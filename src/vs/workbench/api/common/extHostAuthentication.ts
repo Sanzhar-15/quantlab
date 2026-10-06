@@ -13,7 +13,7 @@ import { INTERNAL_AUTH_PROVIDER_PREFIX, isAuthenticationWwwAuthenticateRequest }
 import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
-import { AuthorizationErrorType, createOAuthHttpError, createOAuthInvalidResponseError, createOAuthTransportError, fetchDynamicRegistration, formatOAuthHttpFailure, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse, OAuthBodyOutcome, readOAuthErrorBody, readOAuthJsonResponse } from '../../../base/common/oauth.js';
+import { AuthorizationErrorType, createOAuthHttpError, createOAuthInvalidResponseError, createOAuthTransportError, describeOAuthFailure, fetchDynamicRegistration, formatOAuthHttpFailure, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isValidAuthorizationTokenResponse, OAuthBodyOutcome, OAuthSafeError, readOAuthErrorBody, readOAuthJsonResponse } from '../../../base/common/oauth.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ILogger, ILoggerService, ILogService } from '../../../platform/log/common/log.js';
@@ -268,24 +268,24 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					clientId = registration.client_id;
 					clientSecret = registration.client_secret;
 				} catch (err) {
-					// safe-error: fetchDynamicRegistration throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
-					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${err.message}. Prompting user for client ID and client secret...`);
+					// The issuer string is supplied by the server and can carry credentials: it is not logged
+					this._logService.warn(`Dynamic registration failed: ${describeOAuthFailure(err, 'the registration request failed unexpectedly')}. Prompting user for client ID and client secret...`);
 				}
 			}
 			// Still no client id so dynamic client registration was either not supported or failed
 			if (!clientId) {
-				this._logService.info(`Prompting user for client registration details for ${authorizationServer.toString()}`);
+				this._logService.info('Prompting user for client registration details');
 				const clientDetails = await this._proxy.$promptForClientRegistration(authorizationServer.toString());
 				if (!clientDetails) {
 					throw new Error('User did not provide client details');
 				}
 				clientId = clientDetails.clientId;
 				clientSecret = clientDetails.clientSecret;
-				this._logService.info(`User provided client registration for ${authorizationServer.toString()}`);
+				this._logService.info('User provided client registration');
 				if (clientSecret) {
-					this._logService.trace(`User provided client secret for ${authorizationServer.toString()}`);
+					this._logService.trace('User provided client secret');
 				} else {
-					this._logService.trace(`User did not provide client secret for ${authorizationServer.toString()}`);
+					this._logService.trace('User did not provide client secret');
 				}
 			}
 		}
@@ -474,14 +474,14 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 							// TODO@TylerLeonhardt: When the core scope handling doesn't care about order, this check should be
 							// updated to not care about order
 							if (newToken.scope !== scopeStr) {
-								this._logger.warn(`Token scopes '${newToken.scope}' do not match requested scopes '${scopeStr}'. Overwriting token with what was requested...`);
+								// The scope in the response is server text and is not repeated
+								this._logger.warn('Token scopes do not match the requested scopes. Overwriting token with what was requested...');
 								newToken.scope = scopeStr;
 							}
 							this._logger.info(`Successfully created a new token for scopes ${session.scopes.join(' ')}.`);
 							newTokens.push(newToken);
 						} catch (err) {
-							// safe-error: exchangeRefreshTokenForToken throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
-							this._logger.error(`Failed to refresh token: ${err}`);
+							this._logger.error(`Failed to refresh token: ${describeOAuthFailure(err, 'the refresh failed unexpectedly')}`);
 						}
 
 					}
@@ -527,31 +527,39 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					? nls.localize('userCanceledContinue', "Having trouble authenticating to '{0}'? Would you like to try a different way? ({1})", this.label, nextMode)
 					: nls.localize('continueWith', "You have not yet finished authenticating to '{0}'. Would you like to try a different way? ({1})", this.label, nextMode);
 
-				const result = await this._proxy.$showContinueNotification(message);
+				let result: boolean;
+				try {
+					result = await this._proxy.$showContinueNotification(message);
+				} catch (notificationError) {
+					if (isCancellationError(notificationError)) {
+						throw notificationError;
+					}
+					// The error comes from another process: report a new error without its text
+					throw new OAuthSafeError('Failed to show the continue notification');
+				}
 				if (!result) {
 					throw new CancellationError();
 				}
-				// safe-error: every create flow throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
-				this._logger.error(`Failed to create token via flow '${this._createFlows[i].label}': ${err}`);
+				this._logger.error(`Failed to create token via flow '${this._createFlows[i].label}': ${describeOAuthFailure(err, 'the flow failed unexpectedly')}`);
 			}
 		}
 		if (!token) {
-			if (lastFlowError instanceof Error && !isCancellationError(lastFlowError)) {
-				// Every flow error is a fixed, credential-free message (see the OAuth safe error helpers): keep the last one
-				// safe-error: the last flow error is a fixed-message error, see the log line above
-				throw new Error(`Failed to create authentication token: ${lastFlowError.message}`);
+			if (lastFlowError instanceof OAuthSafeError) {
+				// Only an error of the safe type keeps its message; any other error from a flow is dropped
+				throw new OAuthSafeError(`Failed to create authentication token: ${describeOAuthFailure(lastFlowError, 'the flow failed unexpectedly')}`);
 			}
-			throw new Error('Failed to create authentication token');
+			throw new OAuthSafeError('Failed to create authentication token');
 		}
 		if (token.scope !== scopes.join(' ')) {
-			this._logger.warn(`Token scopes '${token.scope}' do not match requested scopes '${scopes.join(' ')}'. Overwriting token with what was requested...`);
+			// The scope in the response is server text and is not repeated
+			this._logger.warn('Token scopes do not match the requested scopes. Overwriting token with what was requested...');
 			token.scope = scopes.join(' ');
 		}
 
 		// Store session for later retrieval
 		this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
 		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
-		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for scopes: ${token.scope}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
+		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for scopes: ${scopes.join(' ')}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
 	}
 
@@ -595,7 +603,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			state = await this._extHostUrls.createAppUri(callbackUri);
 		} catch {
 			// The error comes from another process: report a new error without its text
-			throw new Error('Failed to create external URI');
+			throw new OAuthSafeError('Failed to create external URI');
 		}
 
 		// Prepare the authorization request URL
@@ -623,7 +631,16 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 		// Open the browser for user authorization
 		this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
-		const opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
+		let opened: boolean;
+		try {
+			opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
+		} catch (openError) {
+			if (isCancellationError(openError)) {
+				throw openError;
+			}
+			// The error comes from another process and can quote the authorization URL: report a new error without its text
+			throw new OAuthSafeError('Failed to open the authorization URL');
+		}
 		if (!opened) {
 			throw new CancellationError();
 		}
@@ -641,9 +658,9 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				this._logger.info('Authorization code request was cancelled by the user.');
 				throw err;
 			}
-			// safe-error: waitForAuthorizationCode and the loopback server throw only fixed-message errors
-			this._logger.error(`Failed to receive authorization code: ${err}`);
-			throw new Error(`Failed to receive authorization code: ${err}`);
+			const detail = describeOAuthFailure(err, 'the redirect failed unexpectedly');
+			this._logger.error(`Failed to receive authorization code: ${detail}`);
+			throw new OAuthSafeError(`Failed to receive authorization code: ${detail}`);
 		}
 		this._logger.info(`Authorization code received for scopes: ${scopeString}`);
 
@@ -682,14 +699,14 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				throw err;
 			}
 			// The error comes from another process and its text is not trusted: report a new error
-			throw new Error('Failed to wait for the authorization redirect');
+			throw new OAuthSafeError('Failed to wait for the authorization redirect');
 		}
 		// Extract the code parameter directly from the query string. NOTE, URLSearchParams does not work here because
 		// it will decode the query string and we need to keep it encoded.
 		const codeMatch = /[?&]code=([^&]+)/.exec(result.query || '');
 		if (!codeMatch || codeMatch.length < 2) {
 			// No code parameter found in the query string
-			throw new Error('Authentication failed: No authorization code received');
+			throw new OAuthSafeError('Authentication failed: No authorization code received');
 		}
 		return { code: codeMatch[1] };
 	}
@@ -731,8 +748,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		} catch {
 			// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
 			const error = createOAuthTransportError('Token exchange');
-			// safe-error: built by createOAuthTransportError from a static label
-			this._logger.error(error.message);
+			this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
 			throw error;
 		}
 
@@ -742,13 +758,13 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		const result = await readOAuthJsonResponse(response, 'Token exchange');
-		if (isAuthorizationTokenResponse(result)) {
+		if (isValidAuthorizationTokenResponse(result)) {
 			this._logger.info(`Successfully exchanged authorization code for token.`);
 			return result;
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
 			await this._generateNewClientId();
-			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
+			throw new OAuthSafeError('Client ID was invalid, generated a new one. Please try again.');
 		}
 		throw createOAuthInvalidResponseError('authorization token', response, result);
 	}
@@ -792,7 +808,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		let failure: OAuthBodyOutcome | undefined;
 		if (response.ok) {
 			result = await readOAuthJsonResponse(response, 'Token refresh');
-			if (isAuthorizationTokenResponse(result)) {
+			if (isValidAuthorizationTokenResponse(result)) {
 				return {
 					...result,
 					created_at: Date.now(),
@@ -809,10 +825,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
 			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
 			await this._generateNewClientId();
-			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
+			throw new OAuthSafeError('Client ID was invalid, generated a new one. Please try again.');
 		}
 		if (failure) {
-			throw new Error(formatOAuthHttpFailure('Token refresh', response, failure));
+			throw new OAuthSafeError(formatOAuthHttpFailure('Token refresh', response, failure));
 		}
 		throw createOAuthInvalidResponseError('authorization token', response, result);
 	}
@@ -825,8 +841,9 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._onDidChangeClientId.fire();
 		} catch (err) {
 			// When DCR fails, try to prompt the user for a client ID and client secret
-			// safe-error: fetchDynamicRegistration throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
-			this._logger.info(`Dynamic registration failed for ${this.authorizationServer.toString()}: ${err}. Prompting user for client ID and client secret.`);
+			// The issuer string is supplied by the server and can carry credentials: it is not logged
+			const registrationFailure = describeOAuthFailure(err, 'the registration request failed unexpectedly');
+			this._logger.info(`Dynamic registration failed: ${registrationFailure}. Prompting user for client ID and client secret.`);
 
 			try {
 				const clientDetails = await this._proxy.$promptForClientRegistration(this.authorizationServer.toString());
@@ -835,18 +852,17 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				}
 				this._clientId = clientDetails.clientId;
 				this._clientSecret = clientDetails.clientSecret;
-				this._logger.info(`User provided client ID for ${this.authorizationServer.toString()}`);
+				this._logger.info('User provided client ID');
 				if (clientDetails.clientSecret) {
-					this._logger.info(`User provided client secret for ${this.authorizationServer.toString()}`);
+					this._logger.info('User provided client secret');
 				} else {
-					this._logger.info(`User did not provide client secret for ${this.authorizationServer.toString()} (optional)`);
+					this._logger.info('User did not provide client secret (optional)');
 				}
 
 				this._onDidChangeClientId.fire();
 			} catch (promptErr) {
-				// safe-error: fetchDynamicRegistration throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
-				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${err}`);
-				throw new Error(`Failed to fetch new client ID and user did not provide one: ${err}`);
+				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${registrationFailure}`);
+				throw new OAuthSafeError(`Failed to fetch new client ID and user did not provide one: ${registrationFailure}`);
 			}
 		}
 	}

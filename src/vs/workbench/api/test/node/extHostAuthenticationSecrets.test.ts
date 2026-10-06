@@ -10,17 +10,17 @@ import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { fetchAuthorizationServerMetadata, fetchDynamicRegistration, fetchResourceMetadata, getClaimsFromJWT, IAuthorizationServerMetadata } from '../../../../base/common/oauth.js';
+import { fetchAuthorizationServerMetadata, fetchDynamicRegistration, fetchResourceMetadata, getClaimsFromJWT, IAuthorizationServerMetadata, isValidAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { ILogger, ILoggerService, LogLevel } from '../../../../platform/log/common/log.js';
+import { ILogger, ILoggerService, ILogService, LogLevel } from '../../../../platform/log/common/log.js';
 import { MainThreadAuthenticationShape } from '../../common/extHost.protocol.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
 import { IExtHostProgress } from '../../common/extHostProgress.js';
 import { IExtHostUrlsService } from '../../common/extHostUrls.js';
 import { IExtHostWindow } from '../../common/extHostWindow.js';
 import { createAuthMetadata } from '../../common/extHostMcp.js';
-import { NodeDynamicAuthProvider } from '../../node/extHostAuthentication.js';
+import { NodeDynamicAuthProvider, NodeExtHostAuthentication } from '../../node/extHostAuthentication.js';
 import { LoopbackAuthServer } from '../../node/loopbackServer.js';
 
 // Distinct markers, one per credential. Every one of them is planted in a mocked request or response, so a marker found in
@@ -114,6 +114,9 @@ class TestProxy {
 	registrationPrompts = 0;
 	continueAnswer = true;
 	waitForUriHandlerError: unknown;
+	deviceModalError: unknown;
+	continueError: unknown;
+	promptAnswer: { clientId: string; clientSecret?: string } | undefined;
 	readonly deviceModals: { userCode: string; verificationUri: string }[] = [];
 
 	async $setSessionsForDynamicAuthProvider(_providerId: string, _clientId: string, sessions: unknown[]): Promise<void> {
@@ -127,16 +130,24 @@ class TestProxy {
 	}
 	async $showContinueNotification(): Promise<boolean> {
 		this.continueNotifications++;
+		if (this.continueError) {
+			throw this.continueError;
+		}
 		return this.continueAnswer;
 	}
 	async $showDeviceCodeModal(userCode: string, verificationUri: string): Promise<boolean> {
 		this.deviceModals.push({ userCode, verificationUri });
+		if (this.deviceModalError) {
+			throw this.deviceModalError;
+		}
 		return true;
 	}
-	async $promptForClientRegistration(): Promise<undefined> {
+	async $promptForClientRegistration(): Promise<{ clientId: string; clientSecret?: string } | undefined> {
 		this.registrationPrompts++;
-		return undefined;
+		return this.promptAnswer;
 	}
+	async $registerDynamicAuthenticationProvider(): Promise<void> { }
+	async $sendDidChangeDynamicProviderInfo(): Promise<void> { }
 }
 
 class TestProvider extends NodeDynamicAuthProvider {
@@ -209,11 +220,18 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 		return respond(status, JSON.stringify(body));
 	}
 
-	function createProvider(options: { initialTokens?: any[]; metadata?: Partial<IAuthorizationServerMetadata>; createAppUriError?: unknown } = {}) {
+	function createProvider(options: { initialTokens?: any[]; metadata?: Partial<IAuthorizationServerMetadata>; createAppUriError?: unknown; openUriError?: unknown; progressErrors?: unknown[]; authorizationServer?: URI } = {}) {
 		const logger = store.add(new RecordingLogger());
 		const proxy = new TestProxy();
 		const loggerService = { createLogger: () => logger } as unknown as ILoggerService;
-		const extHostWindow = { openUri: async () => true } as unknown as IExtHostWindow;
+		const extHostWindow = {
+			openUri: async () => {
+				if (options.openUriError) {
+					throw options.openUriError;
+				}
+				return true;
+			}
+		} as unknown as IExtHostWindow;
 		const urls = {
 			createAppUri: async () => {
 				if (options.createAppUriError) {
@@ -227,8 +245,12 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			remote: { isRemote: true }
 		} as unknown as IExtHostInitDataService;
 		const progress = {
-			withProgressFromSource: async (_source: unknown, _options: unknown, task: (progress: { report(): void }, token: CancellationToken) => Thenable<unknown>) =>
-				task({ report: () => undefined }, CancellationToken.None)
+			withProgressFromSource: async (_source: unknown, _options: unknown, task: (progress: { report(): void }, token: CancellationToken) => Thenable<unknown>) => {
+				if (options.progressErrors?.length) {
+					throw options.progressErrors.shift();
+				}
+				return task({ report: () => undefined }, CancellationToken.None);
+			}
 		} as unknown as IExtHostProgress;
 		const tokenEvents = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: any[] }>());
 		const metadata: IAuthorizationServerMetadata = {
@@ -243,7 +265,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 		const provider = store.add(new TestProvider(
 			extHostWindow, urls, initData, progress, loggerService,
 			proxy as unknown as MainThreadAuthenticationShape,
-			URI.parse(AUTH_SERVER), metadata, undefined,
+			options.authorizationServer ?? URI.parse(AUTH_SERVER), metadata, undefined,
 			CLIENT_ID, CLIENT_SECRET,
 			tokenEvents, options.initialTokens ?? []
 		));
@@ -529,7 +551,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 
 			assert.deepStrictEqual(fetchCalls.map(call => call.url), [TOKEN_ENDPOINT, REGISTRATION_ENDPOINT]);
 			assert.strictEqual(proxy.registrationPrompts, 1);
-			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Error: Invalid dynamic client registration response: 200 (no error code in body)');
+			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Invalid dynamic client registration response: 200 (no error code in body)');
 			assert.ok(logger.messages('warn').some(message => message.includes(`Client ID (${CLIENT_ID}) was invalid`)));
 			assert.ok(logger.messages('info').some(message => message.includes('Dynamic registration failed')));
 		});
@@ -544,7 +566,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assertClean(logger);
 
 			assert.deepStrictEqual(sessions, []);
-			assert.deepStrictEqual(logger.messages('error').filter(message => message.includes('Failed to refresh token')), ['Failed to refresh token: Error: Token refresh failed: 500 (server_error)']);
+			assert.deepStrictEqual(logger.messages('error').filter(message => message.includes('Failed to refresh token')), ['Failed to refresh token: Token refresh failed: 500 (server_error)']);
 		});
 
 		test('getSessions: a refresh with malformed JSON is logged without the response', async () => {
@@ -615,7 +637,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
 			assertClean(logger, error);
 
-			assert.strictEqual(error.message, 'Error polling for token: Error: Device code token request failed: the response body is not valid JSON (200)');
+			assert.strictEqual(error.message, 'Error polling for token: Device code token request failed: the response body is not valid JSON (200)');
 		});
 
 		test('token response ok with the wrong shape and credentials in it', async () => {
@@ -625,7 +647,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
 			assertClean(logger, error);
 
-			assert.strictEqual(error.message, 'Error polling for token: Error: Invalid device code token response: 200 (no error code in body)');
+			assert.strictEqual(error.message, 'Error polling for token: Invalid device code token response: 200 (no error code in body)');
 		});
 
 		test('token response non-ok with malformed JSON', async () => {
@@ -635,7 +657,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
 			assertClean(logger, error);
 
-			assert.strictEqual(error.message, 'Error polling for token: Error: Device code token request failed: the response body is not valid JSON (400)');
+			assert.strictEqual(error.message, 'Error polling for token: Device code token request failed: the response body is not valid JSON (400)');
 		});
 
 		test('token response non-ok with an unknown error and a description that holds credentials', async () => {
@@ -645,7 +667,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
 			assertClean(logger, error);
 
-			assert.strictEqual(error.message, 'Error polling for token: Error: Token request failed: 400 (invalid_scope)');
+			assert.strictEqual(error.message, 'Error polling for token: Token request failed: 400 (invalid_scope)');
 		});
 
 		test('token response non-ok: authorization_pending keeps polling', async () => {
@@ -675,14 +697,14 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assertClean(logger, error);
 
 			// The final flow's diagnostics survive
-			assert.strictEqual(error.message, 'Failed to create authentication token: Error polling for token: Error: Device code token request failed: the response body is not valid JSON (200)');
+			assert.strictEqual(error.message, 'Failed to create authentication token: Error polling for token: Device code token request failed: the response body is not valid JSON (200)');
 			assert.strictEqual(proxy.continueNotifications, 1);
 			for (const marker of [AUTH_CODE, PKCE_VERIFIER, CLIENT_SECRET]) {
 				assert.ok(fetchCalls[0].body?.includes(marker), `the exchange request does not hold ${marker}`);
 			}
 			assert.deepStrictEqual(
 				logger.messages('error').filter(message => message.includes('Failed to create token via flow')).map(message => message.replace(/'[^']*'/, 'FLOW')),
-				['Failed to create token via flow FLOW: Error: Token exchange failed: 400 (invalid_grant)']
+				['Failed to create token via flow FLOW: Token exchange failed: 400 (invalid_grant)']
 			);
 		});
 	});
@@ -760,7 +782,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 				}
 			},
 			{
-				name: 'device polling non-ok', expected: 'Error polling for token: Error: Token request failed: 400 (unrecognised error code)',
+				name: 'device polling non-ok', expected: 'Error polling for token: Token request failed: 400 (unrecognised error code)',
 				run: async marker => {
 					const { provider, logger } = createProvider();
 					fetchQueue.push(respondJson(200, deviceBody), respondJson(400, { error: marker }));
@@ -814,7 +836,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 
 			({ provider } = createProvider());
 			fetchQueue.push(respondJson(200, deviceBody), respondJson(400, { error: 'expired_token' }));
-			assert.strictEqual((await rejection(provider.runFlow(1))).message, 'Error polling for token: Error: Device code expired. Please try again.');
+			assert.strictEqual((await rejection(provider.runFlow(1))).message, 'Error polling for token: Device code expired. Please try again.');
 
 			({ provider } = createProvider());
 			fetchQueue.push(respondJson(200, deviceBody), respondJson(400, { error: 'access_denied' }));
@@ -846,7 +868,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 
 			ctx = createProvider();
 			fetchQueue.push(respondJson(200, deviceBody), respond(400, JSON.stringify({ error: 'invalid_scope' }), reason));
-			results.push({ error: await rejection(ctx.provider.runFlow(1)), logger: ctx.logger, expected: 'Error polling for token: Error: Token request failed: 400 (invalid_scope)' });
+			results.push({ error: await rejection(ctx.provider.runFlow(1)), logger: ctx.logger, expected: 'Error polling for token: Token request failed: 400 (invalid_scope)' });
 
 			ctx = createProvider();
 			fetchQueue.push(respond(200, JSON.stringify(wrongShapeBody), reason));
@@ -960,7 +982,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			await provider.getSessions(['read'], {});
 			assertClean(logger);
 
-			assert.deepStrictEqual(logger.messages('error').filter(message => message.includes('Failed to refresh token')), ['Failed to refresh token: Error: Token refresh failed: the request could not be completed']);
+			assert.deepStrictEqual(logger.messages('error').filter(message => message.includes('Failed to refresh token')), ['Failed to refresh token: Token refresh failed: the request could not be completed']);
 		});
 
 		test('registration: a rejected fetch is thrown without its message or cause', async () => {
@@ -981,7 +1003,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assertClean(logger, error);
 
 			assert.strictEqual(proxy.registrationPrompts, 1);
-			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Error: Dynamic client registration failed: the request could not be completed');
+			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Dynamic client registration failed: the request could not be completed');
 		});
 
 		test('device flow: the code request and the polling fetch both reject without the transport text', async () => {
@@ -996,7 +1018,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, deviceBody), rejectTransport(DEVICE_CODE));
 			const poll = await rejection(ctx.provider.runFlow(1));
 			assertClean(ctx.logger, poll);
-			assert.strictEqual(poll.message, 'Error polling for token: Error: Device code token request failed: the request could not be completed');
+			assert.strictEqual(poll.message, 'Error polling for token: Device code token request failed: the request could not be completed');
 			assert.strictEqual(poll.cause, undefined);
 		});
 
@@ -1021,7 +1043,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			ctx.proxy.waitForUriHandlerError = new Error(`rpc ${AUTH_CODE}`, { cause: new Error(`cause ${AUTH_CODE}`) });
 			const wait = await rejection(ctx.provider.runFlow(0));
 			assertClean(ctx.logger, wait);
-			assert.strictEqual(wait.message, 'Failed to receive authorization code: Error: Failed to wait for the authorization redirect');
+			assert.strictEqual(wait.message, 'Failed to receive authorization code: Failed to wait for the authorization redirect');
 		});
 
 		test('URL handler flow: a cancellation passes through as a cancellation', async () => {
@@ -1085,7 +1107,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.deepStrictEqual(findMarkers(error), []);
 			const messages = flattenErrors(error).map(e => (e as Error).message);
 			assert.ok(messages.length >= 2);
-			assert.ok(messages.every(message => /^Failed to fetch resource metadata from https:\/\/example\.com\/\.well-known\/oauth-protected-resource[^?@]*: 404$/.test(message)), messages.join('\n'));
+			assert.ok(messages.every(message => /^Failed to fetch resource metadata from the (?:resource metadata URL given by the server|path-appended well-known URL|root well-known URL): 404$/.test(message)), messages.join('\n'));
 		});
 
 		test('resource metadata: an invalid shape does not repeat the payload', async () => {
@@ -1141,7 +1163,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.deepStrictEqual(findMarkers(error), []);
 			const messages = flattenErrors(error).map(e => (e as Error).message);
 			assert.strictEqual(messages.length, 3);
-			assert.ok(messages.every(message => /^Failed to fetch authorization server metadata from https:\/\/auth\.example\.com\/[^?@]*: 500$/.test(message)), messages.join('\n'));
+			assert.ok(messages.every(message => /^Failed to fetch authorization server metadata from the (?:OAuth 2\.0|OpenID Connect) discovery URL \(path (?:insertion|addition)\): 500$/.test(message)), messages.join('\n'));
 		});
 
 		test('MCP: the warnings logged for failed resource metadata are clean, and later discovery still succeeds', async () => {
@@ -1166,6 +1188,296 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 
 			assert.ok(logged.some(message => message.includes('Error fetching resource metadata')), 'the metadata errors were logged');
 			assert.deepStrictEqual(findMarkers(logged), []);
+		});
+	});
+
+	suite('every await in a create flow is a boundary: upstream text never reaches a log or an error', () => {
+		const upstream = (marker: string) => new Error(`upstream ${marker}`, { cause: new Error(`cause ${marker}`) });
+
+		test('the browser cannot be opened (URL handler flow): a fresh error without the upstream text', async () => {
+			const { provider, logger } = createProvider({ openUriError: upstream(ACCESS_TOKEN) });
+
+			const error = await rejection(provider.runFlow(0));
+			assertClean(logger, error);
+
+			assert.strictEqual(error.message, 'Failed to open the authorization URL');
+			assert.strictEqual(error.cause, undefined);
+		});
+
+		test('the device code modal fails (device flow): a fresh error without the upstream text', async () => {
+			const { provider, logger, proxy } = createProvider();
+			proxy.deviceModalError = upstream(DEVICE_CODE);
+			fetchQueue.push(respondJson(200, deviceBody));
+
+			const error = await rejection(provider.runFlow(1));
+			assertClean(logger, error);
+
+			assert.strictEqual(error.message, 'Failed to show the device code');
+			assert.strictEqual(error.cause, undefined);
+		});
+
+		test('the continue notification fails: createSession rejects with a fresh error', async () => {
+			const { provider, logger, proxy } = createProvider();
+			proxy.continueError = upstream(REFRESH_TOKEN);
+			fetchQueue.push(respondJson(400, { error: 'invalid_grant' }));
+
+			const error = await rejection(provider.createSession(['read'], {}));
+			assertClean(logger, error);
+
+			assert.strictEqual(error.message, 'Failed to show the continue notification');
+			assert.strictEqual(error.cause, undefined);
+		});
+
+		test('an intermediate flow fails at the browser and the final flow at the modal: logs and the final rejection are clean and keep the safe diagnostics', async () => {
+			const { provider, logger, proxy } = createProvider({ openUriError: upstream(ACCESS_TOKEN) });
+			proxy.deviceModalError = upstream(DEVICE_CODE);
+			fetchQueue.push(respondJson(200, deviceBody));
+
+			const error = await rejection(provider.createSession(['read'], {}));
+			assertClean(logger, error);
+
+			assert.strictEqual(error.message, 'Failed to create authentication token: Failed to show the device code');
+			assert.ok(logger.messages('error').includes(`Failed to create token via flow 'URL Handler': Failed to open the authorization URL`), logger.messages('error').join('\n'));
+		});
+
+		test('a flow that fails with an error of another type: its text is dropped from the log and from the final rejection', async () => {
+			const { provider, logger } = createProvider({ progressErrors: [new Error(`progress ${ACCESS_TOKEN}`, { cause: new Error(`cause ${ACCESS_TOKEN}`) }), new Error(`progress ${ID_TOKEN}`)] });
+
+			const error = await rejection(provider.createSession(['read'], {}));
+			assertClean(logger, error);
+
+			assert.strictEqual(error.message, 'Failed to create authentication token');
+			assert.ok(logger.messages('error').includes(`Failed to create token via flow 'URL Handler': the flow failed unexpectedly`), logger.messages('error').join('\n'));
+		});
+
+		test('cancellation passes through the browser, the modal and the notification as a cancellation', async () => {
+			let ctx = createProvider({ openUriError: new CancellationError() });
+			assert.ok(isCancellationError(await rejection(ctx.provider.runFlow(0))), 'openUri');
+
+			ctx = createProvider();
+			ctx.proxy.deviceModalError = new CancellationError();
+			fetchQueue.push(respondJson(200, deviceBody));
+			assert.ok(isCancellationError(await rejection(ctx.provider.runFlow(1))), 'device modal');
+
+			ctx = createProvider();
+			ctx.proxy.continueError = new CancellationError();
+			fetchQueue.push(respondJson(400, { error: 'invalid_grant' }));
+			assert.ok(isCancellationError(await rejection(ctx.provider.createSession(['read'], {}))), 'continue notification');
+		});
+	});
+
+	suite('metadata errors never name a URL path (a path can hold a credential)', () => {
+		const target = `https://example.com/${CLIENT_SECRET}`;
+		const prmUrl = `https://example.com/${ACCESS_TOKEN}/prm`;
+		const issuer = `https://auth.example.com/${REFRESH_TOKEN}`;
+
+		function response(status: number, json: () => Promise<unknown>) {
+			return { status, statusText: 'x', json, text: async () => `${PARSER_LEAK}` };
+		}
+
+		const failures: { name: string; fetchImpl: () => Promise<ReturnType<typeof response>> }[] = [
+			{ name: 'transport', fetchImpl: async () => { rejectTransport(DEVICE_CODE)('', undefined); throw new Error('unreachable'); } },
+			{ name: 'non-success', fetchImpl: async () => response(404, async () => ({})) },
+			{ name: 'malformed body', fetchImpl: async () => response(200, async () => JSON.parse(malformedBody)) },
+			{ name: 'invalid shape', fetchImpl: async () => response(200, async () => ({ client_secret: ID_TOKEN })) },
+			{ name: 'mismatching resource', fetchImpl: async () => response(200, async () => ({ resource: `https://other.example/${DEVICE_CODE}` })) },
+			{ name: 'resource that is not a URL', fetchImpl: async () => response(200, async () => ({ resource: DEVICE_CODE })) }
+		];
+
+		for (const { name, fetchImpl } of failures) {
+			test(`resource metadata, ${name}: no marker in the error or its attempts`, async () => {
+				const error = await rejection(fetchResourceMetadata(target, prmUrl, { fetch: fetchImpl as never }));
+				assert.deepStrictEqual(findMarkers(error), []);
+			});
+			test(`authorization server metadata, ${name}: no marker in the error or its attempts`, async () => {
+				const error = await rejection(fetchAuthorizationServerMetadata(issuer, { fetch: fetchImpl as never }));
+				assert.deepStrictEqual(findMarkers(error), []);
+			});
+		}
+
+		test('the error that is kept when a later discovery succeeds is clean', async () => {
+			const valid = { resource: target };
+			let calls = 0;
+			const fetchImpl = async () => {
+				calls++;
+				return calls === 1 ? response(200, async () => ({ client_secret: ID_TOKEN })) : response(200, async () => valid);
+			};
+
+			const { metadata, errors } = await fetchResourceMetadata(target, prmUrl, { fetch: fetchImpl as never });
+
+			assert.deepStrictEqual(metadata, valid);
+			assert.strictEqual(errors.length, 1);
+			assert.deepStrictEqual(findMarkers(errors), []);
+			assert.strictEqual(errors[0].message, 'Invalid resource metadata from the resource metadata URL given by the server. Expected to follow shape of https://datatracker.ietf.org/doc/html/rfc9728#name-protected-resource-metadata (Hints: is scopes_supported an array? Is resource a string?).');
+		});
+
+		test('MCP: the warnings logged while discovering metadata for a credential-bearing URL are clean', async () => {
+			const logged: string[] = [];
+			let call = 0;
+			const mockFetch = async () => {
+				call++;
+				const base = { url: `https://example.com/${CLIENT_SECRET}`, headers: new Headers(), body: null, statusText: ACCESS_TOKEN, text: async () => PARSER_LEAK };
+				if (call === 1) {
+					return { ...base, status: 404, json: async () => ({}) };
+				}
+				if (call === 2) {
+					return { ...base, status: 200, json: async () => ({ resource: 'https://example.com/', authorization_servers: [`https://auth.example.com/${REFRESH_TOKEN}?client_secret=${ID_TOKEN}#${DEVICE_CODE}`] }) };
+				}
+				return { ...base, status: 404, json: async () => ({}) };
+			};
+			const original = { status: 401, statusText: 'Unauthorized', url: `https://example.com/${CLIENT_SECRET}`, headers: new Headers({ 'WWW-Authenticate': 'Bearer realm="example"' }), body: null, json: async () => ({}), text: async () => '' };
+
+			await createAuthMetadata(`https://example.com/${CLIENT_SECRET}`, original, {
+				launchHeaders: new Map(),
+				fetch: mockFetch as never,
+				log: (_level, message) => { logged.push(message); }
+			});
+
+			assert.ok(logged.some(message => message.includes('Error fetching resource metadata')), logged.join('\n'));
+			assert.ok(logged.some(message => message.includes('Error populating auth server metadata')), logged.join('\n'));
+			assert.deepStrictEqual(findMarkers(logged), []);
+		});
+	});
+
+	suite('an issuer string is never logged (userinfo, path, query and fragment can hold a credential)', () => {
+		const issuerComponents = {
+			scheme: 'https',
+			authority: `user:${URL_USERINFO}@auth.example.com`,
+			path: `/${ACCESS_TOKEN}`,
+			query: `client_secret=${CLIENT_SECRET}`,
+			fragment: REFRESH_TOKEN
+		};
+
+		function createExtHostAuthentication(logger: RecordingLogger, proxy: TestProxy) {
+			const loggerService = { createLogger: () => logger } as unknown as ILoggerService;
+			const rpc = { getProxy: () => proxy } as never;
+			const initData = { environment: { appUriScheme: 'vscode', appName: 'Test' }, remote: { isRemote: true } } as unknown as IExtHostInitDataService;
+			const progress = { withProgressFromSource: async (_s: unknown, _o: unknown, task: (p: { report(): void }, t: CancellationToken) => Thenable<unknown>) => task({ report: () => undefined }, CancellationToken.None) } as unknown as IExtHostProgress;
+			return new NodeExtHostAuthentication(rpc, initData, { openUri: async () => true } as unknown as IExtHostWindow, {} as IExtHostUrlsService, progress, loggerService, logger as unknown as ILogService);
+		}
+
+		const serverMetadata: IAuthorizationServerMetadata = {
+			issuer: AUTH_SERVER,
+			token_endpoint: TOKEN_ENDPOINT,
+			registration_endpoint: REGISTRATION_ENDPOINT,
+			response_types_supported: ['code']
+		};
+
+		test('initial registration fails and the user supplies a client: nothing logged carries the issuer', async () => {
+			const logger = store.add(new RecordingLogger());
+			const proxy = new TestProxy();
+			proxy.promptAnswer = { clientId: CLIENT_ID, clientSecret: NEW_CLIENT_SECRET };
+			const extHostAuthentication = createExtHostAuthentication(logger, proxy);
+			fetchQueue.push(rejectTransport(ACCESS_TOKEN));
+
+			const id = await extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined);
+			await extHostAuthentication.$onDidUnregisterAuthenticationProvider(id);
+
+			assert.ok(logger.messages('warn').some(message => message.startsWith('Dynamic registration failed: Dynamic client registration failed: the request could not be completed')), logger.messages('warn').join('\n'));
+			assert.ok(logger.records.length >= 3);
+			assert.deepStrictEqual(findMarkers(logger.records), []);
+		});
+
+		test('initial registration fails and the user declines: the rejection and the logs carry no issuer', async () => {
+			const logger = store.add(new RecordingLogger());
+			const extHostAuthentication = createExtHostAuthentication(logger, new TestProxy());
+			fetchQueue.push(respondJson(400, { error: 'invalid_client_metadata' }));
+
+			const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+
+			assert.ok(logger.records.length >= 2);
+			assert.deepStrictEqual(findMarkers(logger.records), []);
+			assert.deepStrictEqual(findMarkers(error), []);
+		});
+
+		test('regeneration after invalid_client: the issuer is not logged when registration fails, nor when the user supplies a client', async () => {
+			let ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
+			fetchQueue.push(respondJson(400, { error: 'invalid_client' }), rejectTransport(ACCESS_TOKEN));
+			const failed = await rejection(ctx.provider.refresh(STORED_REFRESH_TOKEN));
+			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
+			assert.deepStrictEqual(findMarkers(failed), []);
+			assert.ok(ctx.logger.records.length >= 2);
+
+			ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
+			ctx.proxy.promptAnswer = { clientId: CLIENT_ID, clientSecret: NEW_CLIENT_SECRET };
+			fetchQueue.push(respondJson(400, { error: 'invalid_client' }), respondJson(200, { client_secret: NEW_CLIENT_SECRET }));
+			await rejection(ctx.provider.refresh(STORED_REFRESH_TOKEN));
+			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
+			assert.ok(ctx.logger.messages('info').includes('User provided client ID'), ctx.logger.messages('info').join('\n'));
+		});
+	});
+
+	suite('accepted token responses never put server text in a log', () => {
+		// An accepted response (right types) whose scope is server text that happens to be a credential
+		const acceptedBody = (scope: string) => ({ access_token: STORED_ACCESS_TOKEN, token_type: 'Bearer', refresh_token: STORED_REFRESH_TOKEN, scope, expires_in: 3600 });
+
+		test('the guard accepts a lifetime that is a finite number and strings for the text fields, and nothing else', () => {
+			assert.strictEqual(isValidAuthorizationTokenResponse({ access_token: 'a', token_type: 'Bearer', expires_in: 3600, scope: 'read', refresh_token: 'r', id_token: 'i' }), true);
+			assert.strictEqual(isValidAuthorizationTokenResponse({ access_token: 'a', token_type: 'Bearer' }), true);
+			for (const bad of [
+				{ access_token: 'a', token_type: 'Bearer', expires_in: ACCESS_TOKEN },
+				{ access_token: 'a', token_type: 'Bearer', expires_in: Number.POSITIVE_INFINITY },
+				{ access_token: 'a', token_type: 'Bearer', expires_in: Number.NaN },
+				{ access_token: 'a', token_type: 'Bearer', scope: { v: ACCESS_TOKEN } },
+				{ access_token: 'a', token_type: 'Bearer', refresh_token: 5 },
+				{ access_token: 'a', token_type: 'Bearer', id_token: [ID_TOKEN] },
+				{ access_token: 5, token_type: 'Bearer' },
+				{ access_token: 'a', token_type: { v: 1 } }
+			]) {
+				assert.strictEqual(isValidAuthorizationTokenResponse(bad), false, JSON.stringify(bad));
+			}
+		});
+
+		test('exchange, refresh and device token: an invalid lifetime or scope type is rejected without disclosure', async () => {
+			const bodies = [
+				{ ...tokenBody, expires_in: ACCESS_TOKEN },
+				{ ...tokenBody, scope: { v: ACCESS_TOKEN } },
+				{ ...tokenBody, refresh_token: { v: REFRESH_TOKEN } }
+			];
+			for (const body of bodies) {
+				let ctx = createProvider();
+				fetchQueue.push(respondJson(200, body));
+				const exchange = await rejection(ctx.provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+				assertClean(ctx.logger, exchange);
+				assert.strictEqual(exchange.message, 'Invalid authorization token response: 200 (no error code in body)');
+
+				ctx = createProvider();
+				fetchQueue.push(respondJson(200, body));
+				const refresh = await rejection(ctx.provider.refresh(STORED_REFRESH_TOKEN));
+				assert.strictEqual(refresh.message, 'Invalid authorization token response: 200 (no error code in body)');
+				assert.deepStrictEqual(findMarkers(refresh), []);
+
+				ctx = createProvider();
+				fetchQueue.push(respondJson(200, deviceBody), respondJson(200, body));
+				const device = await rejection(ctx.provider.runFlow(1));
+				assertClean(ctx.logger, device);
+				assert.strictEqual(device.message, 'Error polling for token: Invalid device code token response: 200 (no error code in body)');
+			}
+		});
+
+		test('createSession: a server scope that is a credential is accepted and not repeated; a lifetime that is a number is logged', async () => {
+			const { provider, logger } = createProvider();
+			fetchQueue.push(respondJson(200, acceptedBody(ACCESS_TOKEN)));
+			const session = await provider.createSession(['read'], {});
+
+			assertClean(logger);
+			assert.strictEqual(session.accessToken, STORED_ACCESS_TOKEN);
+			assert.deepStrictEqual(session.scopes, ['read']);
+			assert.ok(logger.messages('warn').includes('Token scopes do not match the requested scopes. Overwriting token with what was requested...'), logger.messages('warn').join('\n'));
+			assert.ok(logger.messages('info').some(message => message.includes('that expires in 3600 seconds')), logger.messages('info').join('\n'));
+		});
+
+		test('getSessions: a refreshed token whose scope is a credential is accepted and not repeated', async () => {
+			const { provider, logger } = createProvider({
+				initialTokens: [{ access_token: 'initial-access-token', token_type: 'Bearer', refresh_token: STORED_REFRESH_TOKEN, expires_in: 60, scope: 'read', created_at: 0 }]
+			});
+			fetchQueue.push(respondJson(200, acceptedBody(ID_TOKEN)));
+
+			const sessions = await provider.getSessions(['read'], {});
+
+			assertClean(logger);
+			assert.strictEqual(sessions.length, 1);
+			assert.ok(logger.messages('warn').includes('Token scopes do not match the requested scopes. Overwriting token with what was requested...'), logger.messages('warn').join('\n'));
 		});
 	});
 
@@ -1197,7 +1509,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 
 			assert.strictEqual(error.message, 'Failed to create authentication token: Device code request failed: 400 (invalid_request)');
 			assert.strictEqual(proxy.continueNotifications, 1);
-			assert.ok(logger.messages('error').includes(`Failed to create token via flow 'URL Handler': Error: Token exchange failed: 400 (invalid_grant)`), logger.messages('error').join('\n'));
+			assert.ok(logger.messages('error').includes(`Failed to create token via flow 'URL Handler': Token exchange failed: 400 (invalid_grant)`), logger.messages('error').join('\n'));
 		});
 	});
 

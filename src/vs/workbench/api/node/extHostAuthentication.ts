@@ -13,7 +13,7 @@ import { IExtHostWindow } from '../common/extHostWindow.js';
 import { IExtHostUrlsService } from '../common/extHostUrls.js';
 import { ILoggerService, ILogService } from '../../../platform/log/common/log.js';
 import { MainThreadAuthenticationShape } from '../common/extHost.protocol.js';
-import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, isAuthorizationDeviceResponse, isAuthorizationTokenResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType, createOAuthHttpError, createOAuthInvalidResponseError, createOAuthTransportError, formatOAuthHttpFailure, getSafeOAuthErrorCode, readOAuthJsonResponse } from '../../../base/common/oauth.js';
+import { IAuthorizationServerMetadata, IAuthorizationProtectedResourceMetadata, IAuthorizationTokenResponse, isAuthorizationDeviceResponse, AuthorizationErrorType, AuthorizationDeviceCodeErrorType, createOAuthHttpError, createOAuthInvalidResponseError, createOAuthTransportError, describeOAuthFailure, formatOAuthHttpFailure, getSafeOAuthErrorCode, isValidAuthorizationTokenResponse, OAuthSafeError, readOAuthJsonResponse } from '../../../base/common/oauth.js';
 import { Emitter } from '../../../base/common/event.js';
 import { raceCancellationError } from '../../../base/common/async.js';
 import { IExtHostProgress } from '../common/extHostProgress.js';
@@ -93,7 +93,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			appUri = await this._extHostUrls.createAppUri(callbackUri);
 		} catch {
 			// The error comes from another process: report a new error without its text
-			throw new Error('Failed to create external URI');
+			throw new OAuthSafeError('Failed to create external URI');
 		}
 
 		// Prepare the authorization request URL
@@ -121,7 +121,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			await server.start();
 		} catch {
 			// The listen error is not part of the credential boundary but is not trusted either: report a new error
-			throw new Error('Failed to start loopback server');
+			throw new OAuthSafeError('Failed to start loopback server');
 		}
 
 		// Update the authorization URL with the actual redirect URI
@@ -135,7 +135,16 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		try {
 			// Open the browser for user authorization
 			this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
-			const opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
+			let opened: boolean;
+			try {
+				opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
+			} catch (openError) {
+				if (isCancellationError(openError)) {
+					throw openError;
+				}
+				// The error comes from another process and can quote the authorization URL: report a new error without its text
+				throw new OAuthSafeError('Failed to open the authorization URL');
+			}
 			if (!opened) {
 				throw new CancellationError();
 			}
@@ -153,9 +162,9 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 					this._logger.info('Authorization code request was cancelled by the user.');
 					throw err;
 				}
-				// safe-error: the loopback server throws only fixed-message errors
-				this._logger.error(`Failed to receive authorization code: ${err}`);
-				throw new Error(`Failed to receive authorization code: ${err}`);
+				const detail = describeOAuthFailure(err, 'the redirect failed unexpectedly');
+				this._logger.error(`Failed to receive authorization code: ${detail}`);
+				throw new OAuthSafeError(`Failed to receive authorization code: ${detail}`);
 			}
 			this._logger.info(`Authorization code received for scopes: ${scopeString}`);
 
@@ -206,8 +215,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		} catch {
 			// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
 			const error = createOAuthTransportError('Device code request');
-			// safe-error: built by a safe OAuth error helper from a static label, a numeric status and an allowlisted code
-			this._logger.error(error.message);
+			this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
 			throw error;
 		}
 
@@ -219,8 +227,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		const deviceCodeResult = await readOAuthJsonResponse(deviceCodeResponse, 'Device code request');
 		if (!isAuthorizationDeviceResponse(deviceCodeResult)) {
 			const error = createOAuthInvalidResponseError('device code', deviceCodeResponse, deviceCodeResult);
-			// safe-error: built by a safe OAuth error helper from a static label, a numeric status and an allowlisted code
-			this._logger.error(error.message);
+			this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
 			throw error;
 		}
 		const deviceCodeData = deviceCodeResult;
@@ -228,10 +235,19 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		this._logger.info('Device code received.');
 
 		// Step 2: Show the device code modal
-		const userConfirmed = await this._proxy.$showDeviceCodeModal(
-			deviceCodeData.user_code,
-			deviceCodeData.verification_uri
-		);
+		let userConfirmed: boolean;
+		try {
+			userConfirmed = await this._proxy.$showDeviceCodeModal(
+				deviceCodeData.user_code,
+				deviceCodeData.verification_uri
+			);
+		} catch (modalError) {
+			if (isCancellationError(modalError)) {
+				throw modalError;
+			}
+			// The error comes from another process and can quote the device code: report a new error without its text
+			throw new OAuthSafeError('Failed to show the device code');
+		}
 
 		if (!userConfirmed) {
 			throw new CancellationError();
@@ -286,10 +302,9 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 
 				if (tokenResponse.ok) {
 					const tokenData = await readOAuthJsonResponse(tokenResponse, 'Device code token request');
-					if (!isAuthorizationTokenResponse(tokenData)) {
+					if (!isValidAuthorizationTokenResponse(tokenData)) {
 						const error = createOAuthInvalidResponseError('device code token', tokenResponse, tokenData);
-						// safe-error: built by a safe OAuth error helper from a static label, a numeric status and an allowlisted code
-						this._logger.error(error.message);
+						this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
 						throw error;
 					}
 					this._logger.info(`Device code flow completed successfully for scopes: ${scopeString}`);
@@ -309,27 +324,26 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 						await new Promise(resolve => setTimeout(resolve, pollInterval));
 						continue;
 					} else if (errorCode === AuthorizationDeviceCodeErrorType.ExpiredToken) {
-						throw new Error('Device code expired. Please try again.');
+						throw new OAuthSafeError('Device code expired. Please try again.');
 					} else if (errorCode === AuthorizationDeviceCodeErrorType.AccessDenied) {
 						throw new CancellationError();
 					} else if (errorCode === AuthorizationErrorType.InvalidClient) {
 						this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
 						await this._generateNewClientId();
-						throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
+						throw new OAuthSafeError('Client ID was invalid, generated a new one. Please try again.');
 					} else {
-						throw new Error(formatOAuthHttpFailure('Token request', tokenResponse, { kind: 'json', body: errorBody }));
+						throw new OAuthSafeError(formatOAuthHttpFailure('Token request', tokenResponse, { kind: 'json', body: errorBody }));
 					}
 				}
 			} catch (error) {
 				if (isCancellationError(error)) {
 					throw error;
 				}
-				// safe-error: every error thrown in the polling try block is a fixed-message error (OAuth safe helpers or static text)
-				throw new Error(`Error polling for token: ${error}`);
+				throw new OAuthSafeError(`Error polling for token: ${describeOAuthFailure(error, 'the polling failed unexpectedly')}`);
 			}
 		}
 
-		throw new Error('Device code flow timed out. Please try again.');
+		throw new OAuthSafeError('Device code flow timed out. Please try again.');
 	}
 }
 

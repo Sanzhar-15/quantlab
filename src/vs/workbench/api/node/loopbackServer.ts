@@ -6,7 +6,7 @@ import { randomBytes } from 'crypto';
 import * as http from 'http';
 import { URL } from 'url';
 import { DeferredPromise } from '../../../base/common/async.js';
-import { DEFAULT_AUTH_FLOW_PORT, getSafeOAuthErrorCode } from '../../../base/common/oauth.js';
+import { DEFAULT_AUTH_FLOW_PORT, getSafeOAuthErrorCode, OAuthSafeError } from '../../../base/common/oauth.js';
 import { URI } from '../../../base/common/uri.js';
 import { ILogger } from '../../../platform/log/common/log.js';
 
@@ -68,7 +68,7 @@ export class LoopbackAuthServer implements ILoopbackServer {
 						res.end();
 						// The error value comes from the redirect URL and is untrusted: only an allowlisted OAuth error code is reported
 						const errorCode = getSafeOAuthErrorCode({ error });
-						deferredPromise.error(new Error(`Authorization failed (${errorCode ?? 'unrecognised error code'})`));
+						deferredPromise.error(new OAuthSafeError(`Authorization failed (${errorCode ?? 'unrecognised error code'})`));
 						break;
 					}
 					if (!code || !state) {
@@ -79,7 +79,7 @@ export class LoopbackAuthServer implements ILoopbackServer {
 					if (this.state !== state) {
 						res.writeHead(302, { location: `/done?error=${encodeURIComponent('State does not match.')}` });
 						res.end();
-						deferredPromise.error(new Error('State does not match.'));
+						deferredPromise.error(new OAuthSafeError('State does not match.'));
 						break;
 					}
 					deferredPromise.complete({ code, state });
@@ -145,8 +145,9 @@ export class LoopbackAuthServer implements ILoopbackServer {
 				return;
 			}
 			clearTimeout(portTimeout);
-			// safe-error: a listen error from the operating system, it carries no request data
-			deferredPromise.error(new Error(`Error listening to server: ${err}`));
+			// Only the system error code (EACCES and the like) is reported, not the text of the error
+			const listenErrorCode = 'code' in err && typeof err.code === 'string' && /^E[A-Z0-9]{2,20}$/.test(err.code) ? err.code : 'unknown error';
+			deferredPromise.error(new OAuthSafeError(`Error listening to server (${listenErrorCode})`));
 		});
 		this._server.on('close', () => {
 			deferredPromise.error(new Error('Closed'));

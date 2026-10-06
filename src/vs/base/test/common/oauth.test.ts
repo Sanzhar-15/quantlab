@@ -1013,7 +1013,7 @@ suite('OAuth', () => {
 				(error: any) => {
 					// Should be AggregateError since all URLs fail validation
 					assert.ok(error instanceof AggregateError);
-					assert.ok(error.errors.some((e: Error) => /does not match expected value/.test(e.message)));
+					assert.ok(error.errors.some((e: Error) => /does not match the expected resource/.test(e.message)));
 					return true;
 				}
 			);
@@ -1204,9 +1204,9 @@ suite('OAuth', () => {
 			} catch (error: any) {
 				// Should be AggregateError with validation errors
 				const errorMessage = error instanceof AggregateError ? error.errors.map((e: Error) => e.message).join(' ') : error.message;
-				assert.ok(/does not match expected value/.test(errorMessage), 'Error message should mention mismatch');
+				assert.ok(/does not match the expected resource/.test(errorMessage), 'Error message should mention mismatch');
 				assert.ok(!/different\.com/.test(errorMessage), 'Error message must not repeat the server supplied resource value');
-				assert.ok(/https:\/\/example\.com\/api/.test(errorMessage), 'Error message should include expected resource value');
+				assert.ok(!/example\.com/.test(errorMessage), 'Error message must not repeat a URL: it can hold a credential');
 			}
 		});
 
@@ -1283,8 +1283,8 @@ suite('OAuth', () => {
 				(error: any) => {
 					assert.ok(error instanceof AggregateError, 'Should be an AggregateError');
 					assert.strictEqual(error.errors.length, 2, 'Should contain 2 errors');
-					assert.ok(/Failed to fetch resource metadata from.*\/api\/v1.*404/.test(error.errors[0].message), 'First error should mention /api/v1 and 404');
-					assert.ok(/Failed to fetch resource metadata from.*\.well-known.*404/.test(error.errors[1].message), 'Second error should mention .well-known and 404');
+					assert.ok(/Failed to fetch resource metadata from the path-appended well-known URL: 404/.test(error.errors[0].message), 'First error should name the path-appended attempt and 404');
+					assert.ok(/Failed to fetch resource metadata from the root well-known URL: 404/.test(error.errors[1].message), 'Second error should name the root attempt and 404');
 					return true;
 				}
 			); assert.strictEqual(fetchStub.callCount, 2);
@@ -1512,9 +1512,9 @@ suite('OAuth', () => {
 					// First error is 404 from path-appended attempt
 					assert.ok(/404/.test(error.errors[0].message));
 					// Second error is validation failure from root attempt
-					assert.ok(/does not match expected value/.test(error.errors[1].message));
+					assert.ok(/does not match the expected resource/.test(error.errors[1].message));
 					// Check that validation was against root URL (origin) not full path
-					assert.ok(/expected value "https:\/\/example\.com\/" for URL/.test(error.errors[1].message));
+					assert.ok(/for the root well-known URL/.test(error.errors[1].message));
 					return true;
 				}
 			);
@@ -1822,9 +1822,9 @@ suite('OAuth', () => {
 					assert.strictEqual(error.errors.length, 3, 'Should contain 3 errors (one for each URL)');
 					assert.strictEqual(error.message, 'Failed to fetch authorization server metadata from all attempted URLs');
 					// Verify each error includes the URL it attempted
-					assert.ok(/oauth-authorization-server.*404/.test(error.errors[0].message), 'First error should mention OAuth discovery and 404');
-					assert.ok(/openid-configuration.*404/.test(error.errors[1].message), 'Second error should mention OpenID path insertion and 404');
-					assert.ok(/openid-configuration.*404/.test(error.errors[2].message), 'Third error should mention OpenID path addition and 404');
+					assert.ok(/the OAuth 2\.0 discovery URL \(path insertion\): 404/.test(error.errors[0].message), 'First error should name the OAuth discovery attempt and 404');
+					assert.ok(/the OpenID Connect discovery URL \(path insertion\): 404/.test(error.errors[1].message), 'Second error should name OpenID path insertion and 404');
+					assert.ok(/the OpenID Connect discovery URL \(path addition\): 404/.test(error.errors[2].message), 'Third error should name OpenID path addition and 404');
 					return true;
 				}
 			);
