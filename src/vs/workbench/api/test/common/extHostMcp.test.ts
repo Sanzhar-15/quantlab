@@ -1086,7 +1086,8 @@ suite('McpHTTPHandle authentication failures', () => {
 			// F-SECRETS-5: the generated token replaces the configured header in any casing: one value is sent.
 			assert.strictEqual(harness.posts[1], `Bearer ${GENERATED}`, 'the generated header was sent, alone');
 			// F-SECRETS-5: the trace names the headers and never prints a value.
-			const postTraces = harness.logs.filter(l => l.startsWith(`Fetching POST ${HARNESS_MCP_URL};`));
+			// review QL-G-LOGIN-SECRETS c1 M4: the configured endpoint is logged as its origin with a fixed description.
+			const postTraces = harness.logs.filter(l => l.startsWith('Fetching POST https://mcp.example.com (configured endpoint);'));
 			assert.strictEqual(postTraces.length, 2, postTraces.join('\n'));
 			assert.ok(postTraces[0].includes(`header names: [${name}, `), `the configured header is named: ${postTraces[0]}`);
 			assert.ok(postTraces[1].includes('Authorization]') || postTraces[1].includes('Authorization, '), `the generated header is named: ${postTraces[1]}`);
@@ -1098,7 +1099,8 @@ suite('McpHTTPHandle authentication failures', () => {
 });
 
 // F-SECRETS-5 (R-86): the request/response trace and every log line or server state that names a request print the method,
-// the URL without user info or query (and without a server-provided path), header NAMES and the body's byte length only.
+// the URL's origin with a fixed description (no path: review QL-G-LOGIN-SECRETS c1 M4), header NAMES and the body's byte
+// length only.
 suite('F-SECRETS-5: no request or response value reaches an MCP log line', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
@@ -1120,7 +1122,7 @@ suite('F-SECRETS-5: no request or response value reaches an MCP log line', () =>
 	};
 	const PLANTED_VALUES = Object.values(PLANTED);
 	const MCP_URL = `https://user:${PLANTED.userinfo}@mcp.example.com/mcp?api_key=${PLANTED.query}`;
-	const LOGGED_ENDPOINT = 'https://mcp.example.com/mcp';
+	const LOGGED_ENDPOINT = 'https://mcp.example.com (configured endpoint)';
 	const LAUNCH_HEADERS: [string, string][] = [['x-api-key', PLANTED.header], ['Cookie', `session=${PLANTED.cookie}`]];
 	const RPC_MESSAGE = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"secret":"${PLANTED.rpc}"}}}`;
 	const FORM_MESSAGE = `grant_type=authorization_code&code=${PLANTED.formCode}&client_secret=${PLANTED.formSecret}`;
@@ -1290,4 +1292,185 @@ suite('F-SECRETS-5: no request or response value reaches an MCP log line', () =>
 			});
 		}
 	}
+});
+
+// review QL-G-LOGIN-SECRETS c1 M4: the configured endpoint's path is the user's configuration and can hold a credential (an
+// API key in the path is a common form). Every log line and server state names the endpoint by its origin and a fixed
+// description; the requests still use the full configured URL.
+// review QL-G-LOGIN-SECRETS c1 M5: an error from another process, a transport or a stream is foreign text in its name as in
+// its message, stack and cause; a failure is shown as a named error of this file or a fixed category.
+// review QL-G-LOGIN-SECRETS c1 M3: a configured authentication provider id can be an issuer string; it is not logged.
+// Each test checks for markers first, then the fixed text that replaced them.
+suite('QL-G-LOGIN-SECRETS c1: no configured path, foreign error text or provider id reaches an MCP log line or state', () => {
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+
+	const PATH_SECRET = 'MARK-PATH-SECRET-41c9';
+	const MCP_URL = `https://mcp.example.com/key/${PATH_SECRET}/mcp`;
+	const LOGGED = 'https://mcp.example.com (configured endpoint)';
+	const UNEXPECTED = 'unexpected error (details not logged)';
+	const ERR_NAME = 'MARK-ERR-NAME-7d02';
+	const ERR_MESSAGE = 'MARK-ERR-MESSAGE-a3f1';
+	const ERR_STACK = 'MARK-ERR-STACK-5be8';
+	const ERR_CAUSE = 'MARK-ERR-CAUSE-c06d';
+	const PROVIDER_USERINFO = 'MARK-PROVIDER-USERINFO-2e4a';
+	const PROVIDER_PATH = 'MARK-PROVIDER-PATH-9f13';
+	const PROVIDER_QUERY = 'MARK-PROVIDER-QUERY-60b7';
+	const MARKERS = [PATH_SECRET, ERR_NAME, ERR_MESSAGE, ERR_STACK, ERR_CAUSE, PROVIDER_USERINFO, PROVIDER_PATH, PROVIDER_QUERY];
+	const CONFIGURED_PROVIDER_ID = `https://user:${PROVIDER_USERINFO}@issuer.example/${PROVIDER_PATH}?key=${PROVIDER_QUERY}`;
+
+	/** An upstream error with a marker in each of its name, message, stack and cause. */
+	function markedError(): Error {
+		const error = new Error(ERR_MESSAGE, { cause: new Error(ERR_CAUSE) });
+		error.name = ERR_NAME;
+		error.stack = `${ERR_NAME}: ${ERR_MESSAGE}\n    at ${ERR_STACK}`;
+		return error;
+	}
+
+	async function waitFor(condition: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!condition() && Date.now() < deadline) {
+			await new Promise(resolve => setTimeout(resolve, 5));
+		}
+		assert.ok(condition(), `timed out waiting for ${what}`);
+	}
+
+	function assertNoMarker(harness: IMcpHttpHarness): void {
+		assert.ok(harness.logs.length > 0 || harness.states.length > 0, 'nothing was published: the recorder is not attached');
+		for (const line of [...harness.logs, ...harness.states.map(state => JSON.stringify(state))]) {
+			for (const marker of MARKERS) {
+				assert.ok(!line.includes(marker), `a marker (${marker}) reached a log line or the server state: ${line}`);
+			}
+		}
+	}
+
+	/** A handle for the configured URL `url`: by default {@link MCP_URL}, whose path holds a credential (M4); the M5 and M3 tests use a plain one, so each test finds its own item's leak. */
+	function make(transport: (url: string, init: CommonRequestInit | undefined) => Promise<CommonResponse>, overrides: Partial<{ getToken: () => Promise<string | undefined>; getTokenForProvider: () => Promise<string | undefined>; providerId: string; url: string }> = {}): IMcpHttpHarness {
+		const harness = createMcpHttpHarnessAt(overrides.url ?? MCP_URL, {
+			getToken: overrides.getToken ?? (async () => 'stored-token'),
+			getTokenForProvider: overrides.getTokenForProvider ?? (() => Promise.reject(new Error('not used'))),
+			authentication: overrides.providerId ? { providerId: overrides.providerId, scopes: ['read'] } : undefined,
+			launchHeaders: [],
+			transport,
+		});
+		store.add(harness.handle);
+		return harness;
+	}
+
+	const send = (harness: IMcpHttpHarness) => harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+	const errors = (harness: IMcpHttpHarness) => errorStateMessages(harness.states);
+	const usedFullUrl = (harness: IMcpHttpHarness) => assert.ok(harness.requests.some(r => r.url === MCP_URL), `the request used the full configured URL (with ${PATH_SECRET})`);
+
+	test('M4 streamable HTTP: the request trace, a redirect and a failing status state name no configured path', async () => {
+		let posts = 0;
+		const harness = make(async (url, init) => {
+			if (url === MCP_URL && init?.method === 'POST') {
+				switch (++posts) {
+					case 1: return harnessResponse(401, url, { 'WWW-Authenticate': 'Bearer realm="example"' });
+					case 2: return harnessResponse(307, url, { 'location': MCP_URL });
+					default: return harnessResponse(500, url);
+				}
+			}
+			return harnessResponse(404, url);
+		});
+		await send(harness);
+		assertNoMarker(harness);
+		usedFullUrl(harness);
+		assert.ok(harness.logs.includes(`Redirect (307) from ${LOGGED} to ${LOGGED}`), harness.logs.join('\n'));
+		assert.ok(errors(harness).includes(`500 status sending message to ${LOGGED}`), errors(harness).join('\n'));
+		assert.ok(harness.logs.some(l => l.startsWith(`Fetching POST ${LOGGED};`)), harness.logs.join('\n'));
+		assert.ok(harness.logs.some(l => l.startsWith(`Fetched ${LOGGED}: status 500;`)), harness.logs.join('\n'));
+	});
+
+	test('M4 transport failure: the failing state names no configured path', async () => {
+		const harness = make(async () => { throw new TypeError('fetch failed'); });
+		await send(harness);
+		assertNoMarker(harness);
+		usedFullUrl(harness);
+		assert.ok(errors(harness).includes(`Error sending message to ${LOGGED}: ${UNEXPECTED}`), errors(harness).join('\n'));
+	});
+
+	test('M4 legacy SSE: the fallback line and a failing attach state name no configured path', async () => {
+		const harness = make(async (_url, init) => init?.method === 'POST' ? harnessResponse(405, MCP_URL) : harnessResponse(500, MCP_URL));
+		await send(harness);
+		await waitFor(() => errors(harness).some(m => m.includes('as SSE')), 'the legacy attach state');
+		assertNoMarker(harness);
+		usedFullUrl(harness);
+		assert.ok(harness.logs.includes(`405 status sending message to ${LOGGED}, will attempt to fall back to legacy SSE`), harness.logs.join('\n'));
+		assert.ok(errors(harness).includes(`500 status connecting to ${LOGGED} as SSE`), errors(harness).join('\n'));
+	});
+
+	test('M4 backchannel: the line that disables async notifications names no configured path', async () => {
+		const harness = make(async (_url, init) => init?.method === 'POST' ? harnessResponse(202, MCP_URL) : harnessResponse(405, MCP_URL));
+		await send(harness);
+		await waitFor(() => harness.logs.some(l => l.endsWith('for async notifications; they will be disabled')), 'the backchannel to stop');
+		assertNoMarker(harness);
+		usedFullUrl(harness);
+		assert.ok(harness.logs.includes(`405 status connecting to ${LOGGED} for async notifications; they will be disabled`), harness.logs.join('\n'));
+	});
+
+	test('M5 token getter from server metadata: an upstream error\'s name, message, stack and cause reach no log line or state; the failure is named', async () => {
+		let posts = 0;
+		const harness = make(async (url, init) => url === HARNESS_MCP_URL && init?.method === 'POST' && ++posts === 1
+			? harnessResponse(401, url, { 'WWW-Authenticate': 'Bearer realm="example"' })
+			: harnessResponse(404, url), { getToken: async () => { throw markedError(); }, url: HARNESS_MCP_URL });
+		await send(harness);
+		assertNoMarker(harness);
+		assert.ok(harness.logs.includes(`Error getting token from server metadata: ${UNEXPECTED}`), harness.logs.join('\n'));
+		assert.ok(errors(harness).some(m => m.includes('McpAuthenticationFailedError')), errors(harness).join('\n'));
+	});
+
+	test('M5 token getter for a configured provider: an upstream error\'s name, message, stack and cause reach no log line or state; the failure is named', async () => {
+		const harness = make(async url => harnessResponse(200, url), { getTokenForProvider: async () => { throw markedError(); }, providerId: 'example', url: HARNESS_MCP_URL });
+		await send(harness);
+		assertNoMarker(harness);
+		assert.ok(harness.logs.includes(`Error getting token from provided authentication config: ${UNEXPECTED}`), harness.logs.join('\n'));
+		assert.ok(errors(harness).some(m => m.includes('McpAuthenticationFailedError')), errors(harness).join('\n'));
+	});
+
+	test('M5 transport failure: a marked error and a thrown non-error value reach the state only as a fixed category', async () => {
+		const marked = make(async () => { throw markedError(); }, { url: HARNESS_MCP_URL });
+		await send(marked);
+		assertNoMarker(marked);
+		assert.ok(errors(marked).includes(`Error sending message to ${LOGGED}: ${UNEXPECTED}`), errors(marked).join('\n'));
+
+		const nonError = make(async () => { throw { name: ERR_NAME, message: ERR_MESSAGE }; }, { url: HARNESS_MCP_URL });
+		await send(nonError);
+		assertNoMarker(nonError);
+		assert.ok(errors(nonError).includes(`Error sending message to ${LOGGED}: unexpected non-error value (details not logged)`), errors(nonError).join('\n'));
+	});
+
+	test('M5 SSE: a failing stream and a failing legacy attach reach the log and the state only as a fixed category', async () => {
+		const stream = make(async (url, init) => init?.method === 'POST'
+			? harnessStreamResponse(200, url, { 'content-type': 'text/event-stream' }, '', markedError())
+			: harnessResponse(405, url), { url: HARNESS_MCP_URL });
+		await send(stream);
+		await waitFor(() => stream.logs.some(l => l.startsWith('Error reading SSE stream')), 'the SSE read line');
+		assertNoMarker(stream);
+		assert.ok(stream.logs.includes(`Error reading SSE stream: ${UNEXPECTED}`), stream.logs.join('\n'));
+
+		const attach = make(async (url, init) => {
+			if (init?.method === 'POST') {
+				return harnessResponse(405, url);
+			}
+			throw markedError();
+		}, { url: HARNESS_MCP_URL });
+		await send(attach);
+		await waitFor(() => errors(attach).some(m => m.includes('as SSE')), 'the legacy attach state');
+		assertNoMarker(attach);
+		assert.ok(errors(attach).includes(`Error connecting to ${LOGGED} as SSE: ${UNEXPECTED}`), errors(attach).join('\n'));
+	});
+
+	test('M3 configured provider: its id reaches no log line or state, whether its token is obtained or refused', async () => {
+		const obtained = make(async url => harnessResponse(202, url), { getTokenForProvider: async () => 'provider-token', providerId: CONFIGURED_PROVIDER_ID, url: HARNESS_MCP_URL });
+		await send(obtained);
+		assertNoMarker(obtained);
+		assert.ok(obtained.logs.includes('Using provided authentication config: 1 scope(s)'), obtained.logs.join('\n'));
+		assert.ok(obtained.logs.includes('Successfully obtained token from provided authentication config'), obtained.logs.join('\n'));
+		assert.strictEqual(obtained.posts[0], 'Bearer provider-token');
+
+		const refused = make(async url => harnessResponse(202, url), { getTokenForProvider: async () => { throw new Error(`No authentication provider '${CONFIGURED_PROVIDER_ID}' is currently registered.`); }, providerId: CONFIGURED_PROVIDER_ID, url: HARNESS_MCP_URL });
+		await send(refused);
+		assertNoMarker(refused);
+		assert.ok(errors(refused).some(m => m.includes('McpAuthenticationFailedError')), errors(refused).join('\n'));
+	});
 });

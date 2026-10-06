@@ -93,7 +93,6 @@ class TestProxy {
 	}
 	async $promptForClientRegistration(): Promise<undefined> { return undefined; }
 	async $registerDynamicAuthenticationProvider(): Promise<void> { }
-	async $sendDidChangeDynamicProviderInfo(): Promise<void> { }
 }
 
 class TestProvider extends NodeDynamicAuthProvider {

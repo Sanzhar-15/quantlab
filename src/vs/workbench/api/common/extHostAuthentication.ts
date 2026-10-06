@@ -38,6 +38,28 @@ export interface IExtHostAuthentication extends ExtHostAuthentication { }
 export function scopeCountText(scopes: readonly string[]): string {
 	return `${scopes.length} scope(s)`;
 }
+
+/** The opaque id given to each provider id that is not an extension's plain name, in the order they are first seen. */
+const opaqueProviderIds = new Map<string, string>();
+
+/**
+ * A provider's identity for a log line, an error message or a logger id; never for the protocol or for storage, which keep
+ * the id itself. An id made only of letters, digits, '.', '_' and '-' is an extension's own name for its provider and is
+ * shown as it is. Any other id is shown as an opaque id, the same for the same id in this process: a dynamic provider's id
+ * is its issuer string (and resource), which can hold a credential in its user info, path or query. The opaque id is not
+ * derived from the id's text, so it confirms nothing about it.
+ */
+export function authProviderIdForDiagnostics(id: string): string {
+	if (/^[\w.-]{1,128}$/.test(id)) {
+		return id;
+	}
+	let opaque = opaqueProviderIds.get(id);
+	if (opaque === undefined) {
+		opaque = `dynamic-auth-provider-${opaqueProviderIds.size + 1}`;
+		opaqueProviderIds.set(id, opaque);
+	}
+	return opaque;
+}
 export const IExtHostAuthentication = createDecorator<IExtHostAuthentication>('IExtHostAuthentication');
 
 interface ProviderWithMetadata {
@@ -147,7 +169,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 			// may have unregistered the provider in the meantime. I don't see how this could really be done
 			// synchronously, so we just say first one wins.
 			if (this._authenticationProviders.get(id)) {
-				this._logService.error(`An authentication provider with id '${id}' is already registered. The existing provider will not be replaced.`);
+				this._logService.error(`An authentication provider with id '${authProviderIdForDiagnostics(id)}' is already registered. The existing provider will not be replaced.`);
 				return;
 			}
 			const listener = provider.onDidChangeSessions(e => this._proxy.$sendDidChangeSessions(id, e));
@@ -182,7 +204,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				return await providerData.provider.createSession(scopes, options);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -193,7 +215,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				return await providerData.provider.removeSession(sessionId);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -205,7 +227,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				return await providerData.provider.getSessions(scopes, options);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -219,10 +241,10 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					options.authorizationServer = URI.revive(options.authorizationServer);
 					return await provider.getSessionsFromChallenges(constraint, options);
 				}
-				throw new Error(`Authentication provider with handle: ${providerId} does not support getSessionsFromChallenges`);
+				throw new Error(`Authentication provider with handle: ${authProviderIdForDiagnostics(providerId)} does not support getSessionsFromChallenges`);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -236,10 +258,10 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					options.authorizationServer = URI.revive(options.authorizationServer);
 					return await provider.createSessionFromChallenges(constraint, options);
 				}
-				throw new Error(`Authentication provider with handle: ${providerId} does not support createSessionFromChallenges`);
+				throw new Error(`Authentication provider with handle: ${authProviderIdForDiagnostics(providerId)} does not support createSessionFromChallenges`);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -392,7 +414,7 @@ const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID = 'workbench.action.removeDynamic
 /**
  * Refreshing stored sessions failed. They stay stored: a failure may be transient, and a refresh token is a credential.
  * Only an explicit act of the user (signing out, or removing the provider) removes them. The message carries no token and
- * no issuer string: `label` is the provider's issuer-free display name ({@link DynamicAuthProvider} `_errorLabel`).
+ * no issuer string and no server-provided name: `label` is the issuer's host alone ({@link DynamicAuthProvider} `_errorLabel`).
  */
 export class DynamicAuthSessionRefreshError extends Error {
 	override readonly name = 'DynamicAuthSessionRefreshError';
@@ -431,10 +453,18 @@ export class DynamicAuthClientRejectedError extends Error {
  */
 export class DynamicAuthSessionPersistError extends Error {
 	override readonly name = 'DynamicAuthSessionPersistError';
-	constructor(count: number, failure: string) {
+	/** `failure` is the fixed {@link SESSION_PERSIST_FAILURE} text, never text of the storage's error. */
+	constructor(count: number, failure: typeof SESSION_PERSIST_FAILURE) {
 		super(nls.localize('dynamicAuthSessionPersistFailed', "{0} session(s) could not be saved to secret storage ({1}); the change is kept in this window and saved by the next sign-in operation. Until then it is lost on restart.", count, failure));
 	}
 }
+
+/**
+ * The category of a failed session save, for a log line and {@link DynamicAuthSessionPersistError}. The save is a call to
+ * another process: the error it rejects with is reconstructed from that process's text, so its name, message, stack and
+ * cause are all foreign text, and none of them is repeated or used to choose this text.
+ */
+const SESSION_PERSIST_FAILURE = 'the secret storage did not accept the write';
 
 export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	readonly id: string;
@@ -451,8 +481,13 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	}>;
 
 	protected readonly _logger: ILogger;
-	/** The provider's display name for an error message: {@link label} without the user info of the issuer's authority. */
+	/**
+	 * The provider's name in an error message: the issuer's host (and port) alone. Never the server-provided resource name,
+	 * and never the issuer's user info, path or query, any of which can hold a credential.
+	 */
 	protected readonly _errorLabel: string;
+	/** The provider's identity in a log line and its logger id ({@link authProviderIdForDiagnostics}); {@link id} is never one. */
+	readonly diagnosticId: string;
 	private readonly _disposable: DisposableStore;
 
 	constructor(
@@ -475,14 +510,19 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		this.id = _resourceMetadata?.resource
 			? stringifiedServer + ' ' + _resourceMetadata?.resource
 			: stringifiedServer;
-		// Auth Provider label is just the resource name if provided, otherwise the authority of the authorization server.
-		this.label = _resourceMetadata?.resource_name ?? this.authorizationServer.authority;
-		// An error message names the provider without the issuer string: the authority's user info can hold a credential, so
-		// it is cut off (the id, which is the whole issuer string, is never put in an error).
+		// The id is the protocol and storage identity only. A diagnostic names the provider by an opaque id and the issuer's
+		// host: the issuer string can hold a credential in its user info, path or query.
 		const authority = this.authorizationServer.authority;
-		this._errorLabel = _resourceMetadata?.resource_name ?? authority.slice(authority.lastIndexOf('@') + 1);
+		const host = authority.slice(authority.lastIndexOf('@') + 1);
+		this.diagnosticId = authProviderIdForDiagnostics(this.id);
+		// The label is shown to the user: the resource name if provided (RFC 9728 names it for display to the end user),
+		// otherwise the issuer's host, never its user info. It is not a diagnostic: no log line, logger or error carries it.
+		this.label = _resourceMetadata?.resource_name ?? host;
+		this._errorLabel = host;
 
-		this._logger = loggerService.createLogger(this.id, { name: `Auth: ${this.label}` });
+		// The logger's id becomes its file name and its name the output channel's: neither carries the issuer string or the
+		// server-provided resource name.
+		this._logger = loggerService.createLogger(this.diagnosticId, { name: `Auth: ${host} (${this.diagnosticId})` });
 		this._disposable = new DisposableStore();
 		this._disposable.add(this._onDidChangeSessions);
 		const scopedEvent = Event.chain(onDidDynamicAuthProviderTokensChange.event, $ => $
@@ -1069,12 +1109,11 @@ class TokenStore implements Disposable {
 		const tokens = this._tokens;
 		try {
 			await this._persistence.set(tokens);
-		} catch (error) {
-			// The tokens are credentials, and a storage error's text is not safe by construction: only the count and the
-			// error's class are logged and carried (no cause).
-			const failure = error instanceof Error ? error.name : typeof error;
-			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${failure}`);
-			throw new DynamicAuthSessionPersistError(tokens.length, failure);
+		} catch {
+			// The tokens are credentials, and the storage error is foreign text (its name included): only the count and a
+			// fixed category are logged and carried (no cause).
+			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${SESSION_PERSIST_FAILURE}`);
+			throw new DynamicAuthSessionPersistError(tokens.length, SESSION_PERSIST_FAILURE);
 		}
 		if (this._tokens === tokens) {
 			this._pending = false;

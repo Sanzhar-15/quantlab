@@ -65,9 +65,9 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 			$showContinueNotification: async () => { calls.continuePrompts++; return false; },
 			$promptForClientRegistration: async () => { calls.registrationPrompts++; return { clientId: 'client-typed' }; },
 			$setSessionsForDynamicAuthProvider: async () => { },
-			// The two calls that save a client registration on the main thread: neither may be made.
+			// The call that saves a client registration on the main thread (the only one: the client-ID change call is
+			// removed, review QL-G-LOGIN-SECRETS c1 M3): it may not be made.
 			$registerDynamicAuthenticationProvider: async () => { calls.registrationSaves++; },
-			$sendDidChangeDynamicProviderInfo: async () => { calls.registrationSaves++; },
 		};
 		// No authorization_endpoint: the device code flow is the only sign-in flow.
 		const serverMetadata: IAuthorizationServerMetadata = {

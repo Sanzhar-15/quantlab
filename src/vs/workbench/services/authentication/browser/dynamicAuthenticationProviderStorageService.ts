@@ -6,7 +6,7 @@
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderInfo, DynamicAuthenticationProviderTokensChangeEvent } from '../common/dynamicAuthenticationProviderStorage.js';
-import { InvalidStoredSecretError, ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
+import { InvalidStoredSecretError, ISecretStorageService, SecretDecryptionError, SecretStorageUnavailableError } from '../../../../platform/secrets/common/secrets.js';
 import { IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
@@ -14,6 +14,47 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Queue, SequencerByKey } from '../../../../base/common/async.js';
 import { localize } from '../../../../nls.js';
 import { runAtBoundary } from '../common/storedSecretBoundary.js';
+
+/** The opaque id given to each provider id that is not an extension's plain name, in the order they are first seen. */
+const opaqueProviderIds = new Map<string, string>();
+
+/**
+ * A provider's identity for a log line or an error message in this process; never for the protocol or for storage, which
+ * keep the id itself. An id made only of letters, digits, '.', '_' and '-' is an extension's own name for its provider and
+ * is shown as it is. Any other id is shown as an opaque id, the same for the same id in this process: a dynamic provider's
+ * id is its issuer string (and resource), which can hold a credential in its user info, path or query. The opaque id is
+ * not derived from the id's text, so it confirms nothing about it. (The extension host has the same rule for its own
+ * diagnostics, `authProviderIdForDiagnostics` in extHostAuthentication.ts; its opaque ids are its own.)
+ */
+export function authProviderIdForDiagnostics(id: string): string {
+	if (/^[\w.-]{1,128}$/.test(id)) {
+		return id;
+	}
+	let opaque = opaqueProviderIds.get(id);
+	if (opaque === undefined) {
+		opaque = `dynamic-auth-provider-${opaqueProviderIds.size + 1}`;
+		opaqueProviderIds.set(id, opaque);
+	}
+	return opaque;
+}
+
+/**
+ * The category of a failed stored read for a log line: the name of a recognised secret-storage error class (matched by
+ * instanceof, written here), otherwise a fixed category. The error itself is not logged: a stored-secret error's message
+ * names the secret's key, which for a dynamic provider is built from its issuer string.
+ */
+function storedReadFailureCategory(error: unknown): string {
+	if (error instanceof InvalidStoredSecretError) {
+		return 'InvalidStoredSecretError';
+	}
+	if (error instanceof SecretDecryptionError) {
+		return 'SecretDecryptionError';
+	}
+	if (error instanceof SecretStorageUnavailableError) {
+		return 'SecretStorageUnavailableError';
+	}
+	return 'unexpected error (details not logged)';
+}
 
 /**
  * Why a stored provider list is invalid: `reason` is the stable English structural form (key metadata and
@@ -166,7 +207,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 						clientId: payload.clientId,
 						tokens
 					});
-				}, error => this.logService.error(`Could not read the stored sessions of ${payload.authProviderId} (${payload.clientId}) after a change; they are kept.`, error)));
+				}, error => this.logService.error(`Could not read the stored sessions of ${authProviderIdForDiagnostics(payload.authProviderId)} after a change (${storedReadFailureCategory(error)}); they are kept.`)));
 			}
 		}));
 	}
@@ -177,15 +218,17 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		const credentialsValue = await this.secretStorageService.get(key);
 		// Only undefined is absence: a stored empty string is a present value that is not a registration.
 		if (credentialsValue !== undefined) {
+			// The error names the key with the provider's diagnostic identity: the key holds the issuer string.
+			const diagnosticKey = `dynamicAuthProvider:clientRegistration:${authProviderIdForDiagnostics(providerId)}`;
 			let credentials: unknown;
 			try {
 				credentials = JSON.parse(credentialsValue);
 			} catch {
 				// The parse error quotes the stored text, so it is not carried.
-				throw new InvalidStoredSecretError(key, 'is not valid JSON');
+				throw new InvalidStoredSecretError(diagnosticKey, 'is not valid JSON');
 			}
 			if (!isStoredClientRegistration(credentials)) {
-				throw new InvalidStoredSecretError(key, 'is not a client registration with a client id and an optional client secret');
+				throw new InvalidStoredSecretError(diagnosticKey, 'is not a client registration with a client id and an optional client secret');
 			}
 			return credentials;
 		}
@@ -428,15 +471,17 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		const value = await this.secretStorageService.get(key);
 		// Only undefined is absence: a stored empty string is a present value that is not a session list.
 		if (value !== undefined) {
+			// The error names the key with the provider's diagnostic identity: the key holds the issuer string.
+			const diagnosticKey = JSON.stringify({ isDynamicAuthProvider: true, authProviderId: authProviderIdForDiagnostics(authProviderId), clientId });
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(value);
 			} catch {
 				// The parse error quotes the stored text, so it is not carried.
-				throw new InvalidStoredSecretError(key, 'is not valid JSON');
+				throw new InvalidStoredSecretError(diagnosticKey, 'is not valid JSON');
 			}
 			if (!Array.isArray(parsed) || !parsed.every(isStoredSession)) {
-				throw new InvalidStoredSecretError(key, `is not a list of token responses for ${authProviderId} (${clientId})`);
+				throw new InvalidStoredSecretError(diagnosticKey, 'is not a list of token responses');
 			}
 			return parsed;
 		}
@@ -455,8 +500,8 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 				throw new DynamicAuthProviderNotRegisteredError();
 			}
 			await this.secretStorageService.set(this._sessionsKey(authProviderId, clientId), JSON.stringify(sessions));
-			// The token responses are credentials: only their count is logged.
-			this.logService.trace(`Set ${sessions.length} session(s) for ${authProviderId} (${clientId}) in secret storage`);
+			// The token responses are credentials: only their count is logged, with the provider's diagnostic identity.
+			this.logService.trace(`Set ${sessions.length} session(s) for ${authProviderIdForDiagnostics(authProviderId)} in secret storage`);
 		});
 	}
 }

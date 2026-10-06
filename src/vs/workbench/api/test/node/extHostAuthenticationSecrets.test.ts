@@ -162,7 +162,6 @@ class TestProxy {
 		return this.promptAnswer;
 	}
 	async $registerDynamicAuthenticationProvider(): Promise<void> { }
-	async $sendDidChangeDynamicProviderInfo(): Promise<void> { }
 }
 
 class TestProvider extends NodeDynamicAuthProvider {

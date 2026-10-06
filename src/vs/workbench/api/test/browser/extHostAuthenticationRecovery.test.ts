@@ -253,7 +253,8 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		});
 
 		assert.strictEqual(logger.errors.length, 1, logger.errors.join('\n'));
-		assert.ok(logger.errors[0].includes('Failed to save') && logger.errors[0].includes('KeychainError'), logger.errors[0]);
+		// review QL-G-LOGIN-SECRETS c1 M5: the storage error's name is foreign text too; a fixed category is logged instead.
+		assert.strictEqual(logger.errors[0], 'Failed to save 1 token(s) to secret storage: the secret storage did not accept the write');
 		for (const line of logger.lines) {
 			assert.ok(!/at-[12]|rt-[12]/.test(line), `a log line holds token text: ${line}`);
 			assert.ok(!line.includes(PLANTED), `a log line holds the storage error text: ${line}`);
