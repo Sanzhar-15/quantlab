@@ -11,7 +11,7 @@ import { IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../..
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { Queue } from '../../../../base/common/async.js';
+import { Queue, SequencerByKey } from '../../../../base/common/async.js';
 import { localize } from '../../../../nls.js';
 import { runAtBoundary } from '../common/storedSecretBoundary.js';
 
@@ -58,6 +58,29 @@ export class InvalidStoredProviderListError extends Error {
 		super(localize('dynamicAuthProviders.invalidList', "Stored dynamic authentication provider list '{0}' is invalid: {1}. It was left unchanged.", storageKey, reason.localizedReason));
 		this.name = 'InvalidStoredProviderListError';
 		this.reason = reason.reason;
+	}
+}
+
+/**
+ * Sessions were not saved because the provider has no committed registration under that client ID: it was removed (or
+ * never registered) after the operation that produced them began. Its message is fixed: no provider ID (an issuer string
+ * can hold a credential), no client ID, no token.
+ */
+export class DynamicAuthProviderNotRegisteredError extends Error {
+	constructor() {
+		super(localize('dynamicAuthProviders.notRegistered', "The sessions were not saved: the dynamic authentication provider is not registered with this client registration (it was removed)."));
+		this.name = 'DynamicAuthProviderNotRegisteredError';
+	}
+}
+
+/**
+ * A client registration was written but the provider list could not be committed, and the previous stored client
+ * registration could not be restored either. Its message is fixed and names the explicit reset; it carries no cause.
+ */
+export class DynamicAuthRegistrationRecoveryError extends Error {
+	constructor() {
+		super(localize('dynamicAuthProviders.registrationRecoveryFailed', "The client registration could not be saved, and the previous stored client registration could not be restored. Remove the provider with the command 'Authentication: Remove Dynamic Authentication Providers', then sign in again."));
+		this.name = 'DynamicAuthRegistrationRecoveryError';
 	}
 }
 
@@ -108,6 +131,12 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 	declare readonly _serviceBrand: undefined;
 
 	private static readonly PROVIDERS_STORAGE_KEY = 'dynamicAuthProviders';
+
+	/**
+	 * Every operation that changes one provider's stored registration or sessions runs in this per-provider order, so a
+	 * registration, a removal and a session write never interleave: an operation sees the previous one committed or not at all.
+	 */
+	private readonly _providerOperations = new SequencerByKey<string>();
 
 	private readonly _onDidChangeTokens = this._register(new Emitter<DynamicAuthenticationProviderTokensChangeEvent>());
 	readonly onDidChangeTokens: Event<DynamicAuthenticationProviderTokensChangeEvent> = this._onDidChangeTokens.event;
@@ -174,14 +203,53 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return provider?.clientId;
 	}
 
-	async storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string): Promise<void> {
-		// Store provider information for backward compatibility and UI display
-		this._trackProvider(providerId, authorizationServer, clientId, label);
+	/**
+	 * Staged: the stored list is validated and the previous client registration read before anything is written; the
+	 * client registration is written next; the provider list, which is the commit record and the index removal finds the
+	 * provider by, names the new registration last. When the list cannot be committed, the previous client registration
+	 * is restored before this rejects, so the stored list and client registration stay one consistent identity.
+	 */
+	storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string): Promise<void> {
+		return this._providerOperations.queue(providerId, async () => {
+			// Stage: a stored list that cannot be read rejects here, before any write.
+			this._getStoredProviders();
+			const credentialsKey = this._credentialsKey(providerId);
+			const previousCredentials = await this.secretStorageService.get(credentialsKey);
 
-		// Store both client ID and secret together in SecretStorage
-		const key = `dynamicAuthProvider:clientRegistration:${providerId}`;
-		const credentials = { clientId, clientSecret };
-		await this.secretStorageService.set(key, JSON.stringify(credentials));
+			// A rejected write leaves the previous registration in place: the list has not been touched.
+			await this.secretStorageService.set(credentialsKey, JSON.stringify({ clientId, clientSecret }));
+
+			// Commit: the list is read again, so a change made by another provider meanwhile is kept.
+			try {
+				this._trackProvider(providerId, authorizationServer, clientId, label);
+			} catch (commitError) {
+				await this._restoreCredentials(credentialsKey, previousCredentials);
+				throw commitError;
+			}
+		});
+	}
+
+	/** Explicit recovery of a registration whose list commit failed: the previous client registration is written back. */
+	private async _restoreCredentials(credentialsKey: string, previousCredentials: string | undefined): Promise<void> {
+		try {
+			if (previousCredentials === undefined) {
+				await this.secretStorageService.delete(credentialsKey);
+			} else {
+				await this.secretStorageService.set(credentialsKey, previousCredentials);
+			}
+		} catch {
+			// Neither the commit nor the restore succeeded: both are reported by one named error, with fixed text only.
+			this.logService.error('A client registration was written but not committed, and the previous client registration could not be restored.');
+			throw new DynamicAuthRegistrationRecoveryError();
+		}
+	}
+
+	private _credentialsKey(providerId: string): string {
+		return `dynamicAuthProvider:clientRegistration:${providerId}`;
+	}
+
+	private _sessionsKey(authProviderId: string, clientId: string): string {
+		return JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 	}
 
 	private _trackProvider(providerId: string, authorizationServer: string, clientId: string, label?: string): void {
@@ -294,24 +362,65 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return this._getStoredProviders();
 	}
 
-	async removeDynamicProvider(providerId: string): Promise<void> {
-		// Get provider info before removal for secret cleanup
-		const providers = this._getStoredProviders();
-		const providerInfo = providers.find(p => p.providerId === providerId);
+	/**
+	 * Removes the provider's sessions and client registration, then its list entry. The list entry (the cleanup identity)
+	 * is removed last: a deletion that rejects leaves it in place, so a retried removal finds every stored session again.
+	 * Sessions are deleted under every client ID the provider is known by: the list entry's and the stored client
+	 * registration's. Runs in the provider's operation order, so no session write interleaves with it; once it has
+	 * completed, a session write for the provider is rejected ({@link setSessionsForDynamicAuthProvider}).
+	 */
+	removeDynamicProvider(providerId: string): Promise<void> {
+		return this._providerOperations.queue(providerId, async () => {
+			// A stored list that cannot be read rejects here, before any deletion.
+			const providerInfo = this._getStoredProviders().find(p => p.providerId === providerId);
+			const credentialsKey = this._credentialsKey(providerId);
 
-		// Remove from stored providers
-		const filteredProviders = providers.filter(p => p.providerId !== providerId);
-		this._storeProviders(filteredProviders);
+			const clientIds = new Set<string>();
+			if (providerInfo) {
+				clientIds.add(providerInfo.clientId);
+			}
+			const storedCredentials = await this.secretStorageService.get(credentialsKey);
+			if (storedCredentials !== undefined) {
+				const registration = this._parseCredentialsForRemoval(storedCredentials);
+				if (registration) {
+					clientIds.add(registration.clientId);
+				}
+			}
 
-		// Remove sessions from secret storage if we have the provider info
-		if (providerInfo) {
-			const secretKey = JSON.stringify({ isDynamicAuthProvider: true, authProviderId: providerId, clientId: providerInfo.clientId });
-			await this.secretStorageService.delete(secretKey);
+			for (const clientId of clientIds) {
+				await this.secretStorageService.delete(this._sessionsKey(providerId, clientId));
+			}
+			await this.secretStorageService.delete(credentialsKey);
+
+			// Commit: every stored credential of the provider is deleted; the list is read again, so a change made by
+			// another provider meanwhile is kept.
+			const remaining = this._getStoredProviders();
+			const filteredProviders = remaining.filter(p => p.providerId !== providerId);
+			if (filteredProviders.length !== remaining.length) {
+				this._storeProviders(filteredProviders);
+			}
+		});
+	}
+
+	/**
+	 * The client ID of a stored registration that is being removed. An unreadable one names no client ID: it is deleted
+	 * by the removal (the user's act) all the same, and the fact is logged with fixed text (never the stored value).
+	 */
+	private _parseCredentialsForRemoval(storedCredentials: string): { clientId: string } | undefined {
+		const unreadable = 'The stored client registration being removed is not readable; it is deleted with the provider, and its sessions are found by the list entry only.';
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(storedCredentials);
+		} catch {
+			// The parse error quotes the stored text, so it is not carried.
+			this.logService.warn(unreadable);
+			return undefined;
 		}
-
-		// Remove client credentials from new SecretStorage format
-		const credentialsKey = `dynamicAuthProvider:clientRegistration:${providerId}`;
-		await this.secretStorageService.delete(credentialsKey);
+		if (!isStoredClientRegistration(parsed)) {
+			this.logService.warn(unreadable);
+			return undefined;
+		}
+		return parsed;
 	}
 
 	async getSessionsForDynamicAuthProvider(authProviderId: string, clientId: string): Promise<(IAuthorizationTokenResponse & { created_at: number })[] | undefined> {
@@ -334,12 +443,21 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return undefined;
 	}
 
-	async setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void> {
-		const key = JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
-		const value = JSON.stringify(sessions);
-		await this.secretStorageService.set(key, value);
-		// The token responses are credentials: only their count is logged.
-		this.logService.trace(`Set ${sessions.length} session(s) for ${authProviderId} (${clientId}) in secret storage`);
+	/**
+	 * Saves sessions only for a provider whose registration is committed under `clientId`, in the provider's operation
+	 * order: a write from an operation that began before the provider was removed (a refresh, a sign-in) is rejected with
+	 * {@link DynamicAuthProviderNotRegisteredError} and recreates nothing.
+	 */
+	setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void> {
+		return this._providerOperations.queue(authProviderId, async () => {
+			const providerInfo = this._getStoredProviders().find(p => p.providerId === authProviderId);
+			if (!providerInfo || providerInfo.clientId !== clientId) {
+				throw new DynamicAuthProviderNotRegisteredError();
+			}
+			await this.secretStorageService.set(this._sessionsKey(authProviderId, clientId), JSON.stringify(sessions));
+			// The token responses are credentials: only their count is logged.
+			this.logService.trace(`Set ${sessions.length} session(s) for ${authProviderId} (${clientId}) in secret storage`);
+		});
 	}
 }
 

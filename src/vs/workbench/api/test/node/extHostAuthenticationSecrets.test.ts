@@ -175,14 +175,6 @@ class TestProvider extends NodeDynamicAuthProvider {
 	}
 
 	/**
-	 * A new client registration (dynamic registration, then the user prompt). invalid_client no longer starts it (F-SECRETS-3
-	 * keeps the stored registration), so its no-leak checks call it directly.
-	 */
-	regenerateClient() {
-		return this._generateNewClientId();
-	}
-
-	/**
 	 * Runs one of the create flows. The provider is remote so the flows are [URL handler, device code].
 	 */
 	runFlow(index: number, reports: unknown[] = []) {
@@ -580,20 +572,6 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.strictEqual(error.name, 'DynamicAuthClientRejectedError');
 			assert.strictEqual(provider.clientId, CLIENT_ID);
 			assert.ok(logger.messages('warn').some(message => message.includes(`Client ID (${CLIENT_ID}) was rejected as invalid; the stored client registration is kept.`)));
-		});
-
-		test('a new client registration that fails does not leak its response', async () => {
-			const { provider, logger, proxy } = createProvider();
-			// The registration response is the wrong shape (no client_id) and holds a secret and a registration token
-			fetchQueue.push(respondJson(200, { client_secret: NEW_CLIENT_SECRET, registration_access_token: REGISTRATION_TOKEN }));
-
-			const error = await rejection(provider.regenerateClient());
-			assertClean(logger, error);
-
-			assert.deepStrictEqual(fetchCalls.map(call => call.url), [REGISTRATION_ENDPOINT]);
-			assert.strictEqual(proxy.registrationPrompts, 1);
-			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Invalid dynamic client registration response: 200 (no error code in body)');
-			assert.ok(logger.messages('info').some(message => message.includes('Dynamic registration failed')));
 		});
 
 		// F-SECRETS-3 (cb60eb38859): a failed refresh keeps the stored session and getSessions rejects with
@@ -1040,18 +1018,6 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.strictEqual(error.message, 'Dynamic client registration failed: the request could not be completed');
 			assert.strictEqual(error.cause, undefined);
 			assert.deepStrictEqual(findMarkers(error), []);
-		});
-
-		// F-SECRETS-3 (cb60eb38859): invalid_client no longer starts a new registration, so the registration is run directly
-		test('a new client registration: a rejected registration fetch reaches neither the log nor the error', async () => {
-			const { provider, logger, proxy } = createProvider();
-			fetchQueue.push(rejectTransport(NEW_CLIENT_SECRET));
-
-			const error = await rejection(provider.regenerateClient());
-			assertClean(logger, error);
-
-			assert.strictEqual(proxy.registrationPrompts, 1);
-			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Dynamic client registration failed: the request could not be completed');
 		});
 
 		test('device flow: the code request and the polling fetch both reject without the transport text', async () => {
@@ -1536,6 +1502,27 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.deepStrictEqual(findMarkers(error), []);
 		});
 
+		// review-c1 O8: the dormant client-regeneration path is removed; its no-leak checks run on the live initial registration.
+		for (const [name, responder] of [
+			['a registration response of the wrong shape holding a client secret and a registration token', () => respondJson(200, { client_secret: NEW_CLIENT_SECRET, registration_access_token: REGISTRATION_TOKEN })],
+			['a rejected registration fetch', () => rejectTransport(NEW_CLIENT_SECRET)],
+		] as const) {
+			test(`initial registration, ${name}, the user declines: neither the log nor the rejection carries it`, async () => {
+				const logger = store.add(new RecordingLogger());
+				const proxy = new TestProxy();
+				const extHostAuthentication = createExtHostAuthentication(logger, proxy);
+				fetchQueue.push(responder());
+
+				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+
+				assert.deepStrictEqual(fetchCalls.map(call => call.url), [REGISTRATION_ENDPOINT]);
+				assert.strictEqual(proxy.registrationPrompts, 1);
+				assert.ok(logger.messages('warn').some(message => message.startsWith('Dynamic registration failed: ')), logger.messages('warn').join('\n'));
+				assert.deepStrictEqual(findMarkers(logger.records), []);
+				assert.deepStrictEqual(findMarkers(error), []);
+			});
+		}
+
 		test('invalid_client: the issuer is neither logged nor in the error, which keeps the registration', async () => {
 			const ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
 			fetchQueue.push(respondJson(400, { error: 'invalid_client' }));
@@ -1546,22 +1533,6 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			assert.strictEqual(rejected.name, 'DynamicAuthClientRejectedError');
 			assert.ok(rejected.message.includes(`'auth.example.com'`), rejected.message);
 			assert.deepStrictEqual(fetchCalls.map(call => call.url), [TOKEN_ENDPOINT]);
-		});
-
-		test('a new client registration: the issuer is not logged when registration fails, nor when the user supplies a client', async () => {
-			let ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
-			fetchQueue.push(rejectTransport(ACCESS_TOKEN));
-			const failed = await rejection(ctx.provider.regenerateClient());
-			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
-			assert.deepStrictEqual(findMarkers(failed), []);
-			assert.ok(ctx.logger.records.length >= 2);
-
-			ctx = createProvider({ authorizationServer: URI.from(issuerComponents) });
-			ctx.proxy.promptAnswer = { clientId: CLIENT_ID, clientSecret: NEW_CLIENT_SECRET };
-			fetchQueue.push(respondJson(200, { client_secret: NEW_CLIENT_SECRET }));
-			await ctx.provider.regenerateClient();
-			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
-			assert.ok(ctx.logger.messages('info').includes('User provided client ID'), ctx.logger.messages('info').join('\n'));
 		});
 
 		suite('a rejected UI RPC is replaced by a fresh error or logged with fixed text (the text and causes come from another process)', () => {

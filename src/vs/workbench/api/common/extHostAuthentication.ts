@@ -31,14 +31,6 @@ import { raceCancellationError, SequencerByKey } from '../../../base/common/asyn
 export interface IExtHostAuthentication extends ExtHostAuthentication { }
 
 /**
- * The class of an error, for a log line or an error message on an authentication path: an error's text (a response body,
- * a request, a token) is not safe by construction, so it is never shown.
- */
-export function errorClassName(error: unknown): string {
-	return error instanceof Error ? error.name : typeof error;
-}
-
-/**
  * Scopes for a log line: their count, never their values. A scope can come from a server (an MCP WWW-Authenticate challenge
  * or the resource metadata's scopes_supported), so its text is not a log value. The scopes used for authentication are not
  * changed.
@@ -337,7 +329,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 		try {
 			await this._providerOperations.queue(provider.id, async () => {
 				// The main thread validates and saves the registration before it publishes the provider; it is installed here
-				// only after that resolves. A client-ID change is saved by the provider itself (_generateNewClientId).
+				// only after that resolves. A rejection leaves an entry already registered under this id untouched.
 				await this._proxy.$registerDynamicAuthenticationProvider({
 					id: provider.id,
 					label: provider.label,
@@ -348,6 +340,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					clientSecret: provider.clientSecret
 				});
 
+				const replaced = this._authenticationProviders.get(provider.id);
 				this._authenticationProviders.set(
 					provider.id,
 					{
@@ -360,6 +353,9 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 						options: { supportsMultipleAccounts: true }
 					}
 				);
+				// The registration succeeded and the new provider is installed: the one it replaces is disposed, so it no
+				// longer forwards session events and its listeners are released.
+				replaced?.disposable?.dispose();
 			});
 		} catch (error) {
 			// Not saved, so published on neither side: the provisional provider is disposed and the rejection is the caller's.
@@ -446,9 +442,6 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 	private _onDidChangeSessions = new Emitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>();
 	readonly onDidChangeSessions = this._onDidChangeSessions.event;
-
-	private readonly _onDidChangeClientId = new Emitter<void>();
-	readonly onDidChangeClientId = this._onDidChangeClientId.event;
 
 	private readonly _tokenStore: TokenStore;
 
@@ -543,6 +536,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			const removedTokens: IAuthorizationToken[] = [];
 			const refreshedTokens = new Set<IAuthorizationToken>();
 			const expiredTokens: IAuthorizationToken[] = [];
+			// invalid_client: the stored client registration was rejected. Every refresh uses it, so none is tried after.
+			let clientRejected = false;
 			const tokenMap = new Map<string, IAuthorizationToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
 			for (const session of sessions) {
 				const token = tokenMap.get(session.accessToken);
@@ -579,6 +574,12 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 							newTokens.push(newToken);
 							refreshedTokens.add(token);
 						} catch (err) {
+							if (err instanceof DynamicAuthClientRejectedError) {
+								// A fixed diagnosis: the error's own text names the provider and is the caller's.
+								this._logger.error('Failed to refresh token: the authorization server rejected the stored client registration (invalid_client).');
+								clientRejected = true;
+								break;
+							}
 							this._logger.error(`Failed to refresh token: ${describeOAuthFailure(err, 'the refresh failed unexpectedly')}`);
 						}
 
@@ -594,6 +595,11 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
+			}
+			// The refreshes that succeeded before a rejection are saved above; the rejection is then reported as itself, so it
+			// stays distinguishable from a refresh failure that may be transient.
+			if (clientRejected) {
+				throw new DynamicAuthClientRejectedError(this._errorLabel);
 			}
 			if (failedRefreshTokens.length) {
 				throw new DynamicAuthSessionRefreshError(this._errorLabel, failedRefreshTokens.length);
@@ -964,50 +970,6 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw new OAuthSafeError(formatOAuthHttpFailure('Token refresh', response, failure));
 		}
 		throw createOAuthInvalidResponseError('authorization token', response, result);
-	}
-
-	/**
-	 * Obtains a new client registration and adopts it. It is saved (awaited) before it is used: a save that rejects rejects
-	 * this call and the client ID and secret in use stay the previous ones. {@link onDidChangeClientId} only notifies, after.
-	 */
-	protected async _generateNewClientId(): Promise<void> {
-		const { clientId, clientSecret } = await this._fetchNewClientRegistration();
-		// Outside the registration-to-prompt fallback: a failed save is not a failed registration and prompts nobody.
-		await this._proxy.$sendDidChangeDynamicProviderInfo({ providerId: this.id, clientId, clientSecret });
-		this._clientId = clientId;
-		this._clientSecret = clientSecret;
-		this._onDidChangeClientId.fire();
-	}
-
-	/** Dynamic client registration; when it fails, the user is prompted for a client ID and client secret. Saves nothing. */
-	private async _fetchNewClientRegistration(): Promise<{ clientId: string; clientSecret: string | undefined }> {
-		let registration: { client_id: string; client_secret?: string };
-		try {
-			registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported);
-		} catch (err) {
-			// When DCR fails, try to prompt the user for a client ID and client secret
-			// The issuer string is supplied by the server and can carry credentials: it is not logged
-			const registrationFailure = describeOAuthFailure(err, 'the registration request failed unexpectedly');
-			this._logger.info(`Dynamic registration failed: ${registrationFailure}. Prompting user for client ID and client secret.`);
-
-			try {
-				const clientDetails = await this._proxy.$promptForClientRegistration(this.authorizationServer.toString());
-				if (!clientDetails) {
-					throw new Error('User did not provide client details');
-				}
-				this._logger.info('User provided client ID');
-				if (clientDetails.clientSecret) {
-					this._logger.info('User provided client secret');
-				} else {
-					this._logger.info('User did not provide client secret (optional)');
-				}
-				return { clientId: clientDetails.clientId, clientSecret: clientDetails.clientSecret };
-			} catch (promptErr) {
-				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${registrationFailure}`);
-				throw new OAuthSafeError(`Failed to fetch new client ID and user did not provide one: ${registrationFailure}`);
-			}
-		}
-		return { clientId: registration.client_id, clientSecret: registration.client_secret };
 	}
 }
 
