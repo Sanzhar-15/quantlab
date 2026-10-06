@@ -19,7 +19,20 @@ if (!out) {
 }
 const seedMod = await import(pathToFileURL(join(process.cwd(), out, 'vs/code/electron-main/qlHost/chromeSeed.js')).href);
 const uriMod = await import(pathToFileURL(join(process.cwd(), out, 'vs/base/common/uri.js')).href);
-const { seedQlChromeSettings } = seedMod;
+// A -min build's mangler renames exports (chromeSeed.js exports `$VB`, not `seedQlChromeSettings`: package 5c, RELEASE 6b), so
+// the function is taken by name when present, else as the module's ONE function export; anything else is a named error.
+function resolveSeed(mod) {
+	if (typeof mod.seedQlChromeSettings === 'function') {
+		return mod.seedQlChromeSettings;
+	}
+	const fns = Object.entries(mod).filter(([, v]) => typeof v === 'function');
+	if (fns.length !== 1) {
+		throw new Error(`chromeSeed.js exports ${fns.length} function(s) [${fns.map(([k]) => k).join(', ')}], expected seedQlChromeSettings or exactly one (mangled) function export`);
+	}
+	console.log('seed function resolved from the mangled export', fns[0][0]);
+	return fns[0][1];
+}
+const seedQlChromeSettings = resolveSeed(seedMod);
 const { URI } = uriMod;
 const log = {
 	error: (...a) => console.log('[log.error]', ...a),
