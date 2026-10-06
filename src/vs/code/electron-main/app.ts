@@ -1312,9 +1312,13 @@ export class CodeApplication extends Disposable {
 	// failed and the app is exiting (the client start has already logged `exit 1` and unwound).
 	private async startQlTerminalHost(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): Promise<boolean> {
 
-		// What `openFirstWindow` assigned and later code reads
-		this.windowsMainService = accessor.get(IWindowsMainService);
+		// What `openFirstWindow` assigned and later code reads. EVERY service is taken from the accessor here, before the first
+		// `await`: a ServicesAccessor is valid only during the synchronous invocation of its function ("Illegal state: service
+		// accessor is only valid during the invocation of its target method", package 5c main-loads, folds/HOST/U5-LAUNCH-3.md).
+		const windowsMainService = this.windowsMainService = accessor.get(IWindowsMainService);
 		this.auxiliaryWindowsMainService = accessor.get(IAuxiliaryWindowsMainService);
+		const instantiationService = accessor.get(IInstantiationService);
+		const dialogMainService = accessor.get(IDialogMainService);
 
 		// QuantLab host (U6): the chrome seed, first of all: before the terminal host starts and so before the gate, a launch request or
 		// a key can open a workbench window that reads the default profile's settings. A failure to create or read the file is not
@@ -1327,11 +1331,10 @@ export class CodeApplication extends Disposable {
 
 		// QuantLab host (U5): the workbench is a lazy sibling view (qlHost/): the gate (it IS the windows service) opens and
 		// adopts it on first use. The launch's protocol urls and openables are handed to the first window that opens, once.
-		const instantiationService = accessor.get(IInstantiationService);
 		let launchProtocolUrls = initialProtocolUrls;
 		const qlWorkbenchHost = this.qlWorkbenchHost = new QlWorkbenchHost({
-			gate: requireQlWindowsGate(accessor.get(IWindowsMainService)),
-			dialogs: this.requireQlDialogMainService(accessor.get(IDialogMainService)),
+			gate: requireQlWindowsGate(windowsMainService),
+			dialogs: this.requireQlDialogMainService(dialogMainService),
 			lifecycleMainService: this.lifecycleMainService,
 			logService: this.logService,
 			openWorkbench: () => {
