@@ -16,7 +16,7 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { connect, waitForEndpoint } from './cdp.mjs';
 import * as net from 'node:net';
-import { assemble, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
+import { assemble, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
 import { backtestForm, importModal, readToasts, waitForWorkbench } from './window.mjs';
 
 const { serve } = createRequire(import.meta.url)('./cues.cjs');
@@ -69,6 +69,7 @@ async function launch(bundle, dir, mode, python) {
 	delete env.ELECTRON_RUN_AS_NODE;
 	const child = cp.spawn(appPaths(bundle).exe, [
 		workspace,
+		MOCK_KEYCHAIN,
 		`--user-data-dir=${userData}`,
 		`--extensions-dir=${path.join(dir, 'extensions')}`,
 		`--extensionDevelopmentPath=${path.join(here, 'driver')}`,
@@ -168,6 +169,7 @@ async function plainLaunch(bundle, dir) {
 		workspace,
 		path.join(workspace, 'sample.py'),
 		path.join(workspace, 'fixture.ipynb'),
+		MOCK_KEYCHAIN,
 		`--user-data-dir=${userData}`,
 		`--extensions-dir=${path.join(dir, 'extensions')}`,
 		'--log', 'trace',
