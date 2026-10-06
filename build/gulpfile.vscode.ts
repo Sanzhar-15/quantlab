@@ -164,7 +164,8 @@ const sourceMappingURLBase = `https://main.vscode-cdn.net/sourcemaps/${commit}`;
 const minifyVSCodeTask = task.define('minify-vscode', task.series(
 	bundleVSCodeTask,
 	util.rimraf('out-vscode-min'),
-	optimize.minifyTask('out-vscode', `${sourceMappingURLBase}/core`)
+	// QuantLab host (F-PACK-15): the generated client tree is already-built output; it is copied as it is (R-52 resources above)
+	optimize.minifyTask('out-vscode', `${sourceMappingURLBase}/core`, ['vs/code/electron-main/ql-client/**'])
 ));
 gulp.task(minifyVSCodeTask);
 
