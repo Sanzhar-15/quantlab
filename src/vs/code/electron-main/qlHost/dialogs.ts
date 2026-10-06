@@ -8,6 +8,7 @@
 // The stock code parents a dialog to `CodeWindow.win`. After adoption that is the stand-in (a proxy, which Electron's native
 // dialog functions cannot take) over a hidden shell (which a sheet cannot attach to). The dialog belongs to the host's window,
 // the one the user sees. This class only re-parents; it never answers a dialog and never changes its options.
+// The host's own failure dialogs are parented to the host window here too (`showMessageBoxOnHost`).
 
 import type { BaseWindow, BrowserWindow, MessageBoxOptions, MessageBoxReturnValue, OpenDialogOptions, OpenDialogReturnValue, SaveDialogOptions, SaveDialogReturnValue } from 'electron';
 import { DialogMainService } from '../../../platform/dialogs/electron-main/dialogMainService.js';
@@ -35,9 +36,21 @@ export class QlDialogMainService extends DialogMainService {
 			return window;
 		}
 
-		// `electron.d.ts` (39): the native dialogs take a `BaseWindow`; the fork's `DialogMainService` types its parameter
-		// `BrowserWindow` and reads only `id` from it. This is the one place that says so.
+		return this.asDialogParent(host);
+	}
+
+	// `electron.d.ts` (39): the native dialogs take a `BaseWindow`; the fork's `DialogMainService` types its parameter
+	// `BrowserWindow` and reads only `id` from it. This is the one place that says so.
+	private asDialogParent(host: BaseWindow): BrowserWindow {
 		return host as unknown as BrowserWindow;
+	}
+
+	/**
+	 * A message box of the host's own (a failure it reports), attached to the host window. An unparented message box is
+	 * app-modal on macOS (`runModal` on the main thread): until it is answered nothing else runs there, not even a quit.
+	 */
+	showMessageBoxOnHost(options: MessageBoxOptions, host: BaseWindow): Promise<MessageBoxReturnValue> {
+		return super.showMessageBox(options, this.asDialogParent(host));
 	}
 
 	override showMessageBox(options: MessageBoxOptions, window?: BrowserWindow): Promise<MessageBoxReturnValue> {
