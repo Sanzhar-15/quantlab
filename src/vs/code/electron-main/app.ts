@@ -127,7 +127,7 @@ import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetr
 // electron-updater is CommonJS with getter-defined exports: node's ESM loader finds no named export (`autoUpdater`), and
 // out/main.js is ESM, so a named import throws SyntaxError before `ready` (package 5, folds/HOST/U5-LAUNCH-1.md). Default import.
 import electronUpdater from 'electron-updater';
-import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
+import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
 // QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
@@ -1391,38 +1391,18 @@ export class CodeApplication extends Disposable {
 		// QuantLab host (DRIVER): TEST BUILDS ONLY. `globalThis.QL_TEST_BUILD` is a constant `false` in a product bundle (esbuild define,
 		// build/lib/optimize.ts), so esbuild drops this block and the dynamic import with it: a product bundle carries neither the dump
 		// module nor its file name. The built-app driver reads the view records from the user-data dir; they are written now (the
-		// terminal view) and again after every change of the host's registry: the workbench's adoption and removal (`addView` /
-		// `removeView`) and the overlay's open and close. A failed write is thrown into the caller, never caught.
+		// terminal view) and again after EVERY change of the host's registry, published by the registry itself (review c1 S2: the
+		// overlay's Escape, renderer loss and switch close it from inside the client, which wrapping the exported methods missed).
+		// A failed write is thrown into the code that changed the registry, never caught.
 		if (globalThis.QL_TEST_BUILD) {
 			const { dump } = await import('./qlHost/viewRecordsDump.js');
 			const userDataPath = this.environmentMainService.userDataPath;
-			const publishViewRecords = (): void => {
-				this.logService.info(`QuantLab host: test build: view records written to ${dump(terminalHost.viewRecords(), userDataPath)}`);
+			const publishViewRecords = (records: readonly ViewRecord[]): void => {
+				this.logService.info(`QuantLab host: test build: view records written to ${dump(records, userDataPath)}`);
 			};
 
-			const { addView, removeView, openOverlay, closeOverlay } = terminalHost;
-			terminalHost.addView = (name, role, view, webPreferences) => {
-				addView(name, role, view, webPreferences);
-				publishViewRecords();
-			};
-			terminalHost.removeView = name => {
-				const removed = removeView(name);
-				publishViewRecords();
-
-				return removed;
-			};
-			terminalHost.openOverlay = async () => {
-				try {
-					await openOverlay();
-				} finally {
-					publishViewRecords(); // also after a failed open: the overlay is closed again, so the file must say so
-				}
-			};
-			terminalHost.closeOverlay = () => {
-				closeOverlay();
-				publishViewRecords();
-			};
-			publishViewRecords();
+			terminalHost.onViewRecordsChanged(publishViewRecords);
+			publishViewRecords(terminalHost.viewRecords());
 
 			// The driver's `showWorkbench()`. A key injected over CDP reaches the page and never the host's `before-input-event`
 			// (measured on package 7, folds/HOST/A2-SPLIT-7.md), so the driver cannot press the toggle key: in a test build the
