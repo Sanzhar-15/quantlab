@@ -9,7 +9,7 @@ import { Lazy } from '../../../../base/common/lazy.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { isEmptyObject } from '../../../../base/common/types.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
-import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
+import { InvalidStoredSecretError, ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IResolvedValue } from '../../../services/configurationResolver/common/configurationResolverExpression.js';
 
@@ -34,15 +34,30 @@ export class McpRegistryInputStorage extends Disposable {
 	private static secretSequencer = new Sequencer();
 	private readonly _secretsSealerSequencer = new Sequencer();
 
-	private readonly _getEncryptionKey = new Lazy(() => {
-		return McpRegistryInputStorage.secretSequencer.queue(async () => {
+	private _encryptionKey: Promise<CryptoKey> | undefined;
+
+	/**
+	 * The key that seals the input secrets. A new key is made only when none is stored; a stored key that cannot be
+	 * read rejects and is kept. A rejection is not remembered: the next call reads the secret store again.
+	 */
+	private _getEncryptionKey(): Promise<CryptoKey> {
+		if (this._encryptionKey) {
+			return this._encryptionKey;
+		}
+		const pending = McpRegistryInputStorage.secretSequencer.queue(async () => {
 			const existing = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
 			if (existing) {
+				let parsed: JsonWebKey;
 				try {
-					const parsed: JsonWebKey = JSON.parse(existing);
-					return await crypto.subtle.importKey('jwk', parsed, MCP_ENCRYPTION_KEY_ALGORITHM, false, ['encrypt', 'decrypt']);
+					parsed = JSON.parse(existing);
 				} catch {
-					// fall through
+					// The parse error quotes the stored text, so it is not carried.
+					throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not valid JSON');
+				}
+				try {
+					return await crypto.subtle.importKey('jwk', parsed, MCP_ENCRYPTION_KEY_ALGORITHM, false, ['encrypt', 'decrypt']);
+				} catch (e) {
+					throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not a usable encryption key', { cause: e });
 				}
 			}
 
@@ -56,7 +71,15 @@ export class McpRegistryInputStorage extends Disposable {
 			await this._secretStorageService.set(MCP_ENCRYPTION_KEY_NAME, JSON.stringify(exported));
 			return key;
 		});
-	});
+		this._encryptionKey = pending;
+		// The caller still receives the rejection; this only forgets it.
+		pending.then(undefined, () => {
+			if (this._encryptionKey === pending) {
+				this._encryptionKey = undefined;
+			}
+		});
+		return pending;
+	}
 
 	private _didChange = false;
 
@@ -127,7 +150,7 @@ export class McpRegistryInputStorage extends Disposable {
 	}
 
 	private async _sealSecrets() {
-		const key = await this._getEncryptionKey.value;
+		const key = await this._getEncryptionKey();
 		return this._secretsSealerSequencer.queue(async () => {
 			if (!this._record.value.unsealedSecrets || isEmptyObject(this._record.value.unsealedSecrets)) {
 				this._record.value.secrets = undefined;
@@ -157,25 +180,33 @@ export class McpRegistryInputStorage extends Disposable {
 			return this._record.value.unsealedSecrets;
 		}
 
+		// Sealed secrets that cannot be unsealed are kept: only clearAll() or clear(), the user's acts, remove them.
+		const key = await this._getEncryptionKey();
+		let decrypted: ArrayBuffer;
 		try {
-			const key = await this._getEncryptionKey.value;
 			const iv = decodeBase64(this._record.value.secrets.iv);
 			const encrypted = decodeBase64(this._record.value.secrets.value);
-
-			const decrypted = await crypto.subtle.decrypt(
+			decrypted = await crypto.subtle.decrypt(
 				{ name: MCP_ENCRYPTION_KEY_ALGORITHM, iv: iv.buffer as Uint8Array<ArrayBuffer> },
 				key,
 				encrypted.buffer as Uint8Array<ArrayBuffer>,
 			);
-
-			const unsealedSecrets = JSON.parse(new TextDecoder().decode(decrypted));
-			this._record.value.unsealedSecrets = unsealedSecrets;
-			return unsealedSecrets;
 		} catch (e) {
-			this._logService.warn('Error unsealing MCP secrets', e);
-			this._record.value.secrets = undefined;
+			const error = new InvalidStoredSecretError(MCP_DATA_STORED_KEY, 'could not be unsealed with the stored key', { cause: e });
+			this._logService.error(error);
+			throw error;
 		}
 
-		return {};
+		let unsealedSecrets: Record<string, IResolvedValue>;
+		try {
+			unsealedSecrets = JSON.parse(new TextDecoder().decode(decrypted));
+		} catch {
+			// The parse error quotes the unsealed text, so it is not carried.
+			const error = new InvalidStoredSecretError(MCP_DATA_STORED_KEY, 'unsealed to text that is not valid JSON');
+			this._logService.error(error);
+			throw error;
+		}
+		this._record.value.unsealedSecrets = unsealedSecrets;
+		return unsealedSecrets;
 	}
 }

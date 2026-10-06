@@ -6,7 +6,7 @@
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderInfo, DynamicAuthenticationProviderTokensChangeEvent } from '../common/dynamicAuthenticationProviderStorage.js';
-import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
+import { InvalidStoredSecretError, ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
@@ -55,14 +55,17 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		const key = `dynamicAuthProvider:clientRegistration:${providerId}`;
 		const credentialsValue = await this.secretStorageService.get(key);
 		if (credentialsValue) {
+			let credentials;
 			try {
-				const credentials = JSON.parse(credentialsValue);
-				if (credentials && (credentials.clientId || credentials.clientSecret)) {
-					return credentials;
-				}
+				credentials = JSON.parse(credentialsValue);
 			} catch {
-				await this.secretStorageService.delete(key);
+				// The parse error quotes the stored text, so it is not carried.
+				throw new InvalidStoredSecretError(key, 'is not valid JSON');
 			}
+			if (!credentials || !(credentials.clientId || credentials.clientSecret)) {
+				throw new InvalidStoredSecretError(key, 'has neither a client id nor a client secret');
+			}
+			return credentials;
 		}
 
 		// Just grab the client id from the provider
@@ -170,11 +173,15 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		const key = JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 		const value = await this.secretStorageService.get(key);
 		if (value) {
-			const parsed = JSON.parse(value);
+			let parsed;
+			try {
+				parsed = JSON.parse(value);
+			} catch {
+				// The parse error quotes the stored text, so it is not carried.
+				throw new InvalidStoredSecretError(key, 'is not valid JSON');
+			}
 			if (!Array.isArray(parsed) || !parsed.every((t) => typeof t.created_at === 'number' && isAuthorizationTokenResponse(t))) {
-				this.logService.error(`Invalid session data for ${authProviderId} (${clientId}) in secret storage:`, parsed);
-				await this.secretStorageService.delete(key);
-				return undefined;
+				throw new InvalidStoredSecretError(key, `is not a list of token responses for ${authProviderId} (${clientId})`);
 			}
 			return parsed;
 		}

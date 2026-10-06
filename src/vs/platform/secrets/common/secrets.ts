@@ -14,6 +14,28 @@ import { Lazy } from '../../../base/common/lazy.js';
 
 export const ISecretStorageService = createDecorator<ISecretStorageService>('secretStorageService');
 
+/**
+ * A stored secret exists but could not be decrypted (for example the OS keychain refused or is unavailable). The stored
+ * value is kept: a later read can succeed, and only an explicit act of the user removes a stored secret.
+ */
+export class SecretDecryptionError extends Error {
+	override readonly name = 'SecretDecryptionError';
+	constructor(readonly key: string, options?: { cause?: unknown }) {
+		super(`The stored secret '${key}' could not be decrypted; it is kept.`, options);
+	}
+}
+
+/**
+ * A stored secret was read but its content is not what its owner writes. It is kept: only an explicit act of the user
+ * removes a stored secret. The message never quotes the content.
+ */
+export class InvalidStoredSecretError extends Error {
+	override readonly name = 'InvalidStoredSecretError';
+	constructor(readonly key: string, problem: string, options?: { cause?: unknown }) {
+		super(`The stored secret '${key}' ${problem}; it is kept.`, options);
+	}
+}
+
 export interface ISecretStorageProvider {
 	type: 'in-memory' | 'persisted' | 'unknown';
 	get(key: string): Promise<string | undefined>;
@@ -84,9 +106,9 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 				this._logService.trace('[secrets] decrypted secret for key:', fullKey);
 				return result;
 			} catch (e) {
-				this._logService.error(e);
-				this.delete(key);
-				return undefined;
+				const error = new SecretDecryptionError(key, { cause: e });
+				this._logService.error(error);
+				throw error;
 			}
 		});
 	}

@@ -6,6 +6,7 @@
 import * as assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
+import { InvalidStoredSecretError, SecretDecryptionError } from '../../../../../platform/secrets/common/secrets.js';
 import { TestSecretStorageService } from '../../../../../platform/secrets/test/common/testSecretStorageService.js';
 import { StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { TestStorageService } from '../../../../test/common/workbenchTestServices.js';
@@ -173,6 +174,65 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 		assert.strictEqual(result.secretKey1.value, 'secretValue1');
 
 		assert.ok(!testStorageService.get('mcpInputs', StorageScope.APPLICATION)?.includes('secretValue1'));
+	});
+
+	// F-SECRETS-1: a stored key or sealed secrets that cannot be read are kept, and the read rejects.
+	suite('stored secrets that cannot be read', () => {
+		const keyName = 'mcpEncryptionKey';
+
+		function createInstance(secrets: TestSecretStorageService): McpRegistryInputStorage {
+			return store.add(new McpRegistryInputStorage(StorageScope.APPLICATION, StorageTarget.MACHINE, testStorageService, secrets, testLogService));
+		}
+
+		async function sealOne(): Promise<string> {
+			await mcpInputStorage.setSecrets({ 'secretKey1': { value: 'secretValue1' } });
+			await testStorageService.flush();
+			const sealed = testStorageService.get('mcpInputs', StorageScope.APPLICATION);
+			assert.ok(sealed && sealed.includes('"secrets"'));
+			return sealed;
+		}
+
+		test('a stored key that is not a key rejects; neither the key nor the sealed secrets are replaced', async () => {
+			const sealed = await sealOne();
+			await testSecretStorageService.set(keyName, 'not a key {');
+
+			await assert.rejects(createInstance(testSecretStorageService).getMap(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === keyName);
+			assert.strictEqual(await testSecretStorageService.get(keyName), 'not a key {');
+			await testStorageService.flush();
+			assert.strictEqual(testStorageService.get('mcpInputs', StorageScope.APPLICATION), sealed);
+		});
+
+		test('sealed secrets that do not unseal with the stored key reject and are kept', async () => {
+			const sealed = await sealOne();
+			const otherKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+			await testSecretStorageService.set(keyName, JSON.stringify(await crypto.subtle.exportKey('jwk', otherKey)));
+
+			const second = createInstance(testSecretStorageService);
+			await assert.rejects(second.getMap(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs');
+			await second.setPlainText({ 'key1': { value: 'value1' } });
+			await testStorageService.flush();
+			assert.ok(testStorageService.get('mcpInputs', StorageScope.APPLICATION)?.includes(JSON.parse(sealed).secrets.value));
+		});
+
+		test('a failed key read is not remembered: the next read succeeds', async () => {
+			await sealOne();
+			class FailsOnceSecretStorageService extends TestSecretStorageService {
+				private _failNext = true;
+				override async get(key: string): Promise<string | undefined> {
+					if (this._failNext) {
+						this._failNext = false;
+						throw new SecretDecryptionError(key);
+					}
+					return super.get(key);
+				}
+			}
+			const failsOnce = new FailsOnceSecretStorageService();
+			await failsOnce.set(keyName, (await testSecretStorageService.get(keyName))!);
+
+			const second = createInstance(failsOnce);
+			await assert.rejects(second.getMap(), (e: unknown) => e instanceof SecretDecryptionError);
+			assert.strictEqual((await second.getMap()).secretKey1.value, 'secretValue1');
+		});
 	});
 });
 

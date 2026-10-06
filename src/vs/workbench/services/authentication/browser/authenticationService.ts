@@ -10,7 +10,7 @@ import { isString } from '../../../../base/common/types.js';
 import { localize } from '../../../../nls.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
-import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
+import { InvalidStoredSecretError, ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IAuthenticationAccessService } from './authenticationAccessService.js';
 import { AuthenticationProviderInformation, AuthenticationSession, AuthenticationSessionAccount, AuthenticationSessionsChangeEvent, IAuthenticationCreateSessionOptions, IAuthenticationGetSessionsOptions, IAuthenticationProvider, IAuthenticationProviderHostDelegate, IAuthenticationService, IAuthenticationWwwAuthenticateRequest, isAuthenticationWwwAuthenticateRequest } from '../common/authentication.js';
 import { IBrowserWorkbenchEnvironmentService } from '../../environment/browser/environmentService.js';
@@ -32,21 +32,24 @@ export async function getCurrentAuthenticationSessionInfo(
 	secretStorageService: ISecretStorageService,
 	productService: IProductService
 ): Promise<AuthenticationSessionInfo | undefined> {
-	const authenticationSessionValue = await secretStorageService.get(`${productService.urlProtocol}.loginAccount`);
+	const key = `${productService.urlProtocol}.loginAccount`;
+	const authenticationSessionValue = await secretStorageService.get(key);
 	if (authenticationSessionValue) {
+		let authenticationSessionInfo: AuthenticationSessionInfo;
 		try {
-			const authenticationSessionInfo: AuthenticationSessionInfo = JSON.parse(authenticationSessionValue);
-			if (authenticationSessionInfo
-				&& isString(authenticationSessionInfo.id)
-				&& isString(authenticationSessionInfo.accessToken)
-				&& isString(authenticationSessionInfo.providerId)
-			) {
-				return authenticationSessionInfo;
-			}
-		} catch (e) {
-			// This is a best effort operation.
-			console.error(`Failed parsing current auth session value: ${e}`);
+			authenticationSessionInfo = JSON.parse(authenticationSessionValue);
+		} catch {
+			// The parse error quotes the stored text (an access token), so it is not carried.
+			throw new InvalidStoredSecretError(key, 'is not valid JSON');
 		}
+		if (authenticationSessionInfo
+			&& isString(authenticationSessionInfo.id)
+			&& isString(authenticationSessionInfo.accessToken)
+			&& isString(authenticationSessionInfo.providerId)
+		) {
+			return authenticationSessionInfo;
+		}
+		throw new InvalidStoredSecretError(key, 'is not an authentication session');
 	}
 	return undefined;
 }
