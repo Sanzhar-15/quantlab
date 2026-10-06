@@ -578,9 +578,13 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 			};
 			return {
 				get calls() { return calls; },
-				/** The first call is held, and every operation that would start one has had time to. */
+				/** The first call is held, and every operation that would start one has had time to. A call that never comes fails the test. */
 				async reached(): Promise<void> {
+					const deadline = Date.now() + 1000;
 					while (calls === 0) {
+						if (Date.now() > deadline) {
+							throw new Error(`crypto.subtle.${method} was never called: the operation under test did not reach it`);
+						}
 						await new Promise<void>(resolve => setTimeout(resolve, 1));
 					}
 					await new Promise<void>(resolve => setTimeout(resolve, 20));
@@ -690,7 +694,8 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 		test('clearAll during an in-flight clear rejects named and writes nothing into the new record', async () => {
 			const second = await reopenWithSealed();
 			await second.setPlainText({ 'p': { value: 'plain' } });
-			await second.getMap();
+			// Two sealed secrets: clearing one leaves the other, so the clear re-seals (an empty map is not encrypted).
+			await second.setSecrets({ 's1': { value: 'sealed1' } });
 			const pause = pauseWebCrypto('encrypt');
 			try {
 				const outcome = second.clear('s0').then(() => undefined, e => e);
