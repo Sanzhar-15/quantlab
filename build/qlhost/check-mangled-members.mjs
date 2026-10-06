@@ -43,23 +43,46 @@ if (files.length === 0) {
 const blankComments = text => text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, c => c.replace(/[^\n]/g, ' '));
 const escapeRe = name => name.replace(/[$]/g, '\\$&');
 
-// the compiled classes: a top-level class runs from its line to the next top-level class
-const compiledLines = readFileSync(windowImplCompiled, 'utf8').split('\n');
-const classStartRe = /^(?:export\s+)?(?:(?:abstract\s+)?class\s+([\w$]+)|let\s+([\w$]+)\s*=\s*class\b)/;
+// the compiled classes: a top-level class runs from its line to the next top-level class. The mangled compile renames exported
+// classes too (`export class $nw extends $Ed`), so BaseWindow and CodeWindow are found by structure, never by name: the exported
+// classes of windowImpl.ts, in source order, are the exported top-level classes of the compiled file, in the same order, and
+// the compiled CodeWindow must extend the compiled BaseWindow.
+const windowImplText = blankComments(readFileSync(windowImplSource, 'utf8'));
+const sourceExported = [...windowImplText.matchAll(/^export\s+(?:abstract\s+)?class\s+([\w$]+)/gm)].map(m => m[1]);
+const compiledText = readFileSync(windowImplCompiled, 'utf8');
+const compiledLines = compiledText.split('\n');
+const classStartRe = /^(export\s+)?(?:(?:abstract\s+)?class\s+([\w$]+)|let\s+([\w$]+)\s*=\s*class\b)/;
 const starts = [];
 compiledLines.forEach((line, index) => {
 	const m = classStartRe.exec(line);
 	if (m) {
-		starts.push({ name: m[1] ?? m[2], index });
+		const name = m[2] ?? m[3];
+		const exported = Boolean(m[1]) || new RegExp(`^export\\s*\\{[^}]*(?<![\\w$])${escapeRe(name)}(?![\\w$])[^}]*\\}`, 'm').test(compiledText);
+		starts.push({ name, index, exported, line });
 	}
 });
-let compiled = '';
+const compiledExported = starts.filter(s => s.exported);
+if (sourceExported.length === 0 || sourceExported.length !== compiledExported.length) {
+	console.error(`RED: ${windowImplSource} exports ${sourceExported.length} class(es) [${sourceExported.join(', ')}], ${windowImplCompiled} exports ${compiledExported.length} [${compiledExported.map(s => s.name).join(', ')}]: the classes cannot be paired`);
+	process.exit(2);
+}
+const compiledClass = {};
 for (const wanted of ['BaseWindow', 'CodeWindow']) {
-	const at = starts.findIndex(s => s.name === wanted);
+	const at = sourceExported.indexOf(wanted);
 	if (at < 0) {
-		console.error(`RED: class ${wanted} not found in ${windowImplCompiled}`);
+		console.error(`RED: class ${wanted} is not an exported class of ${windowImplSource}`);
 		process.exit(2);
 	}
+	compiledClass[wanted] = compiledExported[at];
+}
+if (!new RegExp(`\\bextends\\s+${escapeRe(compiledClass.BaseWindow.name)}(?![\\w$])`).test(compiledClass.CodeWindow.line)) {
+	console.error(`RED: the compiled CodeWindow (${compiledClass.CodeWindow.name}, line ${compiledClass.CodeWindow.index + 1}) does not extend the compiled BaseWindow (${compiledClass.BaseWindow.name}): the classes cannot be paired`);
+	process.exit(2);
+}
+console.log(`${windowImplCompiled}: BaseWindow = ${compiledClass.BaseWindow.name} (line ${compiledClass.BaseWindow.index + 1}), CodeWindow = ${compiledClass.CodeWindow.name} (line ${compiledClass.CodeWindow.index + 1})`);
+let compiled = '';
+for (const wanted of ['BaseWindow', 'CodeWindow']) {
+	const at = starts.indexOf(compiledClass[wanted]);
 	compiled += compiledLines.slice(starts[at].index, at + 1 < starts.length ? starts[at + 1].index : compiledLines.length).join('\n') + '\n';
 }
 function isDefined(name) {
@@ -72,7 +95,7 @@ function isDefined(name) {
 
 // the compile must be the mangled one: of windowImpl.ts's private and protected members, (nearly) none keeps its source name
 const privateNames = new Set();
-for (const m of blankComments(readFileSync(windowImplSource, 'utf8')).matchAll(/\b(?:private|protected)\s+(?:(?:override|static|readonly|async|get|set|abstract)\s+)*([\w$]+)/g)) {
+for (const m of windowImplText.matchAll(/\b(?:private|protected)\s+(?:(?:override|static|readonly|async|get|set|abstract)\s+)*([\w$]+)/g)) {
 	privateNames.add(m[1]);
 }
 if (privateNames.size === 0) {
