@@ -149,7 +149,8 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
 			} catch (openError) {
 				if (isCancellationError(openError)) {
-					throw openError;
+					// A received cancellation is recognised by name and message only: its stack and properties are not trusted, so it is replaced
+					throw new CancellationError();
 				}
 				// The error comes from another process and can quote the authorization URL: report a new error without its text
 				throw new OAuthSafeError('Failed to open the authorization URL');
@@ -252,7 +253,8 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			);
 		} catch (modalError) {
 			if (isCancellationError(modalError)) {
-				throw modalError;
+				// A received cancellation is recognised by name and message only: its stack and properties are not trusted, so it is replaced
+				throw new CancellationError();
 			}
 			// The error comes from another process and can quote the device code: report a new error without its text
 			throw new OAuthSafeError('Failed to show the device code');
