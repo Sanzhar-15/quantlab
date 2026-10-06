@@ -12,16 +12,66 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Queue } from '../../../../base/common/async.js';
+import { localize } from '../../../../nls.js';
+
+/**
+ * Why a stored provider list is invalid: `reason` is the stable English structural form (key metadata and
+ * log line), `localizedReason` the same text for the user. Both name only structure (index, field, JSON
+ * type, parse error class), never a stored value.
+ */
+interface InvalidStoredProviderListReason {
+	readonly reason: string;
+	readonly localizedReason: string;
+}
+
+const invalidStoredProviderListReasons = {
+	notJson: (errorClass: string): InvalidStoredProviderListReason => ({
+		reason: `not valid JSON (${errorClass})`,
+		localizedReason: localize('dynamicAuthProviders.invalidList.notJson', "not valid JSON ({0})", errorClass),
+	}),
+	notArray: (valueType: string): InvalidStoredProviderListReason => ({
+		reason: `not an array (${valueType})`,
+		localizedReason: localize('dynamicAuthProviders.invalidList.notArray', "not an array ({0})", valueType),
+	}),
+	entryNotObject: (index: number, valueType: string): InvalidStoredProviderListReason => ({
+		reason: `entry ${index} is not an object (${valueType})`,
+		localizedReason: localize('dynamicAuthProviders.invalidList.entryNotObject', "entry {0} is not an object ({1})", index, valueType),
+	}),
+	fieldNotString: (index: number, field: string, valueType: string): InvalidStoredProviderListReason => ({
+		reason: `entry ${index} field ${field} is not a string (${valueType})`,
+		localizedReason: localize({ key: 'dynamicAuthProviders.invalidList.fieldNotString', comment: ['{1} is a field name such as clientId and is not translated'] }, "entry {0} field {1} is not a string ({2})", index, field, valueType),
+	}),
+	noAuthorizationServer: (index: number): InvalidStoredProviderListReason => ({
+		reason: `entry ${index} has no authorizationServer and no legacy issuer`,
+		localizedReason: localize({ key: 'dynamicAuthProviders.invalidList.noAuthorizationServer', comment: ['authorizationServer and issuer are field names and are not translated'] }, "entry {0} has no authorizationServer and no legacy issuer", index),
+	}),
+};
 
 /**
  * The stored dynamic authentication provider list is present but unreadable. Carries the storage key and a
- * reason; never the stored text.
+ * stable structural reason; its message is localized. Never carries the stored text.
  */
 export class InvalidStoredProviderListError extends Error {
-	constructor(readonly storageKey: string, readonly reason: string) {
-		super(`Stored dynamic authentication provider list '${storageKey}' is invalid: ${reason}. It was left unchanged.`);
+	readonly reason: string;
+	constructor(readonly storageKey: string, reason: InvalidStoredProviderListReason) {
+		super(localize('dynamicAuthProviders.invalidList', "Stored dynamic authentication provider list '{0}' is invalid: {1}. It was left unchanged.", storageKey, reason.localizedReason));
 		this.name = 'InvalidStoredProviderListError';
+		this.reason = reason.reason;
 	}
+}
+
+/** A stored entry after validation and before the issuer migration. */
+type StoredProviderInfo = { providerId: string; clientId: string; label: string; authorizationServer?: string; issuer?: string };
+
+const REQUIRED_STRING_FIELDS = ['providerId', 'clientId', 'label'] as const;
+const OPTIONAL_STRING_FIELDS = ['authorizationServer', 'issuer'] as const;
+
+/** The JSON type of a stored value, for a diagnostic; never the value itself. */
+function describeType(value: unknown): string {
+	if (value === null) {
+		return 'null';
+	}
+	return Array.isArray(value) ? 'array' : typeof value;
 }
 
 export class DynamicAuthenticationProviderStorageService extends Disposable implements IDynamicAuthenticationProviderStorageService {
@@ -133,9 +183,11 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 
 	/**
 	 * Reads the stored provider list. An absent key is a real empty list. A present value that is not
-	 * JSON, not an array, or holds an entry that is not an object with a string `providerId` is logged
-	 * (key and reason only, never the stored text) and thrown as {@link InvalidStoredProviderListError},
-	 * so no caller can write a replacement list over it.
+	 * JSON, not an array, or holds an entry that is not a {@link DynamicAuthenticationProviderInfo} (an object
+	 * with string `providerId`, `clientId` and `label`, an optional string `authorizationServer` and `issuer`,
+	 * and a non-empty `authorizationServer` or, in the legacy form the migration below reads, a string `issuer`)
+	 * is logged (key and structural reason only, never the stored text) and thrown as
+	 * {@link InvalidStoredProviderListError}, so no caller can write a replacement list over it.
 	 */
 	private _getStoredProviders(): DynamicAuthenticationProviderInfo[] {
 		const storageKey = DynamicAuthenticationProviderStorageService.PROVIDERS_STORAGE_KEY;
@@ -150,20 +202,35 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		} catch (error) {
 			// The parse message quotes its input, so only the error class is carried.
 			const errorClass = error instanceof Error ? error.name : typeof error;
-			throw this._invalidStoredProviders(storageKey, `not valid JSON (${errorClass})`);
+			throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.notJson(errorClass));
 		}
 
 		if (!Array.isArray(parsed)) {
-			throw this._invalidStoredProviders(storageKey, `not an array (${parsed === null ? 'null' : typeof parsed})`);
+			throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.notArray(describeType(parsed)));
 		}
 
-		const providerInfos: { providerId: string; authorizationServer?: unknown; issuer?: unknown }[] = [];
+		const providerInfos: StoredProviderInfo[] = [];
 		for (let index = 0; index < parsed.length; index++) {
 			const entry: unknown = parsed[index];
-			if (typeof entry !== 'object' || entry === null || Array.isArray(entry) || typeof (entry as { providerId?: unknown }).providerId !== 'string') {
-				throw this._invalidStoredProviders(storageKey, `entry ${index} is not an object with a string providerId`);
+			if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+				throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.entryNotObject(index, describeType(entry)));
 			}
-			providerInfos.push(entry as { providerId: string; authorizationServer?: unknown; issuer?: unknown });
+			const fields = entry as Record<string, unknown>;
+			for (const field of REQUIRED_STRING_FIELDS) {
+				if (typeof fields[field] !== 'string') {
+					throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.fieldNotString(index, field, describeType(fields[field])));
+				}
+			}
+			for (const field of OPTIONAL_STRING_FIELDS) {
+				if (fields[field] !== undefined && typeof fields[field] !== 'string') {
+					throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.fieldNotString(index, field, describeType(fields[field])));
+				}
+			}
+			// The migration below replaces an empty or absent authorizationServer with the legacy issuer.
+			if (!fields.authorizationServer && typeof fields.issuer !== 'string') {
+				throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.noAuthorizationServer(index));
+			}
+			providerInfos.push(entry as StoredProviderInfo);
 		}
 
 		// MIGRATION: remove after an iteration or 2
@@ -175,9 +242,10 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return providerInfos as DynamicAuthenticationProviderInfo[];
 	}
 
-	private _invalidStoredProviders(storageKey: string, reason: string): InvalidStoredProviderListError {
+	private _invalidStoredProviders(storageKey: string, reason: InvalidStoredProviderListReason): InvalidStoredProviderListError {
 		const error = new InvalidStoredProviderListError(storageKey, reason);
-		this.logService.error(error.message);
+		// Logs stay in English whatever the display language: the stable reason, not the localized message.
+		this.logService.error(`${error.name}: stored dynamic authentication provider list '${storageKey}' is invalid: ${error.reason}. It was left unchanged.`);
 		return error;
 	}
 
