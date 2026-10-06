@@ -191,7 +191,10 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		assert.strictEqual(provider.clientSecret, 'client-secret-1');
 		assert.ok(fetchStub.getCalls().every(c => String(c.args[0]) !== REGISTRATION_ENDPOINT), 'no dynamic registration request');
 		assert.strictEqual(calls.registrationPrompts, 0);
-		assert.ok(logger.lines.some(l => l.includes('DynamicAuthClientRejectedError')), 'the refresh failure log names the rejected client');
+		// The log line's text is F-SECRETS-2's (describeOAuthFailure: a fixed message for an error that is not its safe type); the rejected
+		// client is named by the rejection asserted above. The failure is logged once, without the response body.
+		assert.ok(logger.lines.some(l => l.startsWith('Failed to refresh token: ')), 'the refresh failure is logged');
+		assert.ok(logger.lines.every(l => !l.includes('invalid_client"')), 'no response body in any log line');
 	});
 
 	test('invalid_client on code exchange keeps the client registration and stops sign-in, named', async () => {
