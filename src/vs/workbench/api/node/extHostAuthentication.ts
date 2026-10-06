@@ -231,7 +231,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 
 		if (!deviceCodeResponse.ok && await this._isInvalidClientResponse(deviceCodeResponse)) {
 			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
-			throw new DynamicAuthClientRejectedError(this.id, this.label);
+			throw new DynamicAuthClientRejectedError(this._errorLabel);
 		}
 		if (!deviceCodeResponse.ok) {
 			// Status and a vetted OAuth error code only: the body can hold the device code
@@ -344,7 +344,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 						throw new CancellationError();
 					} else if (errorCode === AuthorizationErrorType.InvalidClient) {
 						this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
-						throw new DynamicAuthClientRejectedError(this.id, this.label);
+						throw new DynamicAuthClientRejectedError(this._errorLabel);
 					} else {
 						throw new OAuthSafeError(formatOAuthHttpFailure('Token request', tokenResponse, { kind: 'json', body: errorBody }));
 					}
