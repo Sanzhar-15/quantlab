@@ -108,6 +108,14 @@ export function requestAuthorization(headers: Record<string, string> | undefined
 }
 
 export function createMcpHttpHarnessFrom(setup: IMcpHttpHarnessSetup): IMcpHttpHarness {
+	return createMcpHttpHarnessAt(HARNESS_MCP_URL, setup);
+}
+
+/**
+ * As {@link createMcpHttpHarnessFrom}, with the server's configured URL given (for example one with user info or a query).
+ * `posts` lists the POSTs to exactly that URL.
+ */
+export function createMcpHttpHarnessAt(mcpUrl: string, setup: IMcpHttpHarnessSetup): IMcpHttpHarness {
 	const posts: (string | undefined)[] = [];
 	const requests: { method: string | undefined; url: string; authorization: string | undefined }[] = [];
 	const tokenRequests: (IMcpAuthenticationOptions | undefined)[] = [];
@@ -123,10 +131,10 @@ export function createMcpHttpHarnessFrom(setup: IMcpHttpHarnessSetup): IMcpHttpH
 		},
 		$getTokenForProviderId: (_id, providerId, scopes) => setup.getTokenForProvider(providerId, scopes),
 	};
-	const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(HARNESS_MCP_URL), headers: setup.launchHeaders, authentication: setup.authentication };
+	const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(mcpUrl), headers: setup.launchHeaders, authentication: setup.authentication };
 	const handle = new TestMcpHTTPHandle(launch, proxy as MainThreadMcpShape, new TraceLogService(), (url, init) => {
 		requests.push({ method: init?.method, url, authorization: requestAuthorization(init?.headers) });
-		if (url === HARNESS_MCP_URL && init?.method === 'POST') {
+		if (url === mcpUrl && init?.method === 'POST') {
 			posts.push(requestAuthorization(init.headers));
 		}
 		return setup.transport(url, init);

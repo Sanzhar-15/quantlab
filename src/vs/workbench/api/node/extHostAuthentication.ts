@@ -6,7 +6,7 @@
 import * as nls from '../../../nls.js';
 import type * as vscode from 'vscode';
 import { URL } from 'url';
-import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, IExtHostAuthentication } from '../common/extHostAuthentication.js';
+import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, IExtHostAuthentication, scopeCountText } from '../common/extHostAuthentication.js';
 import { IExtHostRpcService } from '../common/extHostRpcService.js';
 import { IExtHostInitDataService } from '../common/extHostInitDataService.js';
 import { IExtHostWindow } from '../common/extHostWindow.js';
@@ -143,7 +143,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 
 		try {
 			// Open the browser for user authorization
-			this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
+			this._logger.info(`Opening authorization URL for ${scopeCountText(scopes)}`);
 			let opened: boolean;
 			try {
 				opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
@@ -176,7 +176,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 				this._logger.error(`Failed to receive authorization code: ${detail}`);
 				throw new OAuthSafeError(`Failed to receive authorization code: ${detail}`);
 			}
-			this._logger.info(`Authorization code received for scopes: ${scopeString}`);
+			this._logger.info(`Authorization code received for ${scopeCountText(scopes)}`);
 
 			// Exchange the authorization code for tokens
 			const tokenResponse = await this.exchangeCodeForToken(code, codeVerifier, server.redirectUri);
@@ -199,7 +199,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 
 		const deviceAuthUrl = this._serverMetadata.device_authorization_endpoint;
 		const scopeString = scopes.join(' ');
-		this._logger.info(`Starting device code flow for scopes: ${scopeString}`);
+		this._logger.info(`Starting device code flow for ${scopeCountText(scopes)}`);
 
 		// Step 1: Request device and user codes
 		const deviceCodeRequest = new URLSearchParams();
@@ -322,7 +322,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 						this._logger.error(describeOAuthFailure(error, 'the request failed unexpectedly'));
 						throw error;
 					}
-					this._logger.info(`Device code flow completed successfully for scopes: ${scopeString}`);
+					this._logger.info(`Device code flow completed successfully for ${scopeCountText(scopes)}`);
 					return tokenData;
 				} else {
 					// A failure body is read as text and parsed without keeping any parser message; a malformed one

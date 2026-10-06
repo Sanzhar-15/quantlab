@@ -37,6 +37,15 @@ export interface IExtHostAuthentication extends ExtHostAuthentication { }
 export function errorClassName(error: unknown): string {
 	return error instanceof Error ? error.name : typeof error;
 }
+
+/**
+ * Scopes for a log line: their count, never their values. A scope can come from a server (an MCP WWW-Authenticate challenge
+ * or the resource metadata's scopes_supported), so its text is not a log value. The scopes used for authentication are not
+ * changed.
+ */
+export function scopeCountText(scopes: readonly string[]): string {
+	return `${scopes.length} scope(s)`;
+}
 export const IExtHostAuthentication = createDecorator<IExtHostAuthentication>('IExtHostAuthentication');
 
 interface ProviderWithMetadata {
@@ -507,7 +516,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	}
 
 	async getSessions(scopes: readonly string[] | undefined, _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession[]> {
-		this._logger.info(`Getting sessions for scopes: ${scopes?.join(' ') ?? 'all'}`);
+		// Scope counts only, never values: a scope can come from a server (an MCP challenge or the resource metadata).
+		this._logger.info(scopes ? `Getting sessions for ${scopeCountText(scopes)}` : 'Getting sessions for all scopes');
 		// A change that could not be saved earlier is saved first: no read reports success over an unsaved credential.
 		await this._tokenStore.savePending();
 		if (!scopes) {
@@ -519,7 +529,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		const sortedScopes = [...scopes].sort();
 		const scopeStr = scopes.join(' ');
 		let sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
-		this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
+		this._logger.info(`Found ${sessions.length} sessions for ${scopeCountText(scopes)}`);
 		if (sessions.length) {
 			const newTokens: IAuthorizationToken[] = [];
 			const removedTokens: IAuthorizationToken[] = [];
@@ -557,7 +567,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 								this._logger.warn('Token scopes do not match the requested scopes. Overwriting token with what was requested...');
 								newToken.scope = scopeStr;
 							}
-							this._logger.info(`Successfully created a new token for scopes ${session.scopes.join(' ')}.`);
+							this._logger.info(`Successfully created a new token for ${scopeCountText(session.scopes)}.`);
 							newTokens.push(newToken);
 							refreshedTokens.add(token);
 						} catch (err) {
@@ -583,14 +593,14 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			if (expiredTokens.length) {
 				throw new DynamicAuthSessionExpiredError(this.id, this.label, expiredTokens.length);
 			}
-			this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
+			this._logger.info(`Found ${sessions.length} sessions for ${scopeCountText(scopes)}`);
 			return sessions;
 		}
 		return [];
 	}
 
 	async createSession(scopes: string[], _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
-		this._logger.info(`Creating session for scopes: ${scopes.join(' ')}`);
+		this._logger.info(`Creating session for ${scopeCountText(scopes)}`);
 		// Saved before the user is asked to sign in: a storage that cannot save would lose the new session too.
 		await this._tokenStore.savePending();
 		let token: IAuthorizationTokenResponse | undefined;
@@ -656,7 +666,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		// Store session for later retrieval
 		await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
 		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
-		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for scopes: ${scopes.join(' ')}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
+		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for ${scopeCountText(scopes)}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
 	}
 
@@ -675,7 +685,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			return;
 		}
 		await this._tokenStore.update({ added: [], removed: [token] });
-		this._logger.info(`Removed token for session: ${session.id} with scopes: ${session.scopes.join(' ')}`);
+		this._logger.info(`Removed token for session: ${session.id} with ${scopeCountText(session.scopes)}`);
 	}
 
 	dispose(): void {
@@ -729,7 +739,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		const promise = this.waitForAuthorizationCode(callbackUri);
 
 		// Open the browser for user authorization
-		this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
+		this._logger.info(`Opening authorization URL for ${scopeCountText(scopes)}`);
 		let opened: boolean;
 		try {
 			opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
@@ -762,7 +772,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.error(`Failed to receive authorization code: ${detail}`);
 			throw new OAuthSafeError(`Failed to receive authorization code: ${detail}`);
 		}
-		this._logger.info(`Authorization code received for scopes: ${scopeString}`);
+		this._logger.info(`Authorization code received for ${scopeCountText(scopes)}`);
 
 		// Exchange the authorization code for tokens
 		const tokenResponse = await this.exchangeCodeForToken(code, codeVerifier, redirectUri);

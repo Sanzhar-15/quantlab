@@ -6,10 +6,10 @@
 import * as assert from 'assert';
 import * as sinon from 'sinon';
 import { LogLevel } from '../../../../platform/log/common/log.js';
-import { createAuthMetadata, CommonResponse, IAuthMetadata } from '../../common/extHostMcp.js';
+import { createAuthMetadata, CommonRequestInit, CommonResponse, IAuthMetadata } from '../../common/extHostMcp.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { SecretDecryptionError } from '../../../../platform/secrets/common/secrets.js';
-import { createMcpHttpHarness, createMcpHttpHarnessFrom, errorStateMessages, HARNESS_MCP_URL, harnessResponse, harnessStreamResponse, IMcpHttpHarness } from './mcpHttpHandleHarness.js';
+import { createMcpHttpHarness, createMcpHttpHarnessAt, createMcpHttpHarnessFrom, errorStateMessages, HARNESS_MCP_URL, harnessResponse, harnessStreamResponse, IMcpHttpHarness } from './mcpHttpHandleHarness.js';
 
 // Test constants to avoid magic strings
 const TEST_MCP_URL = 'https://example.com/mcp';
@@ -509,7 +509,7 @@ suite('ExtHostMcp', () => {
 
 			assert.ok(authMetadata.authorizationServer.toString().startsWith(TEST_AUTH_SERVER));
 
-			// Verify the resource_metadata URL was logged
+			// Verify the resource_metadata challenge was found (its URL is server-provided and not logged)
 			assert.ok(logMessages.some(m =>
 				m.level === LogLevel.Debug &&
 				m.message.includes('resource_metadata challenge')
@@ -1059,7 +1059,7 @@ suite('McpHTTPHandle authentication failures', () => {
 	}
 
 	for (const name of CONFIGURED_AUTH_NAMES) {
-		test(`the request trace masks a configured '${name}' header and a generated one; no credential reaches a log line`, async () => {
+		test(`the request trace names a configured '${name}' header and the generated one, never a value; no credential reaches a log line`, async () => {
 			const CONFIGURED = 'CONFIGURED-SECRET-71a';
 			const GENERATED = 'GENERATED-SECRET-2f9';
 			let postCount = 0;
@@ -1082,17 +1082,212 @@ suite('McpHTTPHandle authentication failures', () => {
 
 			// The credentials did go on the wire, so their absence from the trace is the masking.
 			assert.strictEqual(harness.posts.length, 2, `${harness.posts.length} POSTs`);
-			assert.ok(harness.posts[0]?.includes(CONFIGURED), 'the configured header was sent');
-			assert.ok(harness.posts[1]?.includes(GENERATED), 'the generated header was sent');
-			const postTraces = harness.logs.filter(l => l.startsWith(`Fetching ${HARNESS_MCP_URL} with options:`) && l.includes('"method":"POST"'));
+			assert.strictEqual(harness.posts[0], `Bearer ${CONFIGURED}`, 'the configured header was sent');
+			// F-SECRETS-5: the generated token replaces the configured header in any casing: one value is sent.
+			assert.strictEqual(harness.posts[1], `Bearer ${GENERATED}`, 'the generated header was sent, alone');
+			// F-SECRETS-5: the trace names the headers and never prints a value.
+			const postTraces = harness.logs.filter(l => l.startsWith(`Fetching POST ${HARNESS_MCP_URL};`));
 			assert.strictEqual(postTraces.length, 2, postTraces.join('\n'));
-			for (const line of postTraces) {
-				assert.ok(line.includes(`"${name}":"***"`), `the configured header is masked: ${line}`);
-			}
-			assert.ok(postTraces[1].includes('"Authorization":"***"'), `the generated header is masked: ${postTraces[1]}`);
+			assert.ok(postTraces[0].includes(`header names: [${name}, `), `the configured header is named: ${postTraces[0]}`);
+			assert.ok(postTraces[1].includes('Authorization]') || postTraces[1].includes('Authorization, '), `the generated header is named: ${postTraces[1]}`);
 			for (const line of [...harness.logs, ...harness.states.map(s => JSON.stringify(s))]) {
 				assert.ok(!line.includes(CONFIGURED) && !line.includes(GENERATED), `a credential reached a log line or the state: ${line}`);
 			}
 		});
+	}
+});
+
+// F-SECRETS-5 (R-86): the request/response trace and every log line or server state that names a request print the method,
+// the URL without user info or query (and without a server-provided path), header NAMES and the body's byte length only.
+suite('F-SECRETS-5: no request or response value reaches an MCP log line', () => {
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+
+	const PLANTED = {
+		header: 'PLANT-HEADER-a41',
+		cookie: 'PLANT-COOKIE-b52',
+		query: 'PLANT-QUERY-c63',
+		userinfo: 'PLANT-USERINFO-d74',
+		rpc: 'PLANT-RPC-ARG-e85',
+		formCode: 'PLANT-FORM-CODE-f96',
+		formSecret: 'PLANT-FORM-SECRET-0a7',
+		token: 'PLANT-TOKEN-1b8',
+		redirectPath: 'PLANT-REDIRECT-PATH-2c9',
+		redirectQuery: 'PLANT-REDIRECT-QUERY-3da',
+		responseHeader: 'PLANT-RESPONSE-HEADER-4eb',
+		ssePath: 'PLANT-SSE-PATH-5fc',
+		sseQuery: 'PLANT-SSE-QUERY-60d',
+		transportError: 'PLANT-TRANSPORT-ERROR-71e',
+	};
+	const PLANTED_VALUES = Object.values(PLANTED);
+	const MCP_URL = `https://user:${PLANTED.userinfo}@mcp.example.com/mcp?api_key=${PLANTED.query}`;
+	const LOGGED_ENDPOINT = 'https://mcp.example.com/mcp';
+	const LAUNCH_HEADERS: [string, string][] = [['x-api-key', PLANTED.header], ['Cookie', `session=${PLANTED.cookie}`]];
+	const RPC_MESSAGE = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"secret":"${PLANTED.rpc}"}}}`;
+	const FORM_MESSAGE = `grant_type=authorization_code&code=${PLANTED.formCode}&client_secret=${PLANTED.formSecret}`;
+
+	interface IWireRequest { method: string | undefined; url: string; headers: Record<string, string>; body: string | undefined }
+
+	function wireRecord(wire: IWireRequest[], url: string, init: CommonRequestInit | undefined): void {
+		wire.push({ method: init?.method, url, headers: { ...init?.headers }, body: init?.body ? new TextDecoder().decode(init.body) : undefined });
+	}
+
+	function byteLength(text: string): number {
+		return new TextEncoder().encode(text).byteLength;
+	}
+
+	async function waitFor(condition: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!condition() && Date.now() < deadline) {
+			await new Promise(resolve => setTimeout(resolve, 5));
+		}
+		assert.ok(condition(), `timed out waiting for ${what}`);
+	}
+
+	function assertNoPlantedValue(harness: IMcpHttpHarness): void {
+		assert.ok(harness.logs.length > 0, 'the handle logged nothing: the recorder is not attached');
+		for (const line of [...harness.logs, ...harness.states.map(state => JSON.stringify(state))]) {
+			for (const value of PLANTED_VALUES) {
+				assert.ok(!line.includes(value), `a planted value (${value}) reached a log line or the server state: ${line}`);
+			}
+		}
+	}
+
+	test('streamable HTTP: the trace names method, URL without query, header names and body length; no planted value is logged', async function () {
+		this.timeout(10_000); // the backchannel retries once after a second
+		const wire: IWireRequest[] = [];
+		let mcpPosts = 0;
+		let backchannelGets = 0;
+		const harness = createMcpHttpHarnessAt(MCP_URL, {
+			getToken: async () => PLANTED.token,
+			getTokenForProvider: () => Promise.reject(new Error('not used')),
+			authentication: undefined,
+			launchHeaders: LAUNCH_HEADERS,
+			transport: async (url, init) => {
+				wireRecord(wire, url, init);
+				if (url === MCP_URL && init?.method === 'POST') {
+					switch (++mcpPosts) {
+						case 1: return harnessResponse(401, url, { 'WWW-Authenticate': 'Bearer realm="example"' });
+						case 2: return harnessResponse(307, url, { 'location': `https://cdn.example.com/${PLANTED.redirectPath}?code=${PLANTED.redirectQuery}` });
+						default: return harnessResponse(202, url, { 'x-echo': PLANTED.responseHeader });
+					}
+				}
+				if (url.startsWith('https://cdn.example.com/') && init?.method === 'POST') {
+					return harnessResponse(200, url, { 'content-type': 'application/json', 'set-cookie': `s=${PLANTED.responseHeader}`, 'x-echo': PLANTED.responseHeader }, '{}');
+				}
+				if (url === MCP_URL && init?.method === 'GET' && ++backchannelGets === 1) {
+					throw new Error(`transport said ${PLANTED.transportError}`);
+				}
+				return harnessResponse(404, url, { 'x-echo': PLANTED.responseHeader }, `{"echo":"${PLANTED.responseHeader}"}`);
+			},
+		});
+		store.add(harness.handle);
+
+		await harness.handle.send(RPC_MESSAGE);
+		await harness.handle.send(FORM_MESSAGE);
+		await waitFor(() => harness.logs.some(l => l.endsWith('for async notifications; they will be disabled')), 'the backchannel to stop', 5000);
+
+		// Every planted value did go on the wire, so its absence from the logs is the cure.
+		const posts = wire.filter(r => r.method === 'POST');
+		assert.deepStrictEqual(posts.map(r => r.url.startsWith('https://cdn.example.com/') ? 'cdn' : r.url), [MCP_URL, MCP_URL, 'cdn', MCP_URL]);
+		const onWire = JSON.stringify(wire);
+		for (const value of [PLANTED.header, PLANTED.cookie, PLANTED.query, PLANTED.userinfo, PLANTED.rpc, PLANTED.formCode, PLANTED.formSecret, PLANTED.token, PLANTED.redirectPath, PLANTED.redirectQuery]) {
+			assert.ok(onWire.includes(value), `${value} was not sent: the test proves nothing`);
+		}
+		assertNoPlantedValue(harness);
+
+		const postTraces = harness.logs.filter(l => l.startsWith(`Fetching POST ${LOGGED_ENDPOINT};`));
+		assert.strictEqual(postTraces.length, 3, postTraces.join('\n'));
+		for (const line of postTraces) {
+			for (const name of ['x-api-key', 'Cookie', 'Content-Type', 'Content-Length', 'Accept', 'user-agent']) {
+				assert.ok(line.includes(name), `the header name ${name} is in the trace: ${line}`);
+			}
+		}
+		assert.ok(postTraces[0].endsWith(`; body: ${byteLength(RPC_MESSAGE)} bytes`), postTraces[0]);
+		assert.ok(postTraces[1].includes('Authorization') && postTraces[1].endsWith(`; body: ${byteLength(RPC_MESSAGE)} bytes`), postTraces[1]);
+		assert.ok(postTraces[2].includes('Authorization') && postTraces[2].endsWith(`; body: ${byteLength(FORM_MESSAGE)} bytes`), postTraces[2]);
+		assert.ok(harness.logs.includes(`Redirect (307) from ${LOGGED_ENDPOINT} to https://cdn.example.com (server-provided path not logged)`), harness.logs.join('\n'));
+		assert.ok(harness.logs.includes(`404 status connecting to ${LOGGED_ENDPOINT} for async notifications; they will be disabled`), harness.logs.join('\n'));
+		const cdnFetched = harness.logs.find(l => l.startsWith('Fetched https://cdn.example.com (server-provided path not logged): status 200; header names: ['));
+		assert.ok(cdnFetched?.includes('set-cookie') && cdnFetched.includes('x-echo'), `the response trace names the response headers: ${cdnFetched}`);
+		assert.ok(harness.logs.some(l => l.startsWith(`Fetching GET ${LOGGED_ENDPOINT};`) && l.endsWith('; body: none')), 'a request without a body says so');
+		assert.ok(harness.logs.includes(`Error connecting to ${LOGGED_ENDPOINT} for async notifications, will retry`), harness.logs.join('\n'));
+	});
+
+	test('legacy SSE: the fallback, the attach and a failing POST to the server-provided endpoint log no planted value', async () => {
+		const wire: IWireRequest[] = [];
+		const harness = createMcpHttpHarnessAt(MCP_URL, {
+			getToken: () => Promise.reject(new Error('not used')),
+			getTokenForProvider: () => Promise.reject(new Error('not used')),
+			authentication: undefined,
+			launchHeaders: LAUNCH_HEADERS,
+			transport: async (url, init) => {
+				wireRecord(wire, url, init);
+				if (url === MCP_URL && init?.method === 'POST') {
+					return harnessResponse(405, url, { 'x-echo': PLANTED.responseHeader }); // not streamable HTTP: fall back to legacy SSE
+				}
+				if (url === MCP_URL && init?.method === 'GET') {
+					return new Response(`event: endpoint\ndata: /messages/${PLANTED.ssePath}?sessionId=${PLANTED.sseQuery}\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } }) as unknown as CommonResponse;
+				}
+				if (url.includes('/messages/') && init?.method === 'POST') {
+					return harnessResponse(500, url, { 'x-echo': PLANTED.responseHeader }, `{"echo":"${PLANTED.responseHeader}"}`);
+				}
+				return harnessResponse(404, url);
+			},
+		});
+		store.add(harness.handle);
+
+		await harness.handle.send(RPC_MESSAGE);
+		await waitFor(() => harness.logs.some(l => l.startsWith('500 status sending message to')), 'the legacy POST line');
+
+		const legacyPost = wire.find(r => r.url.includes('/messages/'));
+		assert.ok(legacyPost?.url.includes(PLANTED.ssePath) && legacyPost.url.includes(PLANTED.sseQuery) && legacyPost.body?.includes(PLANTED.rpc), 'the planted values were sent');
+		assertNoPlantedValue(harness);
+		assert.ok(harness.logs.includes('500 status sending message to https://mcp.example.com (server-provided path not logged)'), harness.logs.join('\n'));
+		assert.ok(harness.logs.includes(`405 status sending message to ${LOGGED_ENDPOINT}, will attempt to fall back to legacy SSE`), harness.logs.join('\n'));
+		assert.ok(harness.logs.some(l => l.startsWith('Fetching POST https://mcp.example.com (server-provided path not logged);') && l.endsWith(`; body: ${byteLength(RPC_MESSAGE)} bytes`)), harness.logs.join('\n'));
+	});
+
+	// R-91 seat (accepted): a configured Authorization header in any casing plus a generated token. DECIDED: the generated
+	// token replaces the configured header in every casing; exactly one Authorization value is sent.
+	for (const configuredName of ['authorization', 'AUTHORIZATION', 'AuThOrIzAtIoN', 'Authorization']) {
+		for (const source of ['server metadata', 'provided authentication config'] as const) {
+			test(`duplicate Authorization: a configured '${configuredName}' header and a token from ${source} send exactly one Authorization value`, async () => {
+				const CONFIGURED = 'Bearer DUP-CONFIGURED-8f1';
+				const GENERATED = 'DUP-GENERATED-9a2';
+				const wire: IWireRequest[] = [];
+				let mcpPosts = 0;
+				const harness = createMcpHttpHarnessFrom({
+					getToken: async () => GENERATED,
+					getTokenForProvider: async () => GENERATED,
+					authentication: source === 'provided authentication config' ? { providerId: 'example', scopes: ['read'] } : undefined,
+					launchHeaders: [[configuredName, CONFIGURED]],
+					transport: async (url, init) => {
+						wireRecord(wire, url, init);
+						if (url === HARNESS_MCP_URL && init?.method === 'POST') {
+							return source === 'server metadata' && ++mcpPosts === 1
+								? harnessResponse(401, url, { 'WWW-Authenticate': 'Bearer realm="example"' })
+								: harnessResponse(202, url);
+						}
+						return harnessResponse(404, url);
+					},
+				});
+				store.add(harness.handle);
+
+				await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+
+				const withToken = wire.filter(r => Object.values(r.headers).some(v => v.includes(GENERATED)));
+				assert.ok(withToken.length >= 1, 'the generated token was sent');
+				for (const request of withToken) {
+					const keys = Object.keys(request.headers).filter(k => k.toLowerCase() === 'authorization');
+					assert.deepStrictEqual(keys, ['Authorization'], `one Authorization key: ${JSON.stringify(keys)}`);
+					assert.strictEqual(request.headers['Authorization'], `Bearer ${GENERATED}`);
+				}
+				assert.strictEqual(harness.posts[harness.posts.length - 1], `Bearer ${GENERATED}`, 'the request carries the generated token alone');
+				assert.ok(harness.logs.includes('Replaced 1 existing Authorization header value(s) with the obtained token'), harness.logs.join('\n'));
+				for (const line of harness.logs) {
+					assert.ok(!line.includes('DUP-CONFIGURED') && !line.includes(GENERATED), `a credential reached a log line: ${line}`);
+				}
+			});
+		}
 	}
 });

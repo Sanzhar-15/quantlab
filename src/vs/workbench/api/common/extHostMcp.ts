@@ -283,7 +283,6 @@ export class McpAuthenticationFailedError extends Error {
  */
 export class McpHTTPHandle extends Disposable {
 	private readonly _requestSequencer = new Sequencer();
-	private readonly _postEndpoint = new DeferredPromise<{ url: string; transport: McpServerTransportHTTP }>();
 	private _mode: HttpModeT = { value: HttpMode.Unknown };
 	private readonly _cts = new CancellationTokenSource();
 	private readonly _abortCtrl = new AbortController();
@@ -314,7 +313,7 @@ export class McpHTTPHandle extends Disposable {
 				await this._send(message);
 			}
 		} catch (err) {
-			const msg = `Error sending message to ${this._launch.uri}: ${safeErrorText(err)}`;
+			const msg = `Error sending message to ${this._endpointForLog()}: ${safeErrorText(err)}`;
 			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: msg });
 		}
 	}
@@ -401,7 +400,7 @@ export class McpHTTPHandle extends Disposable {
 			// ...except for auth errors
 			&& !isAuthStatusCode(res.status)
 		) {
-			this._log(LogLevel.Info, `${res.status} status sending message to ${this._launch.uri}, will attempt to fall back to legacy SSE`);
+			this._log(LogLevel.Info, `${res.status} status sending message to ${this._endpointForLog()}, will attempt to fall back to legacy SSE`);
 			this._sseFallbackWithMessage(message);
 			return;
 		}
@@ -414,7 +413,7 @@ export class McpHTTPHandle extends Disposable {
 
 			this._proxy.$onDidChangeState(this._id, {
 				state: McpConnectionState.Kind.Error,
-				message: `${res.status} status sending message to ${this._launch.uri}` + (retryWithSessionId ? `; will retry with new session ID` : ''),
+				message: `${res.status} status sending message to ${this._endpointForLog()}` + (retryWithSessionId ? `; will retry with new session ID` : ''),
 				shouldRetry: retryWithSessionId,
 			});
 			return;
@@ -439,7 +438,7 @@ export class McpHTTPHandle extends Disposable {
 				await this._sendLegacySSE(endpoint, message);
 			} catch (err) {
 				// Only the error's class: its text is not safe by construction.
-				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._launch.uri}: ${safeErrorText(err)}` });
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._endpointForLog()}: ${safeErrorText(err)}` });
 			}
 		}
 	}
@@ -456,7 +455,7 @@ export class McpHTTPHandle extends Disposable {
 					this._proxy.$onDidReceiveMessage(this._id, event.data);
 				} else if (event.type === 'endpoint') {
 					// An SSE server that didn't correctly return a 4xx status when we POSTed
-					this._log(LogLevel.Warning, `Received SSE endpoint from a POST to ${this._launch.uri}, will fall back to legacy SSE`);
+					this._log(LogLevel.Warning, `Received SSE endpoint from a POST to ${this._endpointForLog()}, will fall back to legacy SSE`);
 					this._sseFallbackWithMessage(message);
 					throw new CancellationError(); // just to end the SSE stream
 				}
@@ -474,8 +473,8 @@ export class McpHTTPHandle extends Disposable {
 			if (isJSON(responseBody)) { // try to read as JSON even if the server didn't set the content type
 				this._proxy.$onDidReceiveMessage(this._id, responseBody);
 			} else {
-				// Not the body: a response may echo a credential.
-				this._log(LogLevel.Warning, `Unexpected ${res.status} response for request: content type '${contentType}', ${responseBody.length} characters, not JSON`);
+				// Not the body, nor the Content-Type value: a response may echo a credential in either.
+				this._log(LogLevel.Warning, `Unexpected ${res.status} response for request: a content type other than JSON or an event stream, ${responseBody.length} characters, not JSON`);
 			}
 		}
 	}
@@ -522,15 +521,15 @@ export class McpHTTPHandle extends Disposable {
 			} catch (e) {
 				if (e instanceof McpAuthorizationRejectedError || e instanceof McpAuthenticationFailedError) {
 					// Retrying cannot succeed without an act of the user; stop, as for any other 4xx status below.
-					this._log(LogLevel.Warning, `Async notifications from ${this._launch.uri} are disabled: ${e.name}`);
+					this._log(LogLevel.Warning, `Async notifications from ${this._endpointForLog()} are disabled: ${e.name}`);
 					return;
 				}
-				this._log(LogLevel.Info, `Error connecting to ${this._launch.uri} for async notifications, will retry`);
+				this._log(LogLevel.Info, `Error connecting to ${this._endpointForLog()} for async notifications, will retry`);
 				continue;
 			}
 
 			if (res.status >= 400) {
-				this._log(LogLevel.Debug, `${res.status} status connecting to ${this._launch.uri} for async notifications; they will be disabled`);
+				this._log(LogLevel.Debug, `${res.status} status connecting to ${this._endpointForLog()} for async notifications; they will be disabled`);
 				return;
 			}
 
@@ -583,11 +582,11 @@ export class McpHTTPHandle extends Disposable {
 				headers
 			);
 			if (res.status >= 300) {
-				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `${res.status} status connecting to ${this._launch.uri} as SSE` });
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `${res.status} status connecting to ${this._endpointForLog()} as SSE` });
 				return;
 			}
 		} catch (e) {
-			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error connecting to ${this._launch.uri} as SSE: ${safeErrorText(e)}` });
+			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error connecting to ${this._endpointForLog()} as SSE: ${safeErrorText(e)}` });
 			return;
 		}
 
@@ -631,7 +630,7 @@ export class McpHTTPHandle extends Disposable {
 			throw new McpAuthorizationRejectedError(res.status);
 		}
 		if (res.status >= 300) {
-			this._log(LogLevel.Warning, `${res.status} status sending message to ${this._postEndpoint}`);
+			this._log(LogLevel.Warning, `${res.status} status sending message to ${this._urlForLog(url)}`);
 		}
 	}
 
@@ -681,7 +680,7 @@ export class McpHTTPHandle extends Disposable {
 						errorOnUserInteraction: this._errorOnUserInteraction,
 					});
 				if (token) {
-					headers['Authorization'] = `Bearer ${token}`;
+					this._setAuthorizationHeader(headers, `Bearer ${token}`);
 				}
 			} catch (e) {
 				if (UserInteractionRequiredError.is(e)) {
@@ -695,7 +694,8 @@ export class McpHTTPHandle extends Disposable {
 		}
 		if (this._launch.authentication) {
 			try {
-				this._log(LogLevel.Debug, `Using provided authentication config: providerId=${this._launch.authentication.providerId}, scopes=${this._launch.authentication.scopes.join(', ')}`);
+				// The scope values are not logged, only their count: wherever a scope can come from, it is not a log value.
+				this._log(LogLevel.Debug, `Using provided authentication config: providerId=${this._launch.authentication.providerId}, ${scopeCountText(this._launch.authentication.scopes)}`);
 				const token = await this._proxy.$getTokenForProviderId(
 					this._id,
 					this._launch.authentication.providerId,
@@ -705,7 +705,7 @@ export class McpHTTPHandle extends Disposable {
 					}
 				);
 				if (token) {
-					headers['Authorization'] = `Bearer ${token}`;
+					this._setAuthorizationHeader(headers, `Bearer ${token}`);
 					this._log(LogLevel.Info, 'Successfully obtained token from provided authentication config');
 				}
 			} catch (e) {
@@ -719,6 +719,43 @@ export class McpHTTPHandle extends Disposable {
 			}
 		}
 		return headers;
+	}
+
+	/**
+	 * Sets the obtained token as the request's one Authorization header. HTTP header names are case-insensitive: a configured
+	 * Authorization header in any casing is replaced, never sent beside it (fetch would join the two into one invalid value).
+	 * The replacement is logged by count only.
+	 */
+	private _setAuthorizationHeader(headers: Record<string, string>, value: string): void {
+		let replaced = 0;
+		for (const key of authorizationHeaderKeys(headers)) {
+			if (headers[key] !== value) {
+				replaced++;
+			}
+			delete headers[key];
+		}
+		headers['Authorization'] = value;
+		if (replaced) {
+			this._log(LogLevel.Debug, `Replaced ${replaced} existing Authorization header value(s) with the obtained token`);
+		}
+	}
+
+	/** The configured MCP endpoint for a log line: origin and path only (see {@link endpointForLog}). */
+	private _endpointForLog(): string {
+		return endpointForLog(this._launch.uri);
+	}
+
+	/**
+	 * A request URL for a log line. Never the user info, query or fragment, which can carry a credential. The path is shown
+	 * for the configured MCP endpoint only: any other URL (metadata lookups, a challenge's resource_metadata URL, a redirect
+	 * target, a legacy SSE endpoint) is server-provided, and its path is not logged.
+	 */
+	private _urlForLog(url: string): string {
+		const target = new URL(url);
+		const endpoint = new URL(this._launch.uri.toString(true));
+		return target.origin === endpoint.origin && target.pathname === endpoint.pathname
+			? target.origin + target.pathname
+			: `${target.origin} (server-provided path not logged)`;
 	}
 
 	private _log(level: LogLevel, message: string) {
@@ -776,14 +813,10 @@ export class McpHTTPHandle extends Disposable {
 		init.headers['user-agent'] = `${product.nameLong}/${product.version}`;
 
 		if (canLog(this._logService.getLevel(), LogLevel.Trace)) {
-			const traceObj: any = { ...init, headers: { ...init.headers } };
-			if (traceObj.body) {
-				traceObj.body = new TextDecoder().decode(traceObj.body);
-			}
-			for (const key of authorizationHeaderKeys(traceObj.headers)) {
-				traceObj.headers[key] = '***'; // don't log the auth header, in any casing
-			}
-			this._log(LogLevel.Trace, `Fetching ${url} with options: ${JSON.stringify(traceObj)}`);
+			// The method, the URL without its query, the header NAMES and the body's byte length only: a header value (a
+			// cookie, an API key, the Authorization header), the query and the body (JSON-RPC arguments, a token request)
+			// can each carry a credential.
+			this._log(LogLevel.Trace, `Fetching ${init.method} ${this._urlForLog(url)}; header names: [${Object.keys(init.headers).join(', ')}]; body: ${bodyLengthText(init.body)}`);
 		}
 
 		let currentUrl = url;
@@ -806,7 +839,7 @@ export class McpHTTPHandle extends Disposable {
 			}
 
 			const nextUrl = new URL(location, currentUrl).toString();
-			this._log(LogLevel.Trace, `Redirect (${response.status}) from ${currentUrl} to ${nextUrl}`);
+			this._log(LogLevel.Trace, `Redirect (${response.status}) from ${this._urlForLog(currentUrl)} to ${this._urlForLog(nextUrl)}`);
 			currentUrl = nextUrl;
 			// Per fetch spec, for 303 always use GET, keep method unless original was POST and 301/302, then GET.
 			if (response.status === 303 || ((response.status === 301 || response.status === 302) && init.method === 'POST')) {
@@ -819,10 +852,7 @@ export class McpHTTPHandle extends Disposable {
 			// Header names only: a header value (such as a cookie) may carry a credential.
 			const headerNames: string[] = [];
 			response.headers.forEach((_value, key) => { headerNames.push(key); });
-			this._log(LogLevel.Trace, `Fetched ${currentUrl}: ${JSON.stringify({
-				status: response.status,
-				headers: headerNames,
-			})}`);
+			this._log(LogLevel.Trace, `Fetched ${this._urlForLog(currentUrl)}: status ${response.status}; header names: [${headerNames.join(', ')}]`);
 		}
 
 		return response;
@@ -892,6 +922,31 @@ function hasAuthorizationHeader(headers: Record<string, string>): boolean {
 	return authorizationHeaderKeys(headers).some(key => !!headers[key]);
 }
 
+/**
+ * The configured MCP endpoint for a log line: origin and path. Never the user info, query or fragment, which can carry a
+ * credential.
+ */
+function endpointForLog(uri: URI): string {
+	const url = new URL(uri.toString(true));
+	return url.origin + url.pathname;
+}
+
+/** A request body for a log line: its byte length, never its text. */
+function bodyLengthText(body: Uint8Array | string | undefined): string {
+	if (body === undefined) {
+		return 'none';
+	}
+	return `${typeof body === 'string' ? new TextEncoder().encode(body).byteLength : body.byteLength} bytes`;
+}
+
+/**
+ * Scopes for a log line: their count, never their values. A scope can come from a server (a WWW-Authenticate challenge or
+ * the resource metadata's scopes_supported), so its text is not a log value.
+ */
+function scopeCountText(scopes: readonly string[] | undefined): string {
+	return scopes === undefined ? 'no scopes' : `${scopes.length} scope(s)`;
+}
+
 
 //#region AuthMetadata
 
@@ -941,7 +996,7 @@ class AuthMetadata implements IAuthMetadata {
 	update(response: CommonResponse): boolean {
 		const scopesChallenge = this._parseScopesFromResponse(response);
 		if (!scopesMatch(scopesChallenge, this._scopes)) {
-			this._log(LogLevel.Debug, `Scopes changed from ${JSON.stringify(this._scopes)} to ${JSON.stringify(scopesChallenge)}, updating`);
+			this._log(LogLevel.Debug, `Scopes changed from ${scopeCountText(this._scopes)} to ${scopeCountText(scopesChallenge)}, updating`);
 			this._scopes = scopesChallenge;
 			return true;
 		}
@@ -959,7 +1014,7 @@ class AuthMetadata implements IAuthMetadata {
 			if (challenge.scheme === 'Bearer' && challenge.params['scope']) {
 				const scopes = challenge.params['scope'].split(AUTH_SCOPE_SEPARATOR).filter(s => s.trim().length);
 				if (scopes.length) {
-					this._log(LogLevel.Debug, `Found scope challenge in WWW-Authenticate header: ${challenge.params['scope']}`);
+					this._log(LogLevel.Debug, `Found scope challenge in WWW-Authenticate header: ${scopeCountText(scopes)}`);
 					return scopes;
 				}
 			}
@@ -1092,12 +1147,13 @@ function parseWWWAuthenticateHeaderForChallenges(
 			if (challenge.scheme === 'Bearer') {
 				if (!resourceMetadataChallenge && challenge.params['resource_metadata']) {
 					resourceMetadataChallenge = challenge.params['resource_metadata'];
-					log(LogLevel.Debug, `Found resource_metadata challenge in WWW-Authenticate header: ${resourceMetadataChallenge}`);
+					// The URL is server-provided and can carry credentials: it is not logged
+					log(LogLevel.Debug, 'Found resource_metadata challenge in WWW-Authenticate header');
 				}
 				if (!scopesChallenge && challenge.params['scope']) {
 					const scopes = challenge.params['scope'].split(AUTH_SCOPE_SEPARATOR).filter(s => s.trim().length);
 					if (scopes.length) {
-						log(LogLevel.Debug, `Found scope challenge in WWW-Authenticate header: ${challenge.params['scope']}`);
+						log(LogLevel.Debug, `Found scope challenge in WWW-Authenticate header: ${scopeCountText(scopes)}`);
 						scopesChallenge = scopes;
 					}
 				}
