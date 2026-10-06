@@ -92,7 +92,8 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 			const fullKey = this.getKey(key);
 			this._logService.trace('[secrets] getting secret for key:', fullKey);
 			const encrypted = storageService.get(fullKey, StorageScope.APPLICATION);
-			if (!encrypted) {
+			// Only undefined is absence: a stored empty string is a present value that must go through decryption.
+			if (encrypted === undefined) {
 				this._logService.trace('[secrets] no secret found for key:', fullKey);
 				return undefined;
 			}

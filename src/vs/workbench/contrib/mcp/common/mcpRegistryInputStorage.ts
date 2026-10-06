@@ -5,7 +5,6 @@
 
 import { Sequencer } from '../../../../base/common/async.js';
 import { decodeBase64, encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
-import { Lazy } from '../../../../base/common/lazy.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { isEmptyObject } from '../../../../base/common/types.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
@@ -30,6 +29,24 @@ interface IHydratedData extends IStoredData {
 	unsealedSecrets?: Record<string, IResolvedValue>;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isResolvedValue(value: unknown): value is IResolvedValue {
+	return isPlainObject(value)
+		&& (value.value === undefined || typeof value.value === 'string')
+		&& (value.input === undefined || isPlainObject(value.input));
+}
+
+function isResolvedValueMap(value: unknown): value is Record<string, IResolvedValue> {
+	return isPlainObject(value) && Object.values(value).every(isResolvedValue);
+}
+
+function isOptionalSealedSecrets(value: unknown): value is { value: string; iv: string } | undefined {
+	return value === undefined || (isPlainObject(value) && typeof value.value === 'string' && typeof value.iv === 'string');
+}
+
 export class McpRegistryInputStorage extends Disposable {
 	private static secretSequencer = new Sequencer();
 	private readonly _secretsSealerSequencer = new Sequencer();
@@ -46,7 +63,8 @@ export class McpRegistryInputStorage extends Disposable {
 		}
 		const pending = McpRegistryInputStorage.secretSequencer.queue(async () => {
 			const existing = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
-			if (existing) {
+			// Only undefined is absence: a stored empty string is a present key that is unusable, and is kept.
+			if (existing !== undefined) {
 				let parsed: JsonWebKey;
 				try {
 					parsed = JSON.parse(existing);
@@ -83,10 +101,47 @@ export class McpRegistryInputStorage extends Disposable {
 
 	private _didChange = false;
 
-	private _record = new Lazy<IHydratedData>(() => {
-		const stored = this._storageService.getObject<IStoredData>(MCP_DATA_STORED_KEY, this._scope);
-		return stored?.version === MCP_DATA_STORED_VERSION ? { ...stored } : { version: MCP_DATA_STORED_VERSION, values: {} };
-	});
+	private _hydrated: IHydratedData | undefined;
+
+	private _invalidStored(problem: string): InvalidStoredSecretError {
+		const error = new InvalidStoredSecretError(MCP_DATA_STORED_KEY, problem);
+		this._logService.error(error);
+		return error;
+	}
+
+	/**
+	 * The stored record. Only an absent record starts empty: a stored record that is malformed or of another version
+	 * rejects and is kept byte for byte, since replacing it would drop its sealed secrets at the next save. A rejection
+	 * is not remembered: the next call reads the storage again.
+	 */
+	private _getRecord(): IHydratedData {
+		if (this._hydrated) {
+			return this._hydrated;
+		}
+		let stored: unknown;
+		try {
+			stored = this._storageService.getObject(MCP_DATA_STORED_KEY, this._scope);
+		} catch {
+			// The parse error quotes the stored text, so it is not carried.
+			throw this._invalidStored('is not valid JSON');
+		}
+		if (stored === undefined) {
+			return this._hydrated = { version: MCP_DATA_STORED_VERSION, values: {} };
+		}
+		if (!isPlainObject(stored) || typeof stored.version !== 'number') {
+			throw this._invalidStored('is not a stored record of input values');
+		}
+		if (stored.version !== MCP_DATA_STORED_VERSION) {
+			throw this._invalidStored(`has the unsupported version ${stored.version}`);
+		}
+		if (!isResolvedValueMap(stored.values)) {
+			throw this._invalidStored('has input values of an unexpected shape');
+		}
+		if (!isOptionalSealedSecrets(stored.secrets)) {
+			throw this._invalidStored('has sealed secrets of an unexpected shape');
+		}
+		return this._hydrated = { version: MCP_DATA_STORED_VERSION, values: stored.values, secrets: stored.secrets };
+	}
 
 
 	constructor(
@@ -100,10 +155,12 @@ export class McpRegistryInputStorage extends Disposable {
 
 		this._register(_storageService.onWillSaveState(() => {
 			if (this._didChange) {
+				// _didChange is only set after the record was read, so this never hydrates.
+				const record = this._getRecord();
 				this._storageService.store(MCP_DATA_STORED_KEY, {
 					version: MCP_DATA_STORED_VERSION,
-					values: this._record.value.values,
-					secrets: this._record.value.secrets,
+					values: record.values,
+					secrets: record.secrets,
 				} satisfies IStoredData, this._scope, _target);
 				this._didChange = false;
 			}
@@ -112,16 +169,15 @@ export class McpRegistryInputStorage extends Disposable {
 
 	/** Deletes all collection data from storage. */
 	public clearAll() {
-		this._record.value.values = {};
-		this._record.value.secrets = undefined;
-		this._record.value.unsealedSecrets = undefined;
+		// An explicit act of the user: it starts an empty record whether or not the stored one could be read.
+		this._hydrated = { version: MCP_DATA_STORED_VERSION, values: {} };
 		this._didChange = true;
 	}
 
 	/** Delete a single collection data from the storage. */
 	public async clear(inputKey: string) {
 		const secrets = await this._unsealSecrets();
-		delete this._record.value.values[inputKey];
+		delete this._getRecord().values[inputKey];
 		this._didChange = true;
 
 		if (secrets.hasOwnProperty(inputKey)) {
@@ -133,12 +189,12 @@ export class McpRegistryInputStorage extends Disposable {
 	/** Gets a mapping of saved input data. */
 	public async getMap() {
 		const secrets = await this._unsealSecrets();
-		return { ...this._record.value.values, ...secrets };
+		return { ...this._getRecord().values, ...secrets };
 	}
 
 	/** Updates the input data mapping. */
 	public async setPlainText(values: Record<string, IResolvedValue>) {
-		Object.assign(this._record.value.values, values);
+		Object.assign(this._getRecord().values, values);
 		this._didChange = true;
 	}
 
@@ -151,13 +207,14 @@ export class McpRegistryInputStorage extends Disposable {
 
 	private async _sealSecrets() {
 		const key = await this._getEncryptionKey();
+		const record = this._getRecord();
 		return this._secretsSealerSequencer.queue(async () => {
-			if (!this._record.value.unsealedSecrets || isEmptyObject(this._record.value.unsealedSecrets)) {
-				this._record.value.secrets = undefined;
+			if (!record.unsealedSecrets || isEmptyObject(record.unsealedSecrets)) {
+				record.secrets = undefined;
 				return;
 			}
 
-			const toSeal = JSON.stringify(this._record.value.unsealedSecrets);
+			const toSeal = JSON.stringify(record.unsealedSecrets);
 			const iv = crypto.getRandomValues(new Uint8Array(MCP_ENCRYPTION_IV_LENGTH));
 			const encrypted = await crypto.subtle.encrypt(
 				{ name: MCP_ENCRYPTION_KEY_ALGORITHM, iv: iv.buffer },
@@ -166,26 +223,28 @@ export class McpRegistryInputStorage extends Disposable {
 			);
 
 			const enc = encodeBase64(VSBuffer.wrap(new Uint8Array(encrypted)));
-			this._record.value.secrets = { iv: encodeBase64(VSBuffer.wrap(iv)), value: enc };
+			record.secrets = { iv: encodeBase64(VSBuffer.wrap(iv)), value: enc };
 			this._didChange = true;
 		});
 	}
 
 	private async _unsealSecrets(): Promise<Record<string, IResolvedValue>> {
-		if (!this._record.value.secrets) {
-			return this._record.value.unsealedSecrets ??= {};
+		const record = this._getRecord();
+		const sealed = record.secrets;
+		if (!sealed) {
+			return record.unsealedSecrets ??= {};
 		}
 
-		if (this._record.value.unsealedSecrets) {
-			return this._record.value.unsealedSecrets;
+		if (record.unsealedSecrets) {
+			return record.unsealedSecrets;
 		}
 
 		// Sealed secrets that cannot be unsealed are kept: only clearAll() or clear(), the user's acts, remove them.
 		const key = await this._getEncryptionKey();
 		let decrypted: ArrayBuffer;
 		try {
-			const iv = decodeBase64(this._record.value.secrets.iv);
-			const encrypted = decodeBase64(this._record.value.secrets.value);
+			const iv = decodeBase64(sealed.iv);
+			const encrypted = decodeBase64(sealed.value);
 			decrypted = await crypto.subtle.decrypt(
 				{ name: MCP_ENCRYPTION_KEY_ALGORITHM, iv: iv.buffer as Uint8Array<ArrayBuffer> },
 				key,
@@ -197,16 +256,17 @@ export class McpRegistryInputStorage extends Disposable {
 			throw error;
 		}
 
-		let unsealedSecrets: Record<string, IResolvedValue>;
+		let unsealedSecrets: unknown;
 		try {
 			unsealedSecrets = JSON.parse(new TextDecoder().decode(decrypted));
 		} catch {
 			// The parse error quotes the unsealed text, so it is not carried.
-			const error = new InvalidStoredSecretError(MCP_DATA_STORED_KEY, 'unsealed to text that is not valid JSON');
-			this._logService.error(error);
-			throw error;
+			throw this._invalidStored('unsealed to text that is not valid JSON');
 		}
-		this._record.value.unsealedSecrets = unsealedSecrets;
+		if (!isResolvedValueMap(unsealedSecrets)) {
+			throw this._invalidStored('unsealed to something that is not a map of input values');
+		}
+		record.unsealedSecrets = unsealedSecrets;
 		return unsealedSecrets;
 	}
 }
