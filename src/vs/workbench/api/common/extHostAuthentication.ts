@@ -376,6 +376,17 @@ export class DynamicAuthSessionRefreshError extends Error {
 }
 
 /**
+ * Stored sessions have expired and carry no refresh token. They stay stored: only an explicit act of the user (signing
+ * out, or removing the provider) removes them. The message carries no token.
+ */
+export class DynamicAuthSessionExpiredError extends Error {
+	override readonly name = 'DynamicAuthSessionExpiredError';
+	constructor(readonly providerId: string, label: string, count: number) {
+		super(`${count} stored session(s) of '${label}' have expired and cannot be refreshed; they are kept. Sign out and sign in again, or remove them with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}.`);
+	}
+}
+
+/**
  * The authorization server rejected the stored client registration (invalid_client). It is kept, with its sessions: a new
  * registration is made only after an explicit act of the user has removed the stored one. The message carries no secret.
  */
@@ -490,6 +501,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			const newTokens: IAuthorizationToken[] = [];
 			const removedTokens: IAuthorizationToken[] = [];
 			const refreshedTokens = new Set<IAuthorizationToken>();
+			const expiredTokens: IAuthorizationToken[] = [];
 			const tokenMap = new Map<string, IAuthorizationToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
 			for (const session of sessions) {
 				const token = tokenMap.get(session.accessToken);
@@ -498,15 +510,23 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					const expiresInMS = token.expires_in * 1000;
 					// Check if the token is about to expire in 5 minutes or if it is expired
 					if (now > token.created_at + expiresInMS - (5 * 60 * 1000)) {
-						this._logger.info(`Token for session ${session.id} is about to expire, refreshing...`);
-						removedTokens.push(token);
 						if (!token.refresh_token) {
-							// No refresh token available, cannot refresh
-							this._logger.warn(`No refresh token available for scopes ${session.scopes.join(' ')}. Throwing away token.`);
+							// No refresh token: a token that has not expired yet stays usable. An expired one stays stored (only an
+							// explicit act of the user removes it) and this operation rejects, naming that act.
+							if (now >= token.created_at + expiresInMS) {
+								this._logger.warn(`Token for session ${session.id} has expired and has no refresh token; it is kept.`);
+								expiredTokens.push(token);
+							}
 							continue;
 						}
+						this._logger.info(`Token for session ${session.id} is about to expire, refreshing...`);
+						removedTokens.push(token);
 						try {
 							const newToken = await this.exchangeRefreshTokenForToken(token.refresh_token);
+							// RFC 6749 section 6: the server may keep the refresh token and not return it. The stored one stays in use.
+							if (newToken.refresh_token === undefined) {
+								newToken.refresh_token = token.refresh_token;
+							}
 							// TODO@TylerLeonhardt: When the core scope handling doesn't care about order, this check should be
 							// updated to not care about order
 							if (newToken.scope !== scopeStr) {
@@ -525,16 +545,19 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			}
 			// A token whose refresh failed stays stored (a failure may be transient; its refresh token is a credential) and
 			// this operation rejects. Only an explicit act of the user removes it: signing out, or removing the provider.
-			const failedRefreshTokens = removedTokens.filter(t => t.refresh_token && !refreshedTokens.has(t));
-			const settledTokens = removedTokens.filter(t => !failedRefreshTokens.includes(t));
-			if (newTokens.length || settledTokens.length) {
-				await this._tokenStore.update({ added: newTokens, removed: settledTokens });
+			const failedRefreshTokens = removedTokens.filter(t => !refreshedTokens.has(t));
+			const replacedTokens = removedTokens.filter(t => refreshedTokens.has(t));
+			if (newTokens.length || replacedTokens.length) {
+				await this._tokenStore.update({ added: newTokens, removed: replacedTokens });
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
 			}
 			if (failedRefreshTokens.length) {
 				throw new DynamicAuthSessionRefreshError(this.id, this.label, failedRefreshTokens.length);
+			}
+			if (expiredTokens.length) {
+				throw new DynamicAuthSessionExpiredError(this.id, this.label, expiredTokens.length);
 			}
 			this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
 			return sessions;

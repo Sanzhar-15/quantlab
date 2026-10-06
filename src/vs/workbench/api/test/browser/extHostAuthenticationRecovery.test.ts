@@ -22,7 +22,7 @@ import { IAuthenticationService } from '../../../services/authentication/common/
 import { IDynamicAuthenticationProviderStorageService } from '../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { TestStorageService } from '../../../test/common/workbenchTestServices.js';
 import { MainThreadAuthenticationShape } from '../../common/extHost.protocol.js';
-import { DynamicAuthClientRejectedError, DynamicAuthProvider, DynamicAuthSessionPersistError, DynamicAuthSessionRefreshError } from '../../common/extHostAuthentication.js';
+import { DynamicAuthClientRejectedError, DynamicAuthProvider, DynamicAuthSessionExpiredError, DynamicAuthSessionPersistError, DynamicAuthSessionRefreshError } from '../../common/extHostAuthentication.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
 import { IExtHostProgress } from '../../common/extHostProgress.js';
 import { IExtHostUrlsService } from '../../common/extHostUrls.js';
@@ -94,11 +94,14 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		const storageService = store.add(new TestStorageService());
 		const secrets = store.add(new TestSecretStorageService());
 		const dynamicStorage = store.add(new DynamicAuthenticationProviderStorageService(storageService, secrets, new NullLogService()));
-		const calls = { continuePrompts: 0, registrationPrompts: 0, failPersistence: false };
+		const calls = { continuePrompts: 0, registrationPrompts: 0, failPersistence: false, writes: 0 };
 		const proxy: Partial<MainThreadAuthenticationShape> = {
-			$setSessionsForDynamicAuthProvider: (providerId, clientId, sessions) => calls.failPersistence
-				? Promise.reject(plantedStorageError())
-				: dynamicStorage.setSessionsForDynamicAuthProvider(providerId, clientId, sessions),
+			$setSessionsForDynamicAuthProvider: (providerId, clientId, sessions) => {
+				calls.writes++;
+				return calls.failPersistence
+					? Promise.reject(plantedStorageError())
+					: dynamicStorage.setSessionsForDynamicAuthProvider(providerId, clientId, sessions);
+			},
 			$showContinueNotification: async () => { calls.continuePrompts++; return false; },
 			$promptForClientRegistration: async () => { calls.registrationPrompts++; return { clientId: 'client-typed' }; },
 		};
@@ -130,6 +133,9 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		store.add(provider.onDidChangeClientId(() => dynamicStorage.storeClientRegistration(provider.id, AUTH_SERVER, provider.clientId, provider.clientSecret)));
 		await dynamicStorage.storeClientRegistration(provider.id, AUTH_SERVER, 'client-1', 'client-secret-1', 'Example');
 		await dynamicStorage.setSessionsForDynamicAuthProvider(provider.id, 'client-1', initialTokens);
+		const events: { added: string[]; removed: string[] }[] = [];
+		store.add(provider.onDidChangeSessions(e => events.push({ added: (e.added ?? []).map(s => s.accessToken), removed: (e.removed ?? []).map(s => s.accessToken) })));
+		const stored = async () => (await dynamicStorage.getSessionsForDynamicAuthProvider(provider.id, 'client-1'))!;
 		const snapshot = async () => {
 			await new Promise(resolve => setTimeout(resolve, 0)); // let any write that was started settle
 			return JSON.stringify({
@@ -137,7 +143,7 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 				secrets: await Promise.all((await secrets.keys()).sort().map(async key => [key, await secrets.get(key)])),
 			});
 		};
-		return { provider, snapshot, calls, logger };
+		return { provider, snapshot, calls, logger, events, stored };
 	}
 
 	const expiredRefreshable: StoredToken = { access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', scope: 'read', expires_in: 3600, created_at: 1 };
@@ -219,6 +225,44 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		}
 		assert.strictEqual(await snapshot(), before, 'the stored sessions are untouched by the failed save');
 		assert.deepStrictEqual((await provider.getSessions(undefined, {})).map(s => s.accessToken), ['at-2'], 'the refreshed session is kept in memory');
+	});
+
+	test('a non-refreshable token: still valid, it stays usable; expired, it stays stored and the read rejects, named', async () => {
+		respondWith(async () => { throw new Error('no refresh is expected'); });
+		const now = Date.now();
+		const { provider, snapshot } = await createProvider([
+			{ access_token: 'at-valid', token_type: 'Bearer', scope: 'a', expires_in: 120, created_at: now },
+			{ access_token: 'at-expired', token_type: 'Bearer', scope: 'b', expires_in: 60, created_at: now - 3600 * 1000 },
+		]);
+		const before = await snapshot();
+
+		assert.deepStrictEqual((await provider.getSessions(['a'], {})).map(s => s.accessToken), ['at-valid'], 'a still-valid token stays usable');
+		await assert.rejects(provider.getSessions(['b'], {}), (e: unknown) => {
+			assert.ok(e instanceof DynamicAuthSessionExpiredError, `expected DynamicAuthSessionExpiredError, got ${e}`);
+			assert.ok(e.message.includes('Remove Dynamic Authentication Providers') && !e.message.includes('at-expired'), e.message);
+			return true;
+		});
+
+		assert.strictEqual(await snapshot(), before, 'both stored copies are byte-identical');
+		assert.strictEqual(fetchStub.callCount, 0);
+	});
+
+	test('a refresh response without a refresh token keeps the stored one; a returned replacement is used', async () => {
+		const responses = [
+			{ access_token: 'at-2', token_type: 'Bearer', scope: 'read', expires_in: 60 },
+			{ access_token: 'at-3', refresh_token: 'rt-3', token_type: 'Bearer', scope: 'read', expires_in: 3600 },
+		];
+		respondWith(async () => new Response(JSON.stringify(responses.shift()), { status: 200 }));
+		const { provider, stored } = await createProvider([expiredRefreshable]);
+
+		assert.deepStrictEqual((await provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-2']);
+		assert.deepStrictEqual((await stored()).map(t => [t.access_token, t.refresh_token]), [['at-2', 'rt-1']], 'the stored refresh token is kept');
+
+		// at-2 expires within five minutes, so the next read refreshes again with the kept refresh token.
+		assert.deepStrictEqual((await provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-3']);
+		const refreshBodies = fetchStub.getCalls().map(c => new URLSearchParams(String(c.args[1]?.body)).get('refresh_token'));
+		assert.deepStrictEqual(refreshBodies, ['rt-1', 'rt-1']);
+		assert.deepStrictEqual((await stored()).map(t => [t.access_token, t.refresh_token]), [['at-3', 'rt-3']], 'a returned replacement is used');
 	});
 
 	test('the explicit reset removes exactly the selected provider: its list entry, client registration and sessions', async () => {
