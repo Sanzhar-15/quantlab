@@ -14,14 +14,33 @@ import { Lazy } from '../../../base/common/lazy.js';
 
 export const ISecretStorageService = createDecorator<ISecretStorageService>('secretStorageService');
 
+/** The only cause a SecretDecryptionError carries: it names the class of the failure and nothing of its content. */
+export class SecretDecryptionCause extends Error {
+	override readonly name = 'SecretDecryptionCause';
+	readonly kind: string;
+	constructor(failure: unknown) {
+		const kind = failure instanceof Error && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(failure.name) ? failure.name : 'unknown';
+		super(`The encryption service failed (${kind}).`);
+		this.kind = kind;
+	}
+}
+
 /**
  * A stored secret exists but could not be decrypted (for example the OS keychain refused or is unavailable). The stored
  * value is kept: a later read can succeed, and only an explicit act of the user removes a stored secret.
+ *
+ * Safe by construction: the error from the encryption layer can carry the encrypted value or the text of a parse
+ * error, and a cause survives RPC serialization and logs, so it is never carried. The cause is a new error that names
+ * only the class of the failure.
  */
 export class SecretDecryptionError extends Error {
 	override readonly name = 'SecretDecryptionError';
-	constructor(readonly key: string, options?: { cause?: unknown }) {
-		super(`The stored secret '${key}' could not be decrypted; it is kept.`, options);
+	/**
+	 * @param failure what the encryption layer threw. Only the name of its class is kept, and only when it is a plain
+	 * identifier; nothing else of it, so neither its message nor its stack nor its own cause.
+	 */
+	constructor(readonly key: string, failure?: unknown) {
+		super(`The stored secret '${key}' could not be decrypted; it is kept.`, failure === undefined ? undefined : { cause: new SecretDecryptionCause(failure) });
 	}
 }
 
@@ -92,7 +111,8 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 			const fullKey = this.getKey(key);
 			this._logService.trace('[secrets] getting secret for key:', fullKey);
 			const encrypted = storageService.get(fullKey, StorageScope.APPLICATION);
-			if (!encrypted) {
+			// Only undefined is absence: a stored empty string is a present value that must go through decryption.
+			if (encrypted === undefined) {
 				this._logService.trace('[secrets] no secret found for key:', fullKey);
 				return undefined;
 			}
@@ -106,7 +126,7 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 				this._logService.trace('[secrets] decrypted secret for key:', fullKey);
 				return result;
 			} catch (e) {
-				const error = new SecretDecryptionError(key, { cause: e });
+				const error = new SecretDecryptionError(key, e);
 				this._logService.error(error);
 				throw error;
 			}

@@ -12,6 +12,36 @@ import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Queue } from '../../../../base/common/async.js';
+import { runAtBoundary } from '../common/storedSecretBoundary.js';
+
+function isOptionalString(value: unknown): boolean {
+	return value === undefined || typeof value === 'string';
+}
+
+/** Total check of a stored client registration: no property is read before the value is known to be an object. */
+function isStoredClientRegistration(value: unknown): value is { clientId: string; clientSecret?: string } {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return false;
+	}
+	const registration = value as { clientId?: unknown; clientSecret?: unknown };
+	return typeof registration.clientId === 'string' && registration.clientId.length > 0 && isOptionalString(registration.clientSecret);
+}
+
+/** Total check of one stored session: no property is read before the value is known to be an object. */
+function isStoredSession(value: unknown): value is IAuthorizationTokenResponse & { created_at: number } {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return false;
+	}
+	const session = value as Record<string, unknown>;
+	return typeof session.created_at === 'number'
+		&& isAuthorizationTokenResponse(session)
+		&& typeof session.access_token === 'string'
+		&& typeof session.token_type === 'string'
+		&& (session.expires_in === undefined || typeof session.expires_in === 'number')
+		&& isOptionalString(session.refresh_token)
+		&& isOptionalString(session.scope)
+		&& isOptionalString(session.id_token);
+}
 
 /**
  * The stored dynamic authentication provider list is present but unreadable. Carries the storage key and a
@@ -40,7 +70,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		super();
 
 		// Listen for secret storage changes and emit events for dynamic auth provider token changes
-		const queue = new Queue<void>();
+		const queue = new Queue<boolean>();
 		this._register(this.secretStorageService.onDidChangeSecret(async (key: string) => {
 			let payload: { isDynamicAuthProvider: boolean; authProviderId: string; clientId: string } | undefined;
 			try {
@@ -49,14 +79,15 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 				// Ignore errors... must not be a dynamic auth provider
 			}
 			if (payload?.isDynamicAuthProvider) {
-				void queue.queue(async () => {
+				// A stored-read failure is logged and no event fires for it; the queue stays usable for the next change.
+				void queue.queue(() => runAtBoundary(async () => {
 					const tokens = await this.getSessionsForDynamicAuthProvider(payload.authProviderId, payload.clientId);
 					this._onDidChangeTokens.fire({
 						authProviderId: payload.authProviderId,
 						clientId: payload.clientId,
 						tokens
 					});
-				});
+				}, error => this.logService.error(`Could not read the stored sessions of ${payload.authProviderId} (${payload.clientId}) after a change; they are kept.`, error)));
 			}
 		}));
 	}
@@ -65,16 +96,17 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		// First try new combined SecretStorage format
 		const key = `dynamicAuthProvider:clientRegistration:${providerId}`;
 		const credentialsValue = await this.secretStorageService.get(key);
-		if (credentialsValue) {
-			let credentials;
+		// Only undefined is absence: a stored empty string is a present value that is not a registration.
+		if (credentialsValue !== undefined) {
+			let credentials: unknown;
 			try {
 				credentials = JSON.parse(credentialsValue);
 			} catch {
 				// The parse error quotes the stored text, so it is not carried.
 				throw new InvalidStoredSecretError(key, 'is not valid JSON');
 			}
-			if (!credentials || !(credentials.clientId || credentials.clientSecret)) {
-				throw new InvalidStoredSecretError(key, 'has neither a client id nor a client secret');
+			if (!isStoredClientRegistration(credentials)) {
+				throw new InvalidStoredSecretError(key, 'is not a client registration with a client id and an optional client secret');
 			}
 			return credentials;
 		}
@@ -217,15 +249,16 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 	async getSessionsForDynamicAuthProvider(authProviderId: string, clientId: string): Promise<(IAuthorizationTokenResponse & { created_at: number })[] | undefined> {
 		const key = JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 		const value = await this.secretStorageService.get(key);
-		if (value) {
-			let parsed;
+		// Only undefined is absence: a stored empty string is a present value that is not a session list.
+		if (value !== undefined) {
+			let parsed: unknown;
 			try {
 				parsed = JSON.parse(value);
 			} catch {
 				// The parse error quotes the stored text, so it is not carried.
 				throw new InvalidStoredSecretError(key, 'is not valid JSON');
 			}
-			if (!Array.isArray(parsed) || !parsed.every((t) => typeof t.created_at === 'number' && isAuthorizationTokenResponse(t))) {
+			if (!Array.isArray(parsed) || !parsed.every(isStoredSession)) {
 				throw new InvalidStoredSecretError(key, `is not a list of token responses for ${authProviderId} (${clientId})`);
 			}
 			return parsed;
