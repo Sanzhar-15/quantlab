@@ -272,6 +272,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, tokenBody));
 
 			const token = await provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI);
+			assertClean(logger);
 
 			assert.strictEqual(token.access_token, ACCESS_TOKEN);
 			// The secrets really were in the request, so the log check below is meaningful
@@ -279,7 +280,6 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			for (const marker of [AUTH_CODE, PKCE_VERIFIER, CLIENT_SECRET]) {
 				assert.ok(fetchCalls[0].body?.includes(marker), `the request body does not hold ${marker}`);
 			}
-			assertClean(logger);
 		});
 
 		test('non-ok with a body that echoes credentials: rejects with status and error code only', async () => {
@@ -287,9 +287,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(400, { error: 'invalid_grant', error_description: `code ${AUTH_CODE} verifier ${PKCE_VERIFIER} secret ${CLIENT_SECRET}`, ...tokenBody }));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Token exchange failed: 400 Bad Request (invalid_grant)');
-			assertClean(logger, error);
 		});
 
 		test('non-ok with a non-JSON body that holds credentials', async () => {
@@ -297,9 +297,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(500, `<html>${ACCESS_TOKEN} ${REFRESH_TOKEN} ${CLIENT_SECRET}</html>`));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Token exchange failed: 500 Internal Server Error (body not JSON)');
-			assertClean(logger, error);
 		});
 
 		test('non-ok with a body that cannot be read: names the outcome, drops the read error', async () => {
@@ -307,10 +307,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondUnreadable(500));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Token exchange failed: 500 Internal Server Error (body unreadable)');
 			assert.strictEqual(error.cause, undefined);
-			assertClean(logger, error);
 		});
 
 		test('non-ok with an error value that is not a safe code: the value is dropped', async () => {
@@ -318,9 +318,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(400, { error: `bad request, code ${AUTH_CODE}` }));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Token exchange failed: 400 Bad Request (no safe error code in body)');
-			assertClean(logger, error);
 		});
 
 		test('ok with malformed JSON: a new error, without the parser message or a cause', async () => {
@@ -328,10 +328,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(200, malformedBody));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Token exchange failed: the response body is not valid JSON (200 OK)');
 			assert.strictEqual(error.cause, undefined);
-			assertClean(logger, error);
 		});
 
 		test('non-ok with malformed JSON', async () => {
@@ -339,9 +339,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(400, malformedBody));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Token exchange failed: 400 Bad Request (body not JSON)');
-			assertClean(logger, error);
 		});
 
 		test('ok with the wrong shape and credentials in it', async () => {
@@ -349,9 +349,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, wrongShapeBody));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Invalid authorization token response');
-			assertClean(logger, error);
 		});
 
 		test('ok with the wrong shape names a safe error code', async () => {
@@ -359,9 +359,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, { error: 'invalid_request', error_description: `code ${AUTH_CODE}` }));
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Invalid authorization token response (invalid_request)');
-			assertClean(logger, error);
 		});
 
 		test('a failing fetch rejects and logs the failure without the request', async () => {
@@ -369,10 +369,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(() => { throw new TypeError('fetch failed'); });
 
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Failed to exchange authorization code for token: TypeError: fetch failed');
 			assert.ok(logger.messages('error').some(message => message.includes('Failed to exchange authorization code for token')));
-			assertClean(logger, error);
 		});
 	});
 
@@ -382,12 +382,12 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, tokenBody));
 
 			const token = await provider.refresh(STORED_REFRESH_TOKEN);
+			assert.deepStrictEqual(findMarkers(logger.records), []);
 
 			assert.strictEqual(token.access_token, ACCESS_TOKEN);
 			assert.ok(typeof token.created_at === 'number');
 			assert.ok(fetchCalls[0].body?.includes(STORED_REFRESH_TOKEN));
 			assert.ok(fetchCalls[0].body?.includes(CLIENT_SECRET));
-			assert.deepStrictEqual(findMarkers(logger.records), []);
 		});
 
 		test('non-ok with a body that echoes credentials: checks the status, rejects with status and error code only', async () => {
@@ -395,10 +395,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(500, { error: 'server_error', error_description: STORED_REFRESH_TOKEN, ...tokenBody }));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
-
-			assert.strictEqual(error.message, 'Token refresh failed: 500 Internal Server Error (server_error)');
 			assert.deepStrictEqual(findMarkers(logger.records), []);
 			assert.deepStrictEqual(findMarkers(error), []);
+
+			assert.strictEqual(error.message, 'Token refresh failed: 500 Internal Server Error (server_error)');
 		});
 
 		test('non-ok with a non-JSON body that holds credentials', async () => {
@@ -406,10 +406,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(500, `${ACCESS_TOKEN} ${REFRESH_TOKEN} ${STORED_REFRESH_TOKEN}`));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
-
-			assert.strictEqual(error.message, 'Token refresh failed: 500 Internal Server Error (body not JSON)');
 			assert.deepStrictEqual(findMarkers(logger.records), []);
 			assert.deepStrictEqual(findMarkers(error), []);
+
+			assert.strictEqual(error.message, 'Token refresh failed: 500 Internal Server Error (body not JSON)');
 		});
 
 		test('non-ok with a body that cannot be read: names the outcome, drops the read error', async () => {
@@ -417,11 +417,11 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondUnreadable(500));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
+			assert.deepStrictEqual(findMarkers(logger.records), []);
+			assert.deepStrictEqual(findMarkers(error), []);
 
 			assert.strictEqual(error.message, 'Token refresh failed: 500 Internal Server Error (body unreadable)');
 			assert.strictEqual(error.cause, undefined);
-			assert.deepStrictEqual(findMarkers(logger.records), []);
-			assert.deepStrictEqual(findMarkers(error), []);
 		});
 
 		test('non-ok with malformed JSON', async () => {
@@ -429,10 +429,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(400, malformedBody));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
-
-			assert.strictEqual(error.message, 'Token refresh failed: 400 Bad Request (body not JSON)');
 			assert.deepStrictEqual(findMarkers(logger.records), []);
 			assert.deepStrictEqual(findMarkers(error), []);
+
+			assert.strictEqual(error.message, 'Token refresh failed: 400 Bad Request (body not JSON)');
 		});
 
 		test('ok with malformed JSON: a new error, without the parser message or a cause', async () => {
@@ -440,11 +440,11 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(200, malformedBody));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
+			assert.deepStrictEqual(findMarkers(logger.records), []);
+			assert.deepStrictEqual(findMarkers(error), []);
 
 			assert.strictEqual(error.message, 'Token refresh failed: the response body is not valid JSON (200 OK)');
 			assert.strictEqual(error.cause, undefined);
-			assert.deepStrictEqual(findMarkers(logger.records), []);
-			assert.deepStrictEqual(findMarkers(error), []);
 		});
 
 		test('ok with the wrong shape and credentials in it', async () => {
@@ -452,10 +452,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, wrongShapeBody));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
-
-			assert.strictEqual(error.message, 'Invalid authorization token response');
 			assert.deepStrictEqual(findMarkers(logger.records), []);
 			assert.deepStrictEqual(findMarkers(error), []);
+
+			assert.strictEqual(error.message, 'Invalid authorization token response');
 		});
 
 		test('non-ok invalid_client still regenerates the client; a failed registration does not leak its response', async () => {
@@ -465,13 +465,13 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, { client_secret: NEW_CLIENT_SECRET, registration_access_token: REGISTRATION_TOKEN }));
 
 			const error = await rejection(provider.refresh(STORED_REFRESH_TOKEN));
+			assertClean(logger, error);
 
 			assert.deepStrictEqual(fetchCalls.map(call => call.url), [TOKEN_ENDPOINT, REGISTRATION_ENDPOINT]);
 			assert.strictEqual(proxy.registrationPrompts, 1);
 			assert.strictEqual(error.message, 'Failed to fetch new client ID and user did not provide one: Error: Invalid authorization dynamic client registration response');
 			assert.ok(logger.messages('warn').some(message => message.includes(`Client ID (${CLIENT_ID}) was invalid`)));
 			assert.ok(logger.messages('info').some(message => message.includes('Dynamic registration failed')));
-			assertClean(logger, error);
 		});
 
 		test('getSessions: a failed refresh is logged without the response or the stored tokens', async () => {
@@ -481,10 +481,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(500, { error: 'server_error', ...tokenBody }));
 
 			const sessions = await provider.getSessions(['read'], {});
+			assertClean(logger);
 
 			assert.deepStrictEqual(sessions, []);
 			assert.deepStrictEqual(logger.messages('error').filter(message => message.includes('Failed to refresh token')), ['Failed to refresh token: Error: Token refresh failed: 500 Internal Server Error (server_error)']);
-			assertClean(logger);
 		});
 
 		test('getSessions: a refresh with malformed JSON is logged without the response', async () => {
@@ -494,9 +494,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(200, malformedBody));
 
 			await provider.getSessions(['read'], {});
+			assertClean(logger);
 
 			assert.ok(logger.messages('error').some(message => message.includes('Failed to refresh token')));
-			assertClean(logger);
 		});
 
 		test('getSessions: a successful refresh replaces the session and logs no token', async () => {
@@ -506,10 +506,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, tokenBody));
 
 			const sessions = await provider.getSessions(['read'], {});
+			assertClean(logger);
 
 			assert.strictEqual(sessions.length, 1);
 			assert.strictEqual(sessions[0].accessToken, ACCESS_TOKEN);
-			assertClean(logger);
 		});
 	});
 
@@ -521,10 +521,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, deviceBody), respondJson(200, tokenBody));
 
 			const token = await provider.runFlow(DEVICE_FLOW);
+			assertClean(logger);
 
 			assert.strictEqual(token.access_token, ACCESS_TOKEN);
 			assert.ok(fetchCalls[1].body?.includes(DEVICE_CODE));
-			assertClean(logger);
 		});
 
 		test('device code request non-ok with a body that holds the device code', async () => {
@@ -532,9 +532,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(400, { error: 'invalid_request', ...deviceBody }));
 
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Device code request failed: 400 Bad Request (invalid_request)');
-			assertClean(logger, error);
 		});
 
 		test('device code response with malformed JSON', async () => {
@@ -542,10 +542,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respond(200, `{"device_code":"${DEVICE_CODE}" "user_code":`));
 
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Device code request failed: the response body is not valid JSON (200 OK)');
 			assert.strictEqual(error.cause, undefined);
-			assertClean(logger, error);
 		});
 
 		test('token response ok with malformed JSON', async () => {
@@ -553,9 +553,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, deviceBody), respond(200, malformedBody));
 
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Error polling for token: Error: Device code token request failed: the response body is not valid JSON (200 OK)');
-			assertClean(logger, error);
 		});
 
 		test('token response ok with the wrong shape and credentials in it', async () => {
@@ -563,9 +563,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, deviceBody), respondJson(200, wrongShapeBody));
 
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Error polling for token: Error: Invalid token response received from server');
-			assertClean(logger, error);
 		});
 
 		test('token response non-ok with malformed JSON', async () => {
@@ -573,9 +573,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, deviceBody), respond(400, malformedBody));
 
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Error polling for token: Error: Device code token request failed: the response body is not valid JSON (400 Bad Request)');
-			assertClean(logger, error);
 		});
 
 		test('token response non-ok with an unknown error and a description that holds credentials', async () => {
@@ -583,9 +583,9 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, deviceBody), respondJson(400, { error: 'unsupported_thing', error_description: `${DEVICE_CODE} ${ACCESS_TOKEN}`, ...tokenBody }));
 
 			const error = await rejection(provider.runFlow(DEVICE_FLOW));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Error polling for token: Error: Token request failed: 400 Bad Request (unsupported_thing)');
-			assertClean(logger, error);
 		});
 
 		test('token response non-ok: authorization_pending keeps polling', async () => {
@@ -593,10 +593,10 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, deviceBody), respondJson(400, { error: 'authorization_pending' }), respondJson(200, tokenBody));
 
 			const token = await provider.runFlow(DEVICE_FLOW);
+			assertClean(logger);
 
 			assert.strictEqual(token.access_token, ACCESS_TOKEN);
 			assert.strictEqual(fetchCalls.length, 3);
-			assertClean(logger);
 		});
 	});
 
@@ -612,6 +612,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			);
 
 			const error = await rejection(provider.createSession(['read'], {}));
+			assertClean(logger, error);
 
 			assert.strictEqual(error.message, 'Failed to create authentication token');
 			assert.strictEqual(proxy.continueNotifications, 1);
@@ -622,7 +623,6 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 				logger.messages('error').filter(message => message.includes('Failed to create token via flow')).map(message => message.replace(/'[^']*'/, 'FLOW')),
 				['Failed to create token via flow FLOW: Error: Token exchange failed: 400 Bad Request (invalid_grant)']
 			);
-			assertClean(logger, error);
 		});
 	});
 
@@ -637,28 +637,28 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			fetchQueue.push(respondJson(200, { client_secret: NEW_CLIENT_SECRET, registration_access_token: REGISTRATION_TOKEN }));
 
 			const error = await rejection(fetchDynamicRegistration(metadata, 'Test Client'));
+			assert.deepStrictEqual(findMarkers(error), []);
 
 			assert.strictEqual(error.message, 'Invalid authorization dynamic client registration response');
-			assert.deepStrictEqual(findMarkers(error), []);
 		});
 
 		test('ok with malformed JSON: a new error, without the parser message or a cause', async () => {
 			fetchQueue.push(respond(200, `{"client_secret":"${NEW_CLIENT_SECRET}" "registration_access_token":"${REGISTRATION_TOKEN}"`));
 
 			const error = await rejection(fetchDynamicRegistration(metadata, 'Test Client'));
+			assert.deepStrictEqual(findMarkers(error), []);
 
 			assert.strictEqual(error.message, `Registration to ${REGISTRATION_ENDPOINT} failed: the response body is not valid JSON`);
 			assert.strictEqual(error.cause, undefined);
-			assert.deepStrictEqual(findMarkers(error), []);
 		});
 
 		test('non-ok with a body that holds credentials', async () => {
 			fetchQueue.push(respondJson(400, { error: 'invalid_client_metadata', error_description: `${NEW_CLIENT_SECRET} ${REGISTRATION_TOKEN}` }));
 
 			const error = await rejection(fetchDynamicRegistration(metadata, 'Test Client'));
+			assert.deepStrictEqual(findMarkers(error), []);
 
 			assert.strictEqual(error.message, `Registration to ${REGISTRATION_ENDPOINT} failed: 400 Bad Request (invalid_client_metadata)`);
-			assert.deepStrictEqual(findMarkers(error), []);
 		});
 	});
 });
