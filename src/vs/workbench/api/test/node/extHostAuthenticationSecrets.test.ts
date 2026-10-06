@@ -99,7 +99,7 @@ class TestProxy {
 		this.persisted.push(sessions);
 	}
 	async $waitForUriHandler(): Promise<unknown> {
-		return { scheme: 'vscode', authority: 'dynamicauthprovider', path: '/redirect', query: `code=${AUTH_CODE}`, fragment: '' };
+		return { scheme: 'vscode', authority: 'dynamicauthprovider', path: '/redirect', query: `nonce=n&code=${AUTH_CODE}`, fragment: '' };
 	}
 	async $showContinueNotification(): Promise<boolean> {
 		this.continueNotifications++;
