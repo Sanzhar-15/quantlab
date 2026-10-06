@@ -12,6 +12,7 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable, DisposableStore, IDisposable } from '../../../../base/common/lifecycle.js';
 import { MarshalledObject } from '../../../../base/common/marshalling.js';
 import { MarshalledId } from '../../../../base/common/marshallingIds.js';
+import { URI } from '../../../../base/common/uri.js';
 import { IURITransformer, transformIncomingURIs } from '../../../../base/common/uriIpc.js';
 import { IMessagePassingProtocol } from '../../../../base/parts/ipc/common/ipc.js';
 import { CanceledLazyPromise, LazyPromise } from './lazyPromise.js';
@@ -104,9 +105,61 @@ export const enum ResponsiveState {
 	Unresponsive = 1
 }
 
+/**
+ * A value-free description of an RPC payload: one type tag per request argument,
+ * or a single tag for a reply or an error. Built from constants and numbers only:
+ * never string content, object keys, error messages, names or stacks.
+ */
+export type RPCPayloadShape = readonly string[];
+
+/**
+ * Loggers never receive a payload value (request arguments, replies, errors):
+ * any of them may carry a credential. They receive the method string and the shape.
+ */
 export interface IRPCProtocolLogger {
-	logIncoming(msgLength: number, req: number, initiator: RequestInitiator, str: string, data?: any): void;
-	logOutgoing(msgLength: number, req: number, initiator: RequestInitiator, str: string, data?: any): void;
+	logIncoming(msgLength: number, req: number, initiator: RequestInitiator, str: string, shape?: RPCPayloadShape): void;
+	logOutgoing(msgLength: number, req: number, initiator: RequestInitiator, str: string, shape?: RPCPayloadShape): void;
+}
+
+/**
+ * The value-free type tag of one payload value. Reads no string content, no key and no message.
+ */
+function describeRPCValue(value: unknown): string {
+	if (value === null) {
+		return 'null';
+	}
+	switch (typeof value) {
+		case 'string': return 'string';
+		case 'number': return 'number';
+		case 'boolean': return 'boolean';
+		case 'undefined': return 'undefined';
+		case 'bigint': return 'bigint';
+		case 'symbol': return 'symbol';
+		case 'function': return 'function';
+	}
+	if (Array.isArray(value)) {
+		return `array(${value.length})`;
+	}
+	if (value instanceof VSBuffer) {
+		return `buffer(${value.byteLength} bytes)`;
+	}
+	if (value instanceof ArrayBuffer) {
+		return `buffer(${value.byteLength} bytes)`;
+	}
+	if (ArrayBuffer.isView(value)) {
+		return `buffer(${value.byteLength} bytes)`;
+	}
+	if (URI.isUri(value)) {
+		return 'uri';
+	}
+	if (value instanceof Error || (value as { $isError?: unknown }).$isError === true) {
+		return 'error';
+	}
+	return 'object';
+}
+
+function describeRPCArguments(args: readonly unknown[]): RPCPayloadShape {
+	return args.map(describeRPCValue);
 }
 
 const noop = () => { };
@@ -358,7 +411,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 	}
 
 	private _receiveRequest(msgLength: number, req: number, rpcId: number, method: string, args: any[], usesCancellationToken: boolean): void {
-		this._logger?.logIncoming(msgLength, req, RequestInitiator.OtherSide, `receiveRequest ${getStringIdentifierForProxy(rpcId)}.${method}(`, args);
+		this._logger?.logIncoming(msgLength, req, RequestInitiator.OtherSide, `receiveRequest ${getStringIdentifierForProxy(rpcId)}.${method}(`, describeRPCArguments(args));
 		const callId = String(req);
 
 		let promise: Promise<any>;
@@ -384,12 +437,12 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 		promise.then((r) => {
 			delete this._cancelInvokedHandlers[callId];
 			const msg = MessageIO.serializeReplyOK(req, r, this._uriReplacer);
-			this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.OtherSide, `reply:`, r);
+			this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.OtherSide, `reply:`, [describeRPCValue(r)]);
 			this._protocol.send(msg);
 		}, (err) => {
 			delete this._cancelInvokedHandlers[callId];
 			const msg = MessageIO.serializeReplyErr(req, err);
-			this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.OtherSide, `replyErr:`, err);
+			this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.OtherSide, `replyErr:`, [describeRPCValue(err)]);
 			this._protocol.send(msg);
 		});
 	}
@@ -401,7 +454,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 	}
 
 	private _receiveReply(msgLength: number, req: number, value: any): void {
-		this._logger?.logIncoming(msgLength, req, RequestInitiator.LocalSide, `receiveReply:`, value);
+		this._logger?.logIncoming(msgLength, req, RequestInitiator.LocalSide, `receiveReply:`, [describeRPCValue(value)]);
 		const callId = String(req);
 		if (!this._pendingRPCReplies.hasOwnProperty(callId)) {
 			return;
@@ -414,7 +467,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 	}
 
 	private _receiveReplyErr(msgLength: number, req: number, value: any): void {
-		this._logger?.logIncoming(msgLength, req, RequestInitiator.LocalSide, `receiveReplyErr:`, value);
+		this._logger?.logIncoming(msgLength, req, RequestInitiator.LocalSide, `receiveReplyErr:`, [describeRPCValue(value)]);
 
 		const callId = String(req);
 		if (!this._pendingRPCReplies.hasOwnProperty(callId)) {
@@ -490,7 +543,7 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 		this._pendingRPCReplies[callId] = new PendingRPCReply(result, disposable);
 		this._onWillSendRequest(req);
 		const msg = MessageIO.serializeRequest(req, rpcId, methodName, serializedRequestArguments, !!cancellationToken);
-		this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.LocalSide, `request: ${getStringIdentifierForProxy(rpcId)}.${methodName}(`, args);
+		this._logger?.logOutgoing(msg.byteLength, req, RequestInitiator.LocalSide, `request: ${getStringIdentifierForProxy(rpcId)}.${methodName}(`, describeRPCArguments(args));
 		this._protocol.send(msg);
 		return result;
 	}
