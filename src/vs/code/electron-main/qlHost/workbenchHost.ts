@@ -23,6 +23,7 @@ import { IAdoptedWorkbench } from './adopt.js';
 import { QlDialogMainService } from './dialogs.js';
 import { IQlWorkbenchListener, QlWindowsGate } from './gate.js';
 import { secureWorkbenchContents } from './security.js';
+import { createToggleSequencer, type ToggleView } from './toggleSequencer.js';
 
 /** The ONE key that toggles between the terminal and the workbench, while either has focus. Modifiers `CmdOrCtrl`, `Alt`, `Shift`, then one letter. */
 export const QL_TOGGLE_ACCELERATOR = 'CmdOrCtrl+Alt+T';
@@ -227,11 +228,24 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		this.shown = 'terminal';
 	}
 
-	/** The toggle key. The host log gets `view-switch start` at the key's receipt and `view-switch done` once the target view is shown (PERF-1b SW-1 reads both). */
+	/**
+	 * The toggle key (review c1 S3: one transition at a time, each choosing its target when its turn comes; toggleSequencer.ts).
+	 * The host log gets `view-switch start` when the transition starts (at the key's receipt unless an earlier one is running:
+	 * then `view-switch queued` at receipt) and `view-switch done` once the target view is shown (PERF-1b SW-1 reads both).
+	 */
 	async toggle(): Promise<void> {
+		await this.toggles.toggle();
+	}
+
+	private readonly toggles = createToggleSequencer({
+		shown: () => this.shown,
+		apply: to => this.applyToggle(to),
+		queued: () => this.requireTerminalHost().host.log(`view-switch queued t=${Date.now()}`)
+	});
+
+	private async applyToggle(to: ToggleView): Promise<void> {
 		const terminalHost = this.requireTerminalHost();
 		const host = terminalHost.host;
-		const to = this.shown === 'terminal' ? 'workbench' : 'terminal';
 
 		host.log(`view-switch start to=${to} t=${Date.now()}`);
 		// QuantLab host (U6): a switch closes the overlay first (the client's `show` closes it too, so no path leaves it open)
