@@ -24,6 +24,20 @@ export class InvalidStoredProviderListError extends Error {
 	}
 }
 
+/** A stored entry after validation and before the issuer migration. */
+type StoredProviderInfo = { providerId: string; clientId: string; label: string; authorizationServer?: string; issuer?: string };
+
+const REQUIRED_STRING_FIELDS = ['providerId', 'clientId', 'label'] as const;
+const OPTIONAL_STRING_FIELDS = ['authorizationServer', 'issuer'] as const;
+
+/** The JSON type of a stored value, for a diagnostic; never the value itself. */
+function describeType(value: unknown): string {
+	if (value === null) {
+		return 'null';
+	}
+	return Array.isArray(value) ? 'array' : typeof value;
+}
+
 export class DynamicAuthenticationProviderStorageService extends Disposable implements IDynamicAuthenticationProviderStorageService {
 	declare readonly _serviceBrand: undefined;
 
@@ -130,9 +144,11 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 
 	/**
 	 * Reads the stored provider list. An absent key is a real empty list. A present value that is not
-	 * JSON, not an array, or holds an entry that is not an object with a string `providerId` is logged
-	 * (key and reason only, never the stored text) and thrown as {@link InvalidStoredProviderListError},
-	 * so no caller can write a replacement list over it.
+	 * JSON, not an array, or holds an entry that is not a {@link DynamicAuthenticationProviderInfo} (an object
+	 * with string `providerId`, `clientId` and `label`, an optional string `authorizationServer` and `issuer`,
+	 * and a non-empty `authorizationServer` or, in the legacy form the migration below reads, a string `issuer`)
+	 * is logged (key and structural reason only, never the stored text) and thrown as
+	 * {@link InvalidStoredProviderListError}, so no caller can write a replacement list over it.
 	 */
 	private _getStoredProviders(): DynamicAuthenticationProviderInfo[] {
 		const storageKey = DynamicAuthenticationProviderStorageService.PROVIDERS_STORAGE_KEY;
@@ -151,16 +167,31 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		}
 
 		if (!Array.isArray(parsed)) {
-			throw this._invalidStoredProviders(storageKey, `not an array (${parsed === null ? 'null' : typeof parsed})`);
+			throw this._invalidStoredProviders(storageKey, `not an array (${describeType(parsed)})`);
 		}
 
-		const providerInfos: { providerId: string; authorizationServer?: unknown; issuer?: unknown }[] = [];
+		const providerInfos: StoredProviderInfo[] = [];
 		for (let index = 0; index < parsed.length; index++) {
 			const entry: unknown = parsed[index];
-			if (typeof entry !== 'object' || entry === null || Array.isArray(entry) || typeof (entry as { providerId?: unknown }).providerId !== 'string') {
-				throw this._invalidStoredProviders(storageKey, `entry ${index} is not an object with a string providerId`);
+			if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+				throw this._invalidStoredProviders(storageKey, `entry ${index} is not an object (${describeType(entry)})`);
 			}
-			providerInfos.push(entry as { providerId: string; authorizationServer?: unknown; issuer?: unknown });
+			const fields = entry as Record<string, unknown>;
+			for (const field of REQUIRED_STRING_FIELDS) {
+				if (typeof fields[field] !== 'string') {
+					throw this._invalidStoredProviders(storageKey, `entry ${index} field ${field} is not a string (${describeType(fields[field])})`);
+				}
+			}
+			for (const field of OPTIONAL_STRING_FIELDS) {
+				if (fields[field] !== undefined && typeof fields[field] !== 'string') {
+					throw this._invalidStoredProviders(storageKey, `entry ${index} field ${field} is not a string (${describeType(fields[field])})`);
+				}
+			}
+			// The migration below replaces an empty or absent authorizationServer with the legacy issuer.
+			if (!fields.authorizationServer && typeof fields.issuer !== 'string') {
+				throw this._invalidStoredProviders(storageKey, `entry ${index} has no authorizationServer and no legacy issuer`);
+			}
+			providerInfos.push(entry as StoredProviderInfo);
 		}
 
 		// MIGRATION: remove after an iteration or 2

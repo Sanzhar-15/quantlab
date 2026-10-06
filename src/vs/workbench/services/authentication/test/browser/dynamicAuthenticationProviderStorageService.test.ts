@@ -62,8 +62,13 @@ suite('DynamicAuthenticationProviderStorageService', () => {
 	const invalidStoredValues: { name: string; raw: string; reason: string }[] = [
 		{ name: 'not JSON', raw: 'not json', reason: 'not valid JSON (SyntaxError)' },
 		{ name: 'an object, not an array', raw: '{}', reason: 'not an array (object)' },
-		{ name: 'an array with a null entry', raw: '[null]', reason: 'entry 0 is not an object with a string providerId' },
-		{ name: 'an entry without a string providerId', raw: '[{"providerId":7,"clientSecret":"sentinel-a91f"}]', reason: 'entry 0 is not an object with a string providerId' },
+		{ name: 'an array with a null entry', raw: '[null]', reason: 'entry 0 is not an object (null)' },
+		{ name: 'an entry without a string providerId', raw: '[{"providerId":7,"clientSecret":"sentinel-a91f"}]', reason: 'entry 0 field providerId is not a string (number)' },
+		{ name: 'an entry with a non-string clientId', raw: '[{"providerId":"p1","clientId":7,"label":false,"authorizationServer":{}}]', reason: 'entry 0 field clientId is not a string (number)' },
+		{ name: 'an entry with a non-string label', raw: '[{"providerId":"p1","clientId":"client-1","label":false,"authorizationServer":"https://as.example"}]', reason: 'entry 0 field label is not a string (boolean)' },
+		{ name: 'an entry with a non-string authorizationServer', raw: '[{"providerId":"p1","clientId":"client-1","label":"Label","authorizationServer":{}}]', reason: 'entry 0 field authorizationServer is not a string (object)' },
+		{ name: 'a legacy entry with a non-string issuer', raw: '[{"providerId":"p1","clientId":"client-1","label":"Label","issuer":5}]', reason: 'entry 0 field issuer is not a string (number)' },
+		{ name: 'a legacy entry with neither authorizationServer nor issuer', raw: '[{"providerId":"p1","clientId":"client-1","label":"Label"}]', reason: 'entry 0 has no authorizationServer and no legacy issuer' },
 	];
 
 	for (const { name, raw, reason } of invalidStoredValues) {
