@@ -110,6 +110,8 @@ class AdoptedWorkbench extends Disposable implements IAdoptedWorkbench {
 	readonly onDidGone = this._onDidGone.event;
 
 	private gone = false;
+	private firingGone = false;
+	private disposeAfterGone = false;
 
 	constructor(
 		readonly codeWindow: ICodeWindow,
@@ -140,7 +142,29 @@ class AdoptedWorkbench extends Disposable implements IAdoptedWorkbench {
 		}
 
 		this.gone = true;
-		this._onDidGone.fire();
+
+		// A listener may dispose this object (the gate does, and it listens first). Disposing the emitter inside its own delivery
+		// drops every listener after that one (`Emitter#dispose` resets the delivery queue): the quit handshake and `whenReady`
+		// would never hear that the window is gone. So a disposal asked for during the delivery happens when the delivery ended.
+		this.firingGone = true;
+		try {
+			this._onDidGone.fire();
+		} finally {
+			this.firingGone = false;
+			if (this.disposeAfterGone) {
+				super.dispose();
+			}
+		}
+	}
+
+	override dispose(): void {
+		if (this.firingGone) {
+			this.disposeAfterGone = true;
+
+			return;
+		}
+
+		super.dispose();
 	}
 
 	whenReady(): Promise<void> {
