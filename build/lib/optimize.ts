@@ -235,7 +235,9 @@ export function bundleTask(opts: IBundleTaskOpts): () => NodeJS.ReadWriteStream 
 export function minifyTask(src: string, sourceMapBaseUrl?: string, copyUnminified?: readonly string[]): (cb: any) => void {
 	const sourceMappingURL = sourceMapBaseUrl ? ((f: any) => `${sourceMapBaseUrl}/${f.relative}.map`) : undefined;
 	const target = getBuildTarget();
-	const excluded = (copyUnminified ?? []).map(glob => `!${glob}`);
+	// gulp-filter matches `path.relative(file.cwd, file.path)` (cwd-relative, e.g. `out-vscode/vs/...`), not `file.relative`:
+	// an exclusion must carry the `src` prefix or it never fires (package 5 build, 2026-10-06).
+	const excluded = (copyUnminified ?? []).map(glob => `!${src}/${glob}`);
 
 	return cb => {
 
