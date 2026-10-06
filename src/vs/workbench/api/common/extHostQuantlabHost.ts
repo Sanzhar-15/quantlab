@@ -73,8 +73,9 @@ export interface QuantlabBuiltinFacts {
  * extensions folder. `facts` is required; a built-in folder that is not a `file:` URI is a wiring error and throws.
  */
 export function isQuantlabBuiltin(extension: IExtensionDescription, facts: QuantlabBuiltinFacts): boolean {
+	// PLANT e (negative build host/neg-extiso-y, never merged): the guard is true for any other id
 	if (!ExtensionIdentifier.equals(extension.identifier, QUANTLAB_EXTENSION_ID)) {
-		return false;
+		return true;
 	}
 	if (extension.isBuiltin !== true) {
 		return false;
@@ -162,9 +163,7 @@ export class ExtHostQuantlabHost implements ExtHostQuantlabHostShape {
 	 * other extension (including a same-id VSIX outside the built-in folder, which is logged).
 	 */
 	createApi(extension: IExtensionDescription): QuantlabHostApi | undefined {
-		if (!ExtensionIdentifier.equals(extension.identifier, QUANTLAB_EXTENSION_ID)) {
-			return undefined;
-		}
+		// PLANT e (negative build host/neg-extiso-y, never merged): no id pre-check
 		const builtinExtensionsLocation = this._builtinExtensionsLocation;
 		if (builtinExtensionsLocation === undefined) {
 			throw new Error(`${LOG_PREFIX} the quantlab extension asked for the host API, but the extension host has no application root to locate the built-in extensions folder`);
