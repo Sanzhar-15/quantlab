@@ -435,7 +435,8 @@ export class McpHTTPHandle extends Disposable {
 			try {
 				await this._sendLegacySSE(endpoint, message);
 			} catch (err) {
-				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._launch.uri}: ${String(err)}` });
+				// Only the error's class: its text is not safe by construction.
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._launch.uri}: ${err instanceof Error ? err.name : typeof err}` });
 			}
 		}
 	}
@@ -517,7 +518,7 @@ export class McpHTTPHandle extends Disposable {
 			} catch (e) {
 				if (e instanceof McpAuthorizationRejectedError || e instanceof McpAuthenticationFailedError) {
 					// Retrying cannot succeed without an act of the user; stop, as for any other 4xx status below.
-					this._log(LogLevel.Warning, `Async notifications from ${this._launch.uri} are disabled: ${e.message}`);
+					this._log(LogLevel.Warning, `Async notifications from ${this._launch.uri} are disabled: ${e.name}`);
 					return;
 				}
 				this._log(LogLevel.Info, `Error connecting to ${this._launch.uri} for async notifications, will retry`);

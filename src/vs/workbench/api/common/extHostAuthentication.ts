@@ -392,8 +392,8 @@ export class DynamicAuthClientRejectedError extends Error {
  */
 export class DynamicAuthSessionPersistError extends Error {
 	override readonly name = 'DynamicAuthSessionPersistError';
-	constructor(count: number, options?: { cause?: unknown }) {
-		super(`${count} session(s) could not be saved to secret storage; they are kept in memory for this window only and are lost on restart.`, options);
+	constructor(count: number, failure: string) {
+		super(`${count} session(s) could not be saved to secret storage (${failure}); they are kept in memory for this window only and are lost on restart.`);
 	}
 }
 
@@ -922,9 +922,11 @@ class TokenStore implements Disposable {
 			try {
 				await this._persistence.set(currentTokens);
 			} catch (error) {
-				// The tokens are credentials: only their count and the failure are logged.
-				this._logger.error(`Failed to save ${currentTokens.length} token(s) to secret storage: ${error}`);
-				throw new DynamicAuthSessionPersistError(currentTokens.length, { cause: error });
+				// The tokens are credentials, and a storage error's text is not safe by construction: only the count and the
+				// error's class are logged and carried (no cause).
+				const failure = error instanceof Error ? error.name : typeof error;
+				this._logger.error(`Failed to save ${currentTokens.length} token(s) to secret storage: ${failure}`);
+				throw new DynamicAuthSessionPersistError(currentTokens.length, failure);
 			}
 		}
 		this._logger.trace(`Tokens updated: ${currentTokens.length} tokens stored.`);

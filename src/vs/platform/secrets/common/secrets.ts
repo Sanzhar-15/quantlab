@@ -200,7 +200,7 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 			// No fallback to an in-memory store: that would hide the persisted secrets and lose every secret written.
 			this._type = 'unknown';
 			const error = new SecretStorageUnavailableError();
-			this._logService.error(`[SecretStorageService] ${error.message}`);
+			this._logService.error(`[SecretStorageService] ${error.name}: Secret storage is unavailable because encryption is not available; stored secrets are kept.`);
 			throw error;
 		}
 

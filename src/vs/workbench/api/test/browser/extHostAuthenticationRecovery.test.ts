@@ -14,7 +14,6 @@ import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILogger, ILoggerService, NullLogger, NullLogService } from '../../../../platform/log/common/log.js';
 import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
-import { SecretStorageUnavailableError } from '../../../../platform/secrets/common/secrets.js';
 import { TestSecretStorageService } from '../../../../platform/secrets/test/common/testSecretStorageService.js';
 import { StorageScope } from '../../../../platform/storage/common/storage.js';
 import { RemoveDynamicAuthenticationProvidersAction } from '../../../contrib/authentication/browser/actions/manageDynamicAuthenticationProvidersAction.js';
@@ -32,6 +31,14 @@ import { IExtHostWindow } from '../../common/extHostWindow.js';
 const AUTH_SERVER = 'https://auth.example.com';
 const TOKEN_ENDPOINT = `${AUTH_SERVER}/token`;
 const REGISTRATION_ENDPOINT = `${AUTH_SERVER}/register`;
+const PLANTED = 'sk-live-PLANTED-7f3a9c';
+
+/** A storage failure whose text holds a secret-looking value: only its class may reach a log line or an error. */
+function plantedStorageError(): Error {
+	const error = new Error(`keychain refused item ${PLANTED}`);
+	error.name = 'KeychainError';
+	return error;
+}
 
 type StoredToken = IAuthorizationTokenResponse & { created_at: number };
 
@@ -51,6 +58,7 @@ class RecordingLogger extends NullLogger {
 	readonly lines: string[] = [];
 	readonly errors: string[] = [];
 	override trace(message: string): void { this.lines.push(message); }
+	override debug(message: string): void { this.lines.push(message); }
 	override info(message: string): void { this.lines.push(message); }
 	override warn(message: string): void { this.lines.push(message); }
 	override error(message: string | Error): void { this.lines.push(String(message)); this.errors.push(String(message)); }
@@ -89,7 +97,7 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		const calls = { continuePrompts: 0, registrationPrompts: 0, failPersistence: false };
 		const proxy: Partial<MainThreadAuthenticationShape> = {
 			$setSessionsForDynamicAuthProvider: (providerId, clientId, sessions) => calls.failPersistence
-				? Promise.reject(new SecretStorageUnavailableError())
+				? Promise.reject(plantedStorageError())
 				: dynamicStorage.setSessionsForDynamicAuthProvider(providerId, clientId, sessions),
 			$showContinueNotification: async () => { calls.continuePrompts++; return false; },
 			$promptForClientRegistration: async () => { calls.registrationPrompts++; return { clientId: 'client-typed' }; },
@@ -198,14 +206,16 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 
 		await assert.rejects(provider.getSessions(['read'], {}), (e: unknown) => {
 			assert.ok(e instanceof DynamicAuthSessionPersistError, `expected DynamicAuthSessionPersistError, got ${e}`);
-			assert.ok(!/at-[12]|rt-[12]/.test(e.message), 'the error carries no token');
+			assert.ok(!/at-[12]|rt-[12]/.test(e.message) && !e.message.includes(PLANTED), 'the error carries no token and no storage error text');
+			assert.strictEqual(e.cause, undefined, 'no cause carries the storage error');
 			return true;
 		});
 
 		assert.strictEqual(logger.errors.length, 1, logger.errors.join('\n'));
-		assert.ok(logger.errors[0].includes('Failed to save') && logger.errors[0].includes('SecretStorageUnavailableError'), logger.errors[0]);
+		assert.ok(logger.errors[0].includes('Failed to save') && logger.errors[0].includes('KeychainError'), logger.errors[0]);
 		for (const line of logger.lines) {
 			assert.ok(!/at-[12]|rt-[12]/.test(line), `a log line holds token text: ${line}`);
+			assert.ok(!line.includes(PLANTED), `a log line holds the storage error text: ${line}`);
 		}
 		assert.strictEqual(await snapshot(), before, 'the stored sessions are untouched by the failed save');
 		assert.deepStrictEqual((await provider.getSessions(undefined, {})).map(s => s.accessToken), ['at-2'], 'the refreshed session is kept in memory');
