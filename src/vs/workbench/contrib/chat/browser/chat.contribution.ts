@@ -4,22 +4,17 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { timeout } from '../../../../base/common/async.js';
-import { Event } from '../../../../base/common/event.js';
 import { MarkdownString, isMarkdownString } from '../../../../base/common/htmlContent.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { PolicyCategory } from '../../../../base/common/policy.js';
 import * as nls from '../../../../nls.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
-import { Extensions as ConfigurationExtensions, ConfigurationScope, IConfigurationNode, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
+import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
-import { McpAccessValue, McpAutoStartValue, mcpAccessConfig, mcpAutoStartConfig, mcpGalleryServiceUrlConfig } from '../../../../platform/mcp/common/mcpManagement.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { Extensions, IConfigurationMigrationRegistry } from '../../../common/configuration.js';
 import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 } from '../../../common/contributions.js';
 import { EditorExtensions, IEditorFactoryRegistry } from '../../../common/editor.js';
-import { IWorkbenchAssignmentService } from '../../../services/assignment/common/assignmentService.js';
-import { ChatEntitlement, IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
 import { allDiscoverySources, mcpDiscoverySection } from '../../mcp/common/mcpConfiguration.js';
 import { ChatAgentNameService, ChatAgentService, IChatAgentNameService, IChatAgentService } from '../common/participants/chatAgents.js';
 import { CodeMapperService, ICodeMapperService } from '../common/editing/chatCodeMapperService.js';
@@ -102,126 +97,7 @@ import { ChatWindowNotifier } from './chatWindowNotifier.js';
 const toolReferenceNameEnumValues: string[] = [];
 const toolReferenceNameEnumDescriptions: string[] = [];
 
-// Register configuration
 const configurationRegistry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
-configurationRegistry.registerConfiguration({
-	id: 'chatSidebar',
-	title: nls.localize('interactiveSessionConfigurationTitle', "Chat"),
-	type: 'object',
-	properties: {
-		'chat.commandCenter.enabled': {
-			type: 'boolean',
-			markdownDescription: nls.localize('chat.commandCenter.enabled', "Controls whether the command center shows a menu for actions to control chat (requires {0}).", '`#window.commandCenter#`'),
-			default: true
-		},
-		[mcpAccessConfig]: {
-			type: 'string',
-			description: nls.localize('chat.mcp.access', "Controls access to installed Model Context Protocol servers."),
-			enum: [
-				McpAccessValue.None,
-				McpAccessValue.Registry,
-				McpAccessValue.All
-			],
-			enumDescriptions: [
-				nls.localize('chat.mcp.access.none', "No access to MCP servers."),
-				nls.localize('chat.mcp.access.registry', "Allows access to MCP servers installed from the registry that VS Code is connected to."),
-				nls.localize('chat.mcp.access.any', "Allow access to any installed MCP server.")
-			],
-			default: McpAccessValue.All,
-			policy: {
-				name: 'ChatMCP',
-				category: PolicyCategory.InteractiveSession,
-				minimumVersion: '1.99',
-				value: (account) => {
-					if (account.mcp === false) {
-						return McpAccessValue.None;
-					}
-					if (account.mcpAccess === 'registry_only') {
-						return McpAccessValue.Registry;
-					}
-					return undefined;
-				},
-				localization: {
-					description: {
-						key: 'chat.mcp.access',
-						value: nls.localize('chat.mcp.access', "Controls access to installed Model Context Protocol servers.")
-					},
-					enumDescriptions: [
-						{
-							key: 'chat.mcp.access.none', value: nls.localize('chat.mcp.access.none', "No access to MCP servers."),
-						},
-						{
-							key: 'chat.mcp.access.registry', value: nls.localize('chat.mcp.access.registry', "Allows access to MCP servers installed from the registry that VS Code is connected to."),
-						},
-						{
-							key: 'chat.mcp.access.any', value: nls.localize('chat.mcp.access.any', "Allow access to any installed MCP server.")
-						}
-					]
-				},
-			}
-		},
-		[mcpAutoStartConfig]: {
-			type: 'string',
-			description: nls.localize('chat.mcp.autostart', "Controls whether MCP servers should be automatically started when the chat messages are submitted."),
-			default: McpAutoStartValue.NewAndOutdated,
-			enum: [
-				McpAutoStartValue.Never,
-				McpAutoStartValue.OnlyNew,
-				McpAutoStartValue.NewAndOutdated
-			],
-			enumDescriptions: [
-				nls.localize('chat.mcp.autostart.never', "Never automatically start MCP servers."),
-				nls.localize('chat.mcp.autostart.onlyNew', "Only automatically start new MCP servers that have never been run."),
-				nls.localize('chat.mcp.autostart.newAndOutdated', "Automatically start new and outdated MCP servers that are not yet running.")
-			],
-			tags: ['experimental'],
-		},
-		[mcpGalleryServiceUrlConfig]: {
-			type: 'string',
-			description: nls.localize('mcp.gallery.serviceUrl', "Configure the MCP Gallery service URL to connect to"),
-			default: '',
-			scope: ConfigurationScope.APPLICATION,
-			tags: ['usesOnlineServices', 'advanced'],
-			included: false,
-			policy: {
-				name: 'McpGalleryServiceUrl',
-				category: PolicyCategory.InteractiveSession,
-				minimumVersion: '1.101',
-				value: (account) => account.mcpRegistryUrl,
-				localization: {
-					description: {
-						key: 'mcp.gallery.serviceUrl',
-						value: nls.localize('mcp.gallery.serviceUrl', "Configure the MCP Gallery service URL to connect to"),
-					}
-				}
-			},
-		},
-		'chat.disableAIFeatures': {
-			type: 'boolean',
-			description: nls.localize('chat.disableAIFeatures', "Disable and hide built-in AI features provided by GitHub Copilot, including chat and inline suggestions."),
-			default: false,
-			scope: ConfigurationScope.WINDOW
-		},
-		'chat.allowAnonymousAccess': { // TODO@bpasero remove me eventually
-			type: 'boolean',
-			description: nls.localize('chat.allowAnonymousAccess', "Controls whether anonymous access is allowed in chat."),
-			default: false,
-			tags: ['experimental'],
-			experiment: {
-				mode: 'auto'
-			}
-		},
-		'chat.extensionUnification.enabled': {
-			type: 'boolean',
-			description: nls.localize('chat.extensionUnification.enabled', "Enables the unification of GitHub Copilot extensions. When enabled, all GitHub Copilot functionality is served from the GitHub Copilot Chat extension. When disabled, the GitHub Copilot and GitHub Copilot Chat extensions operate independently."),
-			default: true,
-			tags: ['experimental'],
-			experiment: {
-				mode: 'auto'
-			}
-		},
-	}
-});
 Registry.as<IConfigurationMigrationRegistry>(Extensions.ConfigurationMigration).registerConfigurationMigrations([
 	{
 		key: 'chat.experimental.detectParticipant.enabled',
@@ -248,48 +124,6 @@ Registry.as<IConfigurationMigrationRegistry>(Extensions.ConfigurationMigration).
 		}
 	},
 ]);
-
-class ChatAgentSettingContribution extends Disposable implements IWorkbenchContribution {
-
-	static readonly ID = 'workbench.contrib.chatAgentSetting';
-
-	constructor(
-		@IWorkbenchAssignmentService private readonly experimentService: IWorkbenchAssignmentService,
-		@IChatEntitlementService private readonly entitlementService: IChatEntitlementService,
-	) {
-		super();
-		this.registerMaxRequestsSetting();
-	}
-
-
-	private registerMaxRequestsSetting(): void {
-		let lastNode: IConfigurationNode | undefined;
-		const registerMaxRequestsSetting = () => {
-			const treatmentId = this.entitlementService.entitlement === ChatEntitlement.Free ?
-				'chatAgentMaxRequestsFree' :
-				'chatAgentMaxRequestsPro';
-			this.experimentService.getTreatment<number>(treatmentId).then((value) => {
-				const defaultValue = value ?? (this.entitlementService.entitlement === ChatEntitlement.Free ? 25 : 25);
-				const node: IConfigurationNode = {
-					id: 'chatSidebar',
-					title: nls.localize('interactiveSessionConfigurationTitle', "Chat"),
-					type: 'object',
-					properties: {
-						'chat.agent.maxRequests': {
-							type: 'number',
-							markdownDescription: nls.localize('chat.agent.maxRequests', "The maximum number of requests to allow per-turn when using an agent. When the limit is reached, will ask to confirm to continue."),
-							default: defaultValue,
-						},
-					}
-				};
-				configurationRegistry.updateConfigurations({ remove: lastNode ? [lastNode] : [], add: [node] });
-				lastNode = node;
-			});
-		};
-		this._register(Event.runAndSubscribe(Event.debounce(this.entitlementService.onDidChangeEntitlement, () => { }, 1000), () => registerMaxRequestsSetting()));
-	}
-}
-
 
 class ToolReferenceNamesContribution extends Disposable implements IWorkbenchContribution {
 
@@ -422,7 +256,6 @@ registerWorkbenchContribution2(ChatSetupContribution.ID, ChatSetupContribution, 
 registerWorkbenchContribution2(ChatTeardownContribution.ID, ChatTeardownContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(ChatStatusBarEntry.ID, ChatStatusBarEntry, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(BuiltinToolsContribution.ID, BuiltinToolsContribution, WorkbenchPhase.Eventually);
-registerWorkbenchContribution2(ChatAgentSettingContribution.ID, ChatAgentSettingContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(ToolReferenceNamesContribution.ID, ToolReferenceNamesContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(ChatAgentRecommendation.ID, ChatAgentRecommendation, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(ChatEditingEditorAccessibility.ID, ChatEditingEditorAccessibility, WorkbenchPhase.AfterRestored);
