@@ -1459,7 +1459,18 @@ export class CodeApplication extends Disposable {
 		// QuantLab host (U5): once a workbench CodeWindow exists this stays right, because the host window is held open
 		// (`QlWorkbenchHost#onHostWindowClose`) until the workbench's unload handshake is over and its window has closed, so
 		// `window-all-closed` can only fire after the workbench is gone.
-		app.on('window-all-closed', () => terminalHost.windowAllClosed());
+		//
+		// It quits ONLY when the lifecycle service's listener did not. Electron's `app.quit()` is not idempotent across a
+		// prevented `will-quit`: the service prevents the first `will-quit` (a `once` listener) to run its shutdown joiners
+		// (the storage databases among them), and a second `app.quit()` in the same `window-all-closed` raises a second
+		// `will-quit` that nobody prevents, so the process ends under the joiners (measured on package 7: `quit` 14 ms after
+		// `will-quit - begin`, no joiner of the storage ended, the main aborted in vscode-sqlite3.node; folds/HOST/QUIT-EXIT-FIX.md).
+		// The service's listener quits when a quit was requested or off macOS, so this one quits in the remaining case.
+		app.on('window-all-closed', () => {
+			if (isMacintosh && !this.lifecycleMainService.quitRequested) {
+				terminalHost.windowAllClosed();
+			}
+		});
 		app.on('quit', (_event, exitCode) => terminalHost.noteQuit(exitCode));
 
 		return true;
