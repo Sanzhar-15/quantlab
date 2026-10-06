@@ -1440,9 +1440,21 @@ export class CodeApplication extends Disposable {
 					qlWorkbenchHost.requestWorkbench('test driver');
 				} else if (event.message === 'ql-test:toggle') {
 					this.logService.info('QuantLab host: test build: toggle requested by the test driver');
+					terminalHost.host.log('test driver toggle requested');
 					qlWorkbenchHost.requestToggle('test driver toggle');
+				} else if (event.message === 'ql-test:overlay-hide') {
+					// O4's NEGATIVE (PLAN-FINAL 3.5): the open overlay is hidden natively, so the composited capture must FAIL
+					const overlay = terminalHost.view('overlay');
+					if (!overlay) {
+						throw new Error('QuantLab host (DRIVER): ql-test:overlay-hide: the overlay is not open');
+					}
+					overlay.setVisible(false);
+					this.logService.info('QuantLab host: test build: the overlay view was hidden by the test driver (O4 negative)');
 				}
 			});
+			// A console message sent before this line reached no listener (measured: PERF's test-toggle on package 10 was lost when
+			// evaluated at the page's load). A driver or probe waits for this line on stderr before it asks.
+			terminalHost.host.log('test driver routes ready');
 		}
 
 		// What the launch itself asked to open (files, folders, a protocol link) is a first use now, never dropped
