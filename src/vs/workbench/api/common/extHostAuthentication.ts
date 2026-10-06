@@ -398,13 +398,14 @@ export class DynamicAuthClientRejectedError extends Error {
 }
 
 /**
- * Changed sessions could not be saved to secret storage (for example encryption is unavailable). They are kept in memory
- * for this window only; the previously stored sessions are not touched by this failure. The message carries no token.
+ * Changed sessions could not be saved to secret storage (for example encryption is unavailable). The change is kept as
+ * pending in this window and saved by the next operation, which reports success only once it is saved; until then the
+ * stored sessions are the previous ones. No completed-change event is published for it. The message carries no token.
  */
 export class DynamicAuthSessionPersistError extends Error {
 	override readonly name = 'DynamicAuthSessionPersistError';
 	constructor(count: number, failure: string) {
-		super(`${count} session(s) could not be saved to secret storage (${failure}); they are kept in memory for this window only and are lost on restart.`);
+		super(`${count} session(s) could not be saved to secret storage (${failure}); the change is kept in this window and saved by the next sign-in operation. Until then it is lost on restart.`);
 	}
 }
 
@@ -487,6 +488,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 	async getSessions(scopes: readonly string[] | undefined, _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession[]> {
 		this._logger.info(`Getting sessions for scopes: ${scopes?.join(' ') ?? 'all'}`);
+		// A change that could not be saved earlier is saved first: no read reports success over an unsaved credential.
+		await this._tokenStore.savePending();
 		if (!scopes) {
 			return this._tokenStore.sessions;
 		}
@@ -567,6 +570,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 	async createSession(scopes: string[], _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
 		this._logger.info(`Creating session for scopes: ${scopes.join(' ')}`);
+		// Saved before the user is asked to sign in: a storage that cannot save would lose the new session too.
+		await this._tokenStore.savePending();
 		let token: IAuthorizationTokenResponse | undefined;
 		for (let i = 0; i < this._createFlows.length; i++) {
 			const { handler } = this._createFlows[i];
@@ -619,6 +624,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 	async removeSession(sessionId: string): Promise<void> {
 		this._logger.info(`Removing session with id: ${sessionId}`);
+		// A sign-out that failed to save is retried here: it reports success only once the removal is stored.
+		await this._tokenStore.savePending();
 		const session = this._tokenStore.sessions.find(session => session.id === sessionId);
 		if (!session) {
 			this._logger.error(`Session with id ${sessionId} not found`);
@@ -885,6 +892,10 @@ type IAuthorizationToken = IAuthorizationTokenResponse & {
 };
 
 class TokenStore implements Disposable {
+	/** The tokens this window uses. They may hold a change that is not saved yet ({@link _pending}). */
+	private _tokens: IAuthorizationToken[];
+	private _pending = false;
+	/** The tokens known to be saved: completed-change events are published from these only. */
 	private readonly _tokensObservable: ISettableObservable<IAuthorizationToken[]>;
 	private readonly _sessionsObservable: IObservable<vscode.AuthenticationSession[]>;
 
@@ -899,21 +910,30 @@ class TokenStore implements Disposable {
 		private readonly _logger: ILogger
 	) {
 		this._disposable = new DisposableStore();
+		this._tokens = initialTokens;
 		this._tokensObservable = observableValue<IAuthorizationToken[]>('tokens', initialTokens);
 		this._sessionsObservable = derivedOpts(
 			{ equalsFn: (a, b) => arraysEqual(a, b, (a, b) => a.accessToken === b.accessToken) },
 			(reader) => this._tokensObservable.read(reader).map(t => this._getSessionFromToken(t))
 		);
 		this._disposable.add(this._registerChangeEventAutorun());
-		this._disposable.add(this._persistence.onDidChange((tokens) => this._tokensObservable.set(tokens, undefined)));
+		this._disposable.add(this._persistence.onDidChange((tokens) => {
+			this._tokensObservable.set(tokens, undefined);
+			if (this._pending) {
+				// The unsaved change may hold a rotated refresh token: it is kept, and saved by the next operation.
+				this._logger.warn('The stored sessions changed while a change here is not saved yet; the change here is kept and saved by the next operation.');
+			} else {
+				this._tokens = tokens;
+			}
+		}));
 	}
 
 	get tokens(): IAuthorizationToken[] {
-		return this._tokensObservable.get();
+		return this._tokens;
 	}
 
 	get sessions(): vscode.AuthenticationSession[] {
-		return this._sessionsObservable.get();
+		return this._tokens.map(t => this._getSessionFromToken(t));
 	}
 
 	dispose() {
@@ -921,11 +941,12 @@ class TokenStore implements Disposable {
 	}
 
 	/**
-	 * Rejects with {@link DynamicAuthSessionPersistError} when the changed tokens cannot be saved, after one error line.
+	 * Applies the change here and saves it. When it cannot be saved this rejects with {@link DynamicAuthSessionPersistError}
+	 * (after one error line) and the change stays pending: {@link savePending} saves it before a later operation succeeds.
 	 */
 	async update({ added, removed }: { added: IAuthorizationToken[]; removed: IAuthorizationToken[] }): Promise<void> {
 		this._logger.trace(`Updating tokens: added ${added.length}, removed ${removed.length}`);
-		const currentTokens = [...this._tokensObservable.get()];
+		const currentTokens = [...this._tokens];
 		for (const token of removed) {
 			const index = currentTokens.findIndex(t => t.access_token === token.access_token);
 			if (index !== -1) {
@@ -941,18 +962,35 @@ class TokenStore implements Disposable {
 			}
 		}
 		if (added.length || removed.length) {
-			this._tokensObservable.set(currentTokens, undefined);
-			try {
-				await this._persistence.set(currentTokens);
-			} catch (error) {
-				// The tokens are credentials, and a storage error's text is not safe by construction: only the count and the
-				// error's class are logged and carried (no cause).
-				const failure = error instanceof Error ? error.name : typeof error;
-				this._logger.error(`Failed to save ${currentTokens.length} token(s) to secret storage: ${failure}`);
-				throw new DynamicAuthSessionPersistError(currentTokens.length, failure);
-			}
+			this._tokens = currentTokens;
+			this._pending = true;
 		}
+		await this.savePending();
 		this._logger.trace(`Tokens updated: ${currentTokens.length} tokens stored.`);
+	}
+
+	/**
+	 * Saves a change that is not saved yet; nothing to do otherwise. Once saved, the completed-change event is published.
+	 * Rejects with {@link DynamicAuthSessionPersistError} after one error line, leaving the change pending.
+	 */
+	async savePending(): Promise<void> {
+		if (!this._pending) {
+			return;
+		}
+		const tokens = this._tokens;
+		try {
+			await this._persistence.set(tokens);
+		} catch (error) {
+			// The tokens are credentials, and a storage error's text is not safe by construction: only the count and the
+			// error's class are logged and carried (no cause).
+			const failure = error instanceof Error ? error.name : typeof error;
+			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${failure}`);
+			throw new DynamicAuthSessionPersistError(tokens.length, failure);
+		}
+		if (this._tokens === tokens) {
+			this._pending = false;
+		}
+		this._tokensObservable.set(tokens, undefined);
 	}
 
 	private _registerChangeEventAutorun(): IDisposable {

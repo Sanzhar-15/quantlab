@@ -46,6 +46,10 @@ class TestDynamicAuthProvider extends DynamicAuthProvider {
 	exchangeCode(): Promise<IAuthorizationTokenResponse> {
 		return this.exchangeCodeForToken('auth-code', 'code-verifier', 'https://vscode.dev/redirect');
 	}
+	/** One sign-in flow that returns `token`. */
+	useTokenFlow(token: IAuthorizationTokenResponse): void {
+		this._createFlows.splice(0, this._createFlows.length, { label: 'Token', handler: async () => ({ ...token }) });
+	}
 	/** Two sign-in flows that both exchange a code, so a stop is told apart from "try a different way". */
 	useCodeExchangeFlows(): void {
 		this._createFlows.splice(0, this._createFlows.length,
@@ -224,7 +228,78 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 			assert.ok(!line.includes(PLANTED), `a log line holds the storage error text: ${line}`);
 		}
 		assert.strictEqual(await snapshot(), before, 'the stored sessions are untouched by the failed save');
-		assert.deepStrictEqual((await provider.getSessions(undefined, {})).map(s => s.accessToken), ['at-2'], 'the refreshed session is kept in memory');
+	});
+
+	// MUST-3: a change that failed to save stays pending; no completed-change event; the next operation saves it first.
+	const rotated = { access_token: 'at-2', refresh_token: 'rt-2', token_type: 'Bearer', scope: 'read', expires_in: 3600 };
+
+	function isPersistError(e: unknown): boolean {
+		assert.ok(e instanceof DynamicAuthSessionPersistError, `expected DynamicAuthSessionPersistError, got ${e}`);
+		return true;
+	}
+
+	test('refresh with a rotated refresh token, save fails once: no event; the next read saves it before succeeding; it survives a restart', async () => {
+		respondWith(async () => new Response(JSON.stringify(rotated), { status: 200 }));
+		const { provider, calls, events, stored } = await createProvider([expiredRefreshable]);
+
+		calls.failPersistence = true;
+		await assert.rejects(provider.getSessions(['read'], {}), isPersistError);
+		assert.deepStrictEqual(events, [], 'a failed save publishes no completed change');
+		assert.deepStrictEqual((await stored()).map(t => [t.access_token, t.refresh_token]), [['at-1', 'rt-1']]);
+
+		calls.failPersistence = false;
+		const writes = calls.writes;
+		assert.deepStrictEqual((await provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-2']);
+		assert.strictEqual(calls.writes, writes + 1, 'the pending change is written again');
+		assert.strictEqual(fetchStub.callCount, 1, 'the rotated refresh token is kept: no second refresh with the spent one');
+		assert.deepStrictEqual((await stored()).map(t => [t.access_token, t.refresh_token]), [['at-2', 'rt-2']], 'durable state matches the reported result');
+		assert.deepStrictEqual(events, [{ added: ['at-2'], removed: ['at-1'] }]);
+
+		const restarted = await createProvider(await stored());
+		assert.deepStrictEqual((await restarted.provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-2'], 'after a restart');
+		assert.strictEqual(fetchStub.callCount, 1);
+	});
+
+	test('sign-in whose save fails once: rejects, no event; the next read saves it before succeeding; it survives a restart', async () => {
+		respondWith(async () => { throw new Error('no token request is expected'); });
+		const { provider, calls, events, stored } = await createProvider([]);
+		provider.useTokenFlow(rotated);
+
+		calls.failPersistence = true;
+		await assert.rejects(provider.createSession(['read'], {}), isPersistError);
+		assert.deepStrictEqual(events, []);
+		assert.deepStrictEqual(await stored(), []);
+
+		calls.failPersistence = false;
+		const writes = calls.writes;
+		assert.deepStrictEqual((await provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-2']);
+		assert.strictEqual(calls.writes, writes + 1);
+		assert.deepStrictEqual((await stored()).map(t => t.access_token), ['at-2']);
+		assert.deepStrictEqual(events, [{ added: ['at-2'], removed: [] }]);
+
+		const restarted = await createProvider(await stored());
+		assert.deepStrictEqual((await restarted.provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-2']);
+	});
+
+	test('sign-out whose save fails once: rejects, no event; a retried sign-out stores the removal before succeeding; it survives a restart', async () => {
+		respondWith(async () => { throw new Error('no token request is expected'); });
+		const { provider, calls, events, stored } = await createProvider([{ ...rotated, created_at: Date.now() }]);
+		const [session] = await provider.getSessions(undefined, {});
+
+		calls.failPersistence = true;
+		await assert.rejects(provider.removeSession(session.id), isPersistError);
+		assert.deepStrictEqual(events, []);
+		assert.deepStrictEqual((await stored()).map(t => t.access_token), ['at-2']);
+
+		calls.failPersistence = false;
+		const writes = calls.writes;
+		await provider.removeSession(session.id);
+		assert.strictEqual(calls.writes, writes + 1, 'the retried sign-out writes the removal');
+		assert.deepStrictEqual(await stored(), [], 'durable state matches the reported result');
+		assert.deepStrictEqual(events, [{ added: [], removed: ['at-2'] }]);
+
+		const restarted = await createProvider(await stored());
+		assert.deepStrictEqual(await restarted.provider.getSessions(undefined, {}), [], 'the session does not return after a restart');
 	});
 
 	test('a non-refreshable token: still valid, it stays usable; expired, it stays stored and the read rejects, named', async () => {
