@@ -12,7 +12,7 @@ import { IMessagePassingProtocol } from '../../../../../base/parts/ipc/common/ip
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ExtensionHostKind } from '../../common/extensionHostKind.js';
 import { RPCLogger } from '../../common/extensionHostManager.js';
-import { ProxyIdentifier } from '../../common/proxyIdentifier.js';
+import { createProxyIdentifier } from '../../common/proxyIdentifier.js';
 import { IRPCProtocolLogger, RPCProtocol, RPCPayloadShape, RequestInitiator } from '../../common/rpcProtocol.js';
 
 /**
@@ -192,8 +192,8 @@ suite('RPCProtocol logging carries no payload value', () => {
 		}
 	}
 
-	const mainIdentifier = new ProxyIdentifier<MainThreadAuthActor>('rpcLoggingTestMainThreadAuth');
-	const extIdentifier = new ProxyIdentifier<ExtHostAuthActor>('rpcLoggingTestExtHostAuth');
+	const mainIdentifier = createProxyIdentifier<MainThreadAuthActor>('rpcLoggingTestMainThreadAuth');
+	const extIdentifier = createProxyIdentifier<ExtHostAuthActor>('rpcLoggingTestExtHostAuth');
 
 	let consoleLogCalls: unknown[][];
 	let originalConsoleLog: typeof console.log;
@@ -365,7 +365,7 @@ suite('RPCProtocol logging carries no payload value', () => {
 
 		// replies as received by the caller
 		assert.strictEqual(registered, 'provider-id');
-		assert.ok((waited as UriComponents).query.includes(`code=${M_WAIT_REPLY_CODE}`));
+		assert.ok((waited as UriComponents).query?.includes(`code=${M_WAIT_REPLY_CODE}`));
 		assert.strictEqual(prompted?.clientSecret, M_PROMPT_REPLY_SECRET);
 		const sessionsText = JSON.stringify([sessions, created]);
 		for (const marker of [M_EXT_REPLY_ACCESS, M_EXT_REPLY_REFRESH, M_EXT_REPLY_ID]) {
