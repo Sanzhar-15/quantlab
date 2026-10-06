@@ -427,8 +427,12 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			const error = await rejection(provider.exchangeCode(AUTH_CODE, PKCE_VERIFIER, REDIRECT_URI));
 			assertClean(logger, error);
 
-			assert.strictEqual(error.message, 'Failed to exchange authorization code for token: TypeError: fetch failed');
-			assert.ok(logger.messages('error').some(message => message.includes('Failed to exchange authorization code for token')));
+			assert.strictEqual(error.message, 'Token exchange failed: the request could not be completed');
+			assert.strictEqual(error.cause, undefined);
+			// The upstream text is dropped from the error and from every log line
+			assert.ok(!error.message.includes('fetch failed'));
+			assert.ok(!logger.records.some(record => collectStrings(record.args).some(text => text.includes('fetch failed'))));
+			assert.ok(logger.messages('error').includes('Token exchange failed: the request could not be completed'));
 		});
 	});
 
