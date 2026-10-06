@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { app, BaseWindow, dialog, ipcMain, protocol, safeStorage, session, Session, shell, systemPreferences, WebContents, WebContentsView, WebFrameMain } from 'electron';
+import { app, BaseWindow, dialog, ipcMain, protocol, safeStorage, screen, session, Session, shell, systemPreferences, WebContents, WebContentsView, WebFrameMain } from 'electron';
 import { addUNCHostToAllowlist, disableUNCAccessRestrictions } from '../../base/node/unc.js';
 import { validatedIpcMain } from '../../base/parts/ipc/electron-main/ipcMain.js';
 import { hostname, release } from 'os';
@@ -1354,7 +1354,7 @@ export class CodeApplication extends Disposable {
 		});
 
 		const ports: Ports = {
-			electron: { app, BaseWindow, WebContentsView, session, protocol, ipcMain, shell, safeStorage, dialog },
+			electron: { app, BaseWindow, WebContentsView, session, protocol, ipcMain, shell, safeStorage, dialog, screen },
 			validatedIpcMain,
 			platform: process.platform,
 			backendOrigin,
