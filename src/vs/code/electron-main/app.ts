@@ -1388,6 +1388,63 @@ export class CodeApplication extends Disposable {
 		// before the window goes), the toggle key, and the gate's requests
 		qlWorkbenchHost.attach(terminalHost);
 
+		// QuantLab host (DRIVER): TEST BUILDS ONLY. `globalThis.QL_TEST_BUILD` is a constant `false` in a product bundle (esbuild define,
+		// build/lib/optimize.ts), so esbuild drops this block and the dynamic import with it: a product bundle carries neither the dump
+		// module nor its file name. The built-app driver reads the view records from the user-data dir; they are written now (the
+		// terminal view) and again after every change of the host's registry: the workbench's adoption and removal (`addView` /
+		// `removeView`) and the overlay's open and close. A failed write is thrown into the caller, never caught.
+		if (globalThis.QL_TEST_BUILD) {
+			const { dump } = await import('./qlHost/viewRecordsDump.js');
+			const userDataPath = this.environmentMainService.userDataPath;
+			const publishViewRecords = (): void => {
+				this.logService.info(`QuantLab host: test build: view records written to ${dump(terminalHost.viewRecords(), userDataPath)}`);
+			};
+
+			const { addView, removeView, openOverlay, closeOverlay } = terminalHost;
+			terminalHost.addView = (name, role, view, webPreferences) => {
+				addView(name, role, view, webPreferences);
+				publishViewRecords();
+			};
+			terminalHost.removeView = name => {
+				const removed = removeView(name);
+				publishViewRecords();
+
+				return removed;
+			};
+			terminalHost.openOverlay = async () => {
+				try {
+					await openOverlay();
+				} finally {
+					publishViewRecords(); // also after a failed open: the overlay is closed again, so the file must say so
+				}
+			};
+			terminalHost.closeOverlay = () => {
+				closeOverlay();
+				publishViewRecords();
+			};
+			publishViewRecords();
+
+			// The driver's `showWorkbench()`. A key injected over CDP reaches the page and never the host's `before-input-event`
+			// (measured on package 7, folds/HOST/A2-SPLIT-7.md), so the driver cannot press the toggle key: in a test build the
+			// terminal page asks by console message (the driver evaluates `console.debug('ql-test:show-workbench')` in it). It is a
+			// request like a launch argument's: first use, then shown; a failure goes to the failure dialog and the log.
+			const terminalView = terminalHost.view('terminal');
+			if (!terminalView) {
+				throw new Error('QuantLab host (DRIVER): the started host registered no terminal view');
+			}
+			// `ql-test:toggle` is the toggle key's own path (`view-switch start` / `done` in the host log, which PERF's SW-1 reads),
+			// for the same reason: no injected key reaches the key watch. It is watched on the terminal page only.
+			terminalView.webContents.on('console-message', event => {
+				if (event.message === 'ql-test:show-workbench') {
+					this.logService.info('QuantLab host: test build: workbench requested by the test driver');
+					qlWorkbenchHost.requestWorkbench('test driver');
+				} else if (event.message === 'ql-test:toggle') {
+					this.logService.info('QuantLab host: test build: toggle requested by the test driver');
+					qlWorkbenchHost.requestToggle('test driver toggle');
+				}
+			});
+		}
+
 		// What the launch itself asked to open (files, folders, a protocol link) is a first use now, never dropped
 		const launchRequestCause = this.qlLaunchRequestCause(initialProtocolUrls);
 		if (launchRequestCause) {
@@ -1402,7 +1459,18 @@ export class CodeApplication extends Disposable {
 		// QuantLab host (U5): once a workbench CodeWindow exists this stays right, because the host window is held open
 		// (`QlWorkbenchHost#onHostWindowClose`) until the workbench's unload handshake is over and its window has closed, so
 		// `window-all-closed` can only fire after the workbench is gone.
-		app.on('window-all-closed', () => terminalHost.windowAllClosed());
+		//
+		// It quits ONLY when the lifecycle service's listener did not. Electron's `app.quit()` is not idempotent across a
+		// prevented `will-quit`: the service prevents the first `will-quit` (a `once` listener) to run its shutdown joiners
+		// (the storage databases among them), and a second `app.quit()` in the same `window-all-closed` raises a second
+		// `will-quit` that nobody prevents, so the process ends under the joiners (measured on package 7: `quit` 14 ms after
+		// `will-quit - begin`, no joiner of the storage ended, the main aborted in vscode-sqlite3.node; folds/HOST/QUIT-EXIT-FIX.md).
+		// The service's listener quits when a quit was requested or off macOS, so this one quits in the remaining case.
+		app.on('window-all-closed', () => {
+			if (isMacintosh && !this.lifecycleMainService.quitRequested) {
+				terminalHost.windowAllClosed();
+			}
+		});
 		app.on('quit', (_event, exitCode) => terminalHost.noteQuit(exitCode));
 
 		return true;
