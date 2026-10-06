@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { EncryptionMainServiceWithElectron, IEncryptionApp, IEncryptionSafeStorage } from '../../electron-main/encryptionMainService.js';
+import { EncryptionKeychainError, EncryptionMainServiceWithElectron, IEncryptionApp, IEncryptionSafeStorage } from '../../electron-main/encryptionMainService.js';
 
 // Planted values: none of them may appear in any log line (LOG-1).
 const PLANTED_PLAINTEXT = 'planted-plaintext-7f3a91';
@@ -155,28 +155,70 @@ suite('EncryptionMainService (F-PACK-13 keychain lines, LOG-1)', () => {
 		assertNoPlantedValueLogged(noData);
 	});
 
-	test('a Keychain failure logs the error class (not its message) and rethrows', async () => {
-		const denied = new KeychainDeniedError(`denied while reading ${PLANTED_CIPHERTEXT}`);
+	/**
+	 * Review c1 MUST-4: what leaves the service on a Keychain failure. The planted credential is in the original error's message
+	 * and stack; the outgoing error must carry neither (nor keep the original as `cause`): it is what the secret-storage service
+	 * logs raw (`logService.error(e)`) and what IPC carries to the renderer (message and stack).
+	 */
+	function assertSanitized(error: unknown, original: Error, operation: string): true {
+		assert.ok(error instanceof Error);
+		const exposed = [error.message, String(error.stack), stringifyLogArgument(error), JSON.stringify(error), JSON.stringify(Object.getOwnPropertyNames(error).map(name => String((error as unknown as Record<string, unknown>)[name])))];
+		for (const text of exposed) {
+			assert.ok(!text.includes(PLANTED_CREDENTIAL), 'the outgoing error exposes the planted credential');
+		}
+		assert.ok(error instanceof EncryptionKeychainError, 'the outgoing error is the sanitized EncryptionKeychainError');
+		assert.notStrictEqual(error, original, 'the original error must not leave the service');
+		assert.strictEqual(error.message, `[EncryptionMainService] keychain: ${operation} failed (KeychainDeniedError)`);
+		assert.strictEqual(error.cause, undefined, 'the original error must not be kept as cause');
+		// a raw sink, as the secret-storage service's `this.logService.error(e)`
+		logService.error(error);
+		return true;
+	}
+
+	const PLANTED_CREDENTIAL = 'planted-credential-91be0d';
+
+	function credentialBearing(): KeychainDeniedError {
+		const denied = new KeychainDeniedError(`denied while reading ${PLANTED_CREDENTIAL}`);
+		denied.stack = `KeychainDeniedError: denied while reading ${PLANTED_CREDENTIAL}\n    at native (${PLANTED_CREDENTIAL})`;
+		return denied;
+	}
+
+	test('a decrypt Keychain failure logs the error class (not its message) and throws a sanitized error, not the original', async () => {
+		const denied = credentialBearing();
 		safeStorage.failWith = denied;
-		await assert.rejects(service.decrypt(STORED_VALUE), (error: unknown) => error === denied);
-		assert.deepStrictEqual(logService.events, [
+		await assert.rejects(service.decrypt(STORED_VALUE), (error: unknown) => assertSanitized(error, denied, 'decryptString'));
+		assert.deepStrictEqual(logService.events.slice(0, 4), [
 			`info: [EncryptionMainService] keychain: decryptString ${ITEM} start`,
 			'call: decryptString',
 			`info: [EncryptionMainService] keychain: decryptString ${ITEM} failed (KeychainDeniedError)`,
 			'error: [EncryptionMainService] decryptString failed (KeychainDeniedError)',
 		]);
-		assertNoPlantedValueLogged();
+		assertNoPlantedValueLogged(PLANTED_CREDENTIAL);
 	});
 
-	test('isEncryptionAvailable failure is bracketed and rethrown', () => {
-		const denied = new KeychainDeniedError('denied');
+	test('an encrypt Keychain failure throws a sanitized error, not the original; no credential in any line', async () => {
+		const denied = credentialBearing();
 		safeStorage.failWith = denied;
-		assert.throws(() => service.isEncryptionAvailable(), (error: unknown) => error === denied);
-		assert.deepStrictEqual(logService.events, [
+		await assert.rejects(service.encrypt(PLANTED_PLAINTEXT), (error: unknown) => assertSanitized(error, denied, 'encryptString'));
+		assert.deepStrictEqual(logService.events.slice(0, 4), [
+			`info: [EncryptionMainService] keychain: encryptString ${ITEM} start`,
+			'call: encryptString',
+			`info: [EncryptionMainService] keychain: encryptString ${ITEM} failed (KeychainDeniedError)`,
+			'error: [EncryptionMainService] encryptString failed (KeychainDeniedError)',
+		]);
+		assertNoPlantedValueLogged(PLANTED_CREDENTIAL);
+	});
+
+	test('isEncryptionAvailable failure is bracketed and throws a sanitized error, not the original', () => {
+		const denied = credentialBearing();
+		safeStorage.failWith = denied;
+		assert.throws(() => service.isEncryptionAvailable(), (error: unknown) => assertSanitized(error, denied, 'isEncryptionAvailable'));
+		assert.deepStrictEqual(logService.events.slice(0, 4), [
 			`info: [EncryptionMainService] keychain: isEncryptionAvailable ${ITEM} start`,
 			'call: isEncryptionAvailable',
 			`info: [EncryptionMainService] keychain: isEncryptionAvailable ${ITEM} failed (KeychainDeniedError)`,
 			'error: [EncryptionMainService] isEncryptionAvailable failed (KeychainDeniedError)',
 		]);
+		assertNoPlantedValueLogged(PLANTED_CREDENTIAL);
 	});
 });
