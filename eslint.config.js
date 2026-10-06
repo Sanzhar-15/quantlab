@@ -1908,6 +1908,7 @@ export default tseslint.config(
 						'vs/**/common/*',
 						'vs/**/node/*',
 						'vs/nls.js',
+						'vs/code/electron-main/ql-client/index.js', // QuantLab host (EGRESS-MAIN): main.ts calls the generated client entry before ready
 						'src/*.js',
 						'*' // node.js
 					]
