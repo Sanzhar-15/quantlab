@@ -148,7 +148,12 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 				secrets: await Promise.all((await secrets.keys()).sort().map(async key => [key, await secrets.get(key)])),
 			});
 		};
-		return { provider, snapshot, calls, logger, events, stored };
+		/** Another window stored `tokens`: the stored value changes and the change reaches this window. */
+		const storedByAnotherWindow = async (tokens: StoredToken[]) => {
+			await dynamicStorage.setSessionsForDynamicAuthProvider(provider.id, 'client-1', tokens);
+			emitter.fire({ authProviderId: provider.id, clientId: 'client-1', tokens });
+		};
+		return { provider, snapshot, calls, logger, events, stored, storedByAnotherWindow };
 	}
 
 	const expiredRefreshable: StoredToken = { access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', scope: 'read', expires_in: 3600, created_at: 1 };
@@ -259,6 +264,40 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		const restarted = await createProvider(await stored());
 		assert.deepStrictEqual((await restarted.provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-2'], 'after a restart');
 		assert.strictEqual(fetchStub.callCount, 1);
+	});
+
+	// Item 3, cross-window: a pending change is re-applied onto what another window stored, never saved over it.
+	test('a session signed out in another window is not brought back by a pending refresh here', async () => {
+		respondWith(async () => new Response(JSON.stringify(rotated), { status: 200 }));
+		const { provider, calls, stored, storedByAnotherWindow, logger } = await createProvider([expiredRefreshable]);
+
+		calls.failPersistence = true;
+		await assert.rejects(provider.getSessions(['read'], {}), isPersistError);
+
+		// The user signs out of at-1 in another window.
+		await storedByAnotherWindow([]);
+		calls.failPersistence = false;
+
+		assert.deepStrictEqual(await provider.getSessions(['read'], {}), []);
+		assert.deepStrictEqual(await stored(), [], 'the sign-out stored by the other window stands');
+		assert.strictEqual(logger.lines.filter(l => l.includes('signed out in another window')).length, 1, logger.lines.join('\n'));
+	});
+
+	test('a pending refresh keeps its rotated refresh token and keeps a session another window added', async () => {
+		respondWith(async () => new Response(JSON.stringify(rotated), { status: 200 }));
+		const { provider, calls, stored, storedByAnotherWindow } = await createProvider([expiredRefreshable]);
+		const otherWindowSession: StoredToken = { access_token: 'at-b', refresh_token: 'rt-b', token_type: 'Bearer', scope: 'other', expires_in: 3600, created_at: Date.now() };
+
+		calls.failPersistence = true;
+		await assert.rejects(provider.getSessions(['read'], {}), isPersistError);
+
+		// Another window signs in a second session.
+		await storedByAnotherWindow([expiredRefreshable, otherWindowSession]);
+		calls.failPersistence = false;
+
+		assert.deepStrictEqual((await provider.getSessions(['read'], {})).map(s => s.accessToken), ['at-2']);
+		assert.deepStrictEqual((await stored()).map(t => [t.access_token, t.refresh_token]), [['at-2', 'rt-2'], ['at-b', 'rt-b']]);
+		assert.strictEqual(fetchStub.callCount, 1, 'the rotated refresh token is used, not refreshed again');
 	});
 
 	test('sign-in whose save fails once: rejects, no event; the next read saves it before succeeding; it survives a restart', async () => {

@@ -509,9 +509,9 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		let sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
 		this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
 		if (sessions.length) {
-			const newTokens: IAuthorizationToken[] = [];
 			const removedTokens: IAuthorizationToken[] = [];
-			const refreshedTokens = new Set<IAuthorizationToken>();
+			/** Each refreshed token and the token that replaces it. */
+			const refreshedTokens = new Map<IAuthorizationToken, IAuthorizationToken>();
 			const expiredTokens: IAuthorizationToken[] = [];
 			const tokenMap = new Map<string, IAuthorizationToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
 			for (const session of sessions) {
@@ -545,8 +545,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 								newToken.scope = scopeStr;
 							}
 							this._logger.info(`Successfully created a new token for scopes ${session.scopes.join(' ')}.`);
-							newTokens.push(newToken);
-							refreshedTokens.add(token);
+							refreshedTokens.set(token, newToken);
 						} catch (err) {
 							this._logger.error(`Failed to refresh token: ${err}`);
 						}
@@ -557,9 +556,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			// A token whose refresh failed stays stored (a failure may be transient; its refresh token is a credential) and
 			// this operation rejects. Only an explicit act of the user removes it: signing out, or removing the provider.
 			const failedRefreshTokens = removedTokens.filter(t => !refreshedTokens.has(t));
-			const replacedTokens = removedTokens.filter(t => refreshedTokens.has(t));
-			if (newTokens.length || replacedTokens.length) {
-				await this._tokenStore.update({ added: newTokens, removed: replacedTokens });
+			if (refreshedTokens.size) {
+				await this._tokenStore.update([...refreshedTokens].map(([previous, token]) => ({ kind: 'replace', previousId: sessionIdOf(previous), token })));
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
@@ -624,7 +622,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		// Store session for later retrieval
-		await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
+		await this._tokenStore.update([{ kind: 'add', token: { ...token, created_at: Date.now() } }]);
 		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
 		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for scopes: ${token.scope}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
@@ -644,7 +642,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.error(`Failed to retrieve token for removed session: ${session.id}`);
 			return;
 		}
-		await this._tokenStore.update({ added: [], removed: [token] });
+		await this._tokenStore.update([{ kind: 'remove', id: sessionIdOf(token) }]);
 		this._logger.info(`Removed token for session: ${session.id} with scopes: ${session.scopes.join(' ')}`);
 	}
 
@@ -920,10 +918,26 @@ type IAuthorizationToken = IAuthorizationTokenResponse & {
 	created_at: number;
 };
 
+/** The session id of a token: the id of the session made from it ({@link TokenStore}). */
+function sessionIdOf(token: IAuthorizationTokenResponse): string {
+	return stringHash(token.access_token, 0).toString();
+}
+
+/**
+ * One change to the stored tokens, by session id: a new token, a token that replaces another (a refresh), or a removal.
+ */
+type TokenChange =
+	| { readonly kind: 'add'; readonly token: IAuthorizationToken }
+	| { readonly kind: 'replace'; readonly previousId: string; readonly token: IAuthorizationToken }
+	| { readonly kind: 'remove'; readonly id: string };
+
 class TokenStore implements Disposable {
-	/** The tokens this window uses. They may hold a change that is not saved yet ({@link _pending}). */
+	/** The last stored tokens known here (saved here, or stored by another window). */
+	private _savedTokens: IAuthorizationToken[];
+	/** Changes made here and not saved yet, in order. They are re-applied onto tokens stored by another window. */
+	private _pending: TokenChange[] = [];
+	/** The tokens this window uses: the pending changes applied onto the saved tokens. */
 	private _tokens: IAuthorizationToken[];
-	private _pending = false;
 	/** The tokens known to be saved: completed-change events are published from these only. */
 	private readonly _tokensObservable: ISettableObservable<IAuthorizationToken[]>;
 	private readonly _sessionsObservable: IObservable<vscode.AuthenticationSession[]>;
@@ -939,6 +953,7 @@ class TokenStore implements Disposable {
 		private readonly _logger: ILogger
 	) {
 		this._disposable = new DisposableStore();
+		this._savedTokens = initialTokens;
 		this._tokens = initialTokens;
 		this._tokensObservable = observableValue<IAuthorizationToken[]>('tokens', initialTokens);
 		this._sessionsObservable = derivedOpts(
@@ -947,13 +962,10 @@ class TokenStore implements Disposable {
 		);
 		this._disposable.add(this._registerChangeEventAutorun());
 		this._disposable.add(this._persistence.onDidChange((tokens) => {
+			this._savedTokens = tokens;
 			this._tokensObservable.set(tokens, undefined);
-			if (this._pending) {
-				// The unsaved change may hold a rotated refresh token: it is kept, and saved by the next operation.
-				this._logger.warn('The stored sessions changed while a change here is not saved yet; the change here is kept and saved by the next operation.');
-			} else {
-				this._tokens = tokens;
-			}
+			// Changes not saved yet are re-applied onto what another window stored, so saving them never overwrites it.
+			this._tokens = this._applyPending();
 		}));
 	}
 
@@ -970,32 +982,56 @@ class TokenStore implements Disposable {
 	}
 
 	/**
-	 * Applies the change here and saves it. When it cannot be saved this rejects with {@link DynamicAuthSessionPersistError}
-	 * (after one error line) and the change stays pending: {@link savePending} saves it before a later operation succeeds.
+	 * Applies the changes here and saves them. When they cannot be saved this rejects with
+	 * {@link DynamicAuthSessionPersistError} (after one error line) and they stay pending: {@link savePending} saves them
+	 * before a later operation succeeds.
 	 */
-	async update({ added, removed }: { added: IAuthorizationToken[]; removed: IAuthorizationToken[] }): Promise<void> {
-		this._logger.trace(`Updating tokens: added ${added.length}, removed ${removed.length}`);
-		const currentTokens = [...this._tokens];
-		for (const token of removed) {
-			const index = currentTokens.findIndex(t => t.access_token === token.access_token);
-			if (index !== -1) {
-				currentTokens.splice(index, 1);
-			}
-		}
-		for (const token of added) {
-			const index = currentTokens.findIndex(t => t.access_token === token.access_token);
-			if (index === -1) {
-				currentTokens.push(token);
-			} else {
-				currentTokens[index] = token;
-			}
-		}
-		if (added.length || removed.length) {
-			this._tokens = currentTokens;
-			this._pending = true;
-		}
+	async update(changes: TokenChange[]): Promise<void> {
+		this._logger.trace(`Updating tokens: ${changes.length} change(s)`);
+		this._pending.push(...changes);
+		this._tokens = this._applyPending();
 		await this.savePending();
-		this._logger.trace(`Tokens updated: ${currentTokens.length} tokens stored.`);
+		this._logger.trace(`Tokens updated: ${this._tokens.length} tokens stored.`);
+	}
+
+	/**
+	 * The pending changes applied onto the saved tokens. A replacement whose token is no longer stored (another window
+	 * signed it out: the user's explicit act) is dropped, with one log line; so are the changes that build on it.
+	 */
+	private _applyPending(): IAuthorizationToken[] {
+		const tokens = [...this._savedTokens];
+		const kept: TokenChange[] = [];
+		let dropped = 0;
+		for (const change of this._pending) {
+			if (change.kind === 'remove') {
+				const index = tokens.findIndex(t => sessionIdOf(t) === change.id);
+				if (index !== -1) {
+					tokens.splice(index, 1);
+				}
+				kept.push(change);
+			} else if (change.kind === 'replace') {
+				const index = tokens.findIndex(t => sessionIdOf(t) === change.previousId);
+				if (index === -1) {
+					dropped++;
+					continue;
+				}
+				tokens[index] = change.token;
+				kept.push(change);
+			} else {
+				const index = tokens.findIndex(t => sessionIdOf(t) === sessionIdOf(change.token));
+				if (index === -1) {
+					tokens.push(change.token);
+				} else {
+					tokens[index] = change.token;
+				}
+				kept.push(change);
+			}
+		}
+		if (dropped) {
+			this._logger.warn(`${dropped} unsaved session refresh(es) dropped: the session was signed out in another window.`);
+		}
+		this._pending = kept;
+		return tokens;
 	}
 
 	/**
@@ -1003,10 +1039,11 @@ class TokenStore implements Disposable {
 	 * Rejects with {@link DynamicAuthSessionPersistError} after one error line, leaving the change pending.
 	 */
 	async savePending(): Promise<void> {
-		if (!this._pending) {
+		if (!this._pending.length) {
 			return;
 		}
 		const tokens = this._tokens;
+		const saving = [...this._pending];
 		try {
 			await this._persistence.set(tokens);
 		} catch (error) {
@@ -1016,9 +1053,9 @@ class TokenStore implements Disposable {
 			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${failure}`);
 			throw new DynamicAuthSessionPersistError(tokens.length, failure);
 		}
-		if (this._tokens === tokens) {
-			this._pending = false;
-		}
+		this._savedTokens = tokens;
+		// Changes made while this save ran stay pending.
+		this._pending = this._pending.filter(change => !saving.includes(change));
 		this._tokensObservable.set(tokens, undefined);
 	}
 
