@@ -36,6 +36,18 @@ export class InvalidStoredSecretError extends Error {
 	}
 }
 
+/**
+ * Secret storage is persisted but its encryption is unavailable (for example no OS keychain), so no secret can be read or
+ * written. The stored secrets are kept, nothing is written anywhere else, and the failure is not remembered: the next call
+ * checks again, so the stored secrets become readable once encryption is available. It carries no key and no secret.
+ */
+export class SecretStorageUnavailableError extends Error {
+	override readonly name = 'SecretStorageUnavailableError';
+	constructor() {
+		super('Secret storage is unavailable because encryption is not available; stored secrets are kept and can be neither read nor written until it is.');
+	}
+}
+
 export interface ISecretStorageProvider {
 	type: 'in-memory' | 'persisted' | 'unknown';
 	get(key: string): Promise<string | undefined>;
@@ -80,7 +92,7 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 		return this._type;
 	}
 
-	private _lazyStorageService: Lazy<Promise<IStorageService>> = new Lazy(() => this.initialize());
+	private _lazyStorageService: Lazy<Promise<IStorageService>> = this.createLazyStorageService();
 	protected get resolvedStorageService() {
 		return this._lazyStorageService.value;
 	}
@@ -156,20 +168,40 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 		});
 	}
 
+	/**
+	 * A failed initialization is not kept: the caller receives the rejection and the next call initializes again, so a
+	 * later call after encryption becomes available uses the persisted storage.
+	 */
+	private createLazyStorageService(): Lazy<Promise<IStorageService>> {
+		const lazy: Lazy<Promise<IStorageService>> = new Lazy(() => this.initialize().catch(error => {
+			if (this._lazyStorageService === lazy) {
+				this._lazyStorageService = this.createLazyStorageService();
+			}
+			throw error;
+		}));
+		return lazy;
+	}
+
 	private async initialize(): Promise<IStorageService> {
 		let storageService;
-		if (!this._useInMemoryStorage && await this._encryptionService.isEncryptionAvailable()) {
-			this._logService.trace(`[SecretStorageService] Encryption is available, using persisted storage`);
-			this._type = 'persisted';
-			storageService = this._storageService;
-		} else {
+		if (this._useInMemoryStorage) {
 			// If we already have an in-memory storage service, we don't need to recreate it
 			if (this._type === 'in-memory') {
 				return this._storageService;
 			}
-			this._logService.trace('[SecretStorageService] Encryption is not available, falling back to in-memory storage');
+			this._logService.trace('[SecretStorageService] Using in-memory storage');
 			this._type = 'in-memory';
 			storageService = this._register(new InMemoryStorageService());
+		} else if (await this._encryptionService.isEncryptionAvailable()) {
+			this._logService.trace(`[SecretStorageService] Encryption is available, using persisted storage`);
+			this._type = 'persisted';
+			storageService = this._storageService;
+		} else {
+			// No fallback to an in-memory store: that would hide the persisted secrets and lose every secret written.
+			this._type = 'unknown';
+			const error = new SecretStorageUnavailableError();
+			this._logService.error(`[SecretStorageService] ${error.message}`);
+			throw error;
 		}
 
 		this._onDidChangeValueDisposable.clear();
@@ -180,7 +212,7 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 	}
 
 	protected reinitialize(): void {
-		this._lazyStorageService = new Lazy(() => this.initialize());
+		this._lazyStorageService = this.createLazyStorageService();
 	}
 
 	private onDidChangeValue(key: string): void {

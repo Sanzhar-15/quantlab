@@ -38,18 +38,23 @@ export class NativeSecretStorageService extends BaseSecretStorageService {
 		);
 	}
 
-	override set(key: string, value: string): Promise<void> {
-		this._sequencer.queue(key, async () => {
-			await this.resolvedStorageService;
+	override async set(key: string, value: string): Promise<void> {
+		// Queued before the write on the same key, so a choice made in the notification (such as "Use weaker
+		// encryption", which reinitializes) applies to this write. When encryption stays unavailable the write
+		// rejects with SecretStorageUnavailableError; a failed notification rejects the set as well.
+		const notified = this._sequencer.queue(key, () => this.notifyIfEncryptionUnavailable());
+		const stored = super.set(key, value);
+		await Promise.all([notified, stored]);
+	}
 
-			if (this.type !== 'persisted' && !this._environmentService.useInMemorySecretStorage) {
-				this._logService.trace('[NativeSecretStorageService] Notifying user that secrets are not being stored on disk.');
-				await this.notifyOfNoEncryptionOnce();
-			}
-
-		});
-
-		return super.set(key, value);
+	private async notifyIfEncryptionUnavailable(): Promise<void> {
+		if (this._environmentService.useInMemorySecretStorage || this.type === 'persisted') {
+			return;
+		}
+		if (!await this._encryptionService.isEncryptionAvailable()) {
+			this._logService.trace('[NativeSecretStorageService] Notifying user that secrets cannot be stored: encryption is not available.');
+			await this.notifyOfNoEncryptionOnce();
+		}
 	}
 
 	private notifyOfNoEncryptionOnce = createSingleCallFunction(() => this.notifyOfNoEncryption());

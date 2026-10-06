@@ -8,8 +8,8 @@ import * as sinon from 'sinon';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { IEncryptionService, KnownStorageProvider } from '../../../encryption/common/encryptionService.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { BaseSecretStorageService, SecretDecryptionError } from '../../common/secrets.js';
-import { InMemoryStorageService, StorageScope } from '../../../storage/common/storage.js';
+import { BaseSecretStorageService, SecretDecryptionError, SecretStorageUnavailableError } from '../../common/secrets.js';
+import { InMemoryStorageService, StorageScope, StorageTarget } from '../../../storage/common/storage.js';
 
 class TestEncryptionService implements IEncryptionService {
 	_serviceBrand: undefined;
@@ -198,43 +198,75 @@ suite('secrets', () => {
 	});
 
 	suite('BaseSecretStorageService useInMemoryStorage=false, encryption not available', () => {
-		let service: BaseSecretStorageService;
-		let spyNoEncryptionService: sinon.SinonSpiedInstance<TestEncryptionService>;
-		let sandbox: sinon.SinonSandbox;
+		// F-SECRETS-3: no fallback to an in-memory store. Every call rejects, named; the persisted secrets are kept; the failure
+		// is not remembered, so the persisted secret is read once encryption is available.
+		class RecordingLogService extends NullLogService {
+			readonly errors: string[] = [];
+			override error(message: string | Error, ...args: unknown[]): void {
+				this.errors.push([String(message), ...args.map(arg => String(arg))].join(' '));
+			}
+		}
 
-		setup(() => {
-			sandbox = sinon.createSandbox();
-			spyNoEncryptionService = sandbox.spy(new TestNoEncryptionService());
-			service = store.add(new BaseSecretStorageService(
-				false,
-				store.add(new InMemoryStorageService()),
-				spyNoEncryptionService,
-				store.add(new NullLogService()))
-			);
+		function snapshot(storageService: InMemoryStorageService): [string, string | undefined][] {
+			return storageService.keys(StorageScope.APPLICATION, StorageTarget.MACHINE).sort().map(key => [key, storageService.get(key, StorageScope.APPLICATION)]);
+		}
+
+		function isUnavailable(e: unknown): boolean {
+			assert.ok(e instanceof SecretStorageUnavailableError, `expected SecretStorageUnavailableError, got ${e}`);
+			assert.strictEqual(e.name, 'SecretStorageUnavailableError');
+			assert.ok(!e.message.includes('my-secret-value') && !e.message.includes('encrypted+'), 'the error carries no secret');
+			return true;
+		}
+
+		test('every call rejects named, the persisted secret stays byte-identical, and it is read once encryption is available', async () => {
+			const encryptionService = new TestEncryptionService();
+			const storageService = store.add(new InMemoryStorageService());
+			storageService.store('secret://my-secret', 'encrypted+my-secret-value', StorageScope.APPLICATION, StorageTarget.MACHINE);
+			const before = snapshot(storageService);
+			const logService = store.add(new RecordingLogService());
+			const available = sinon.stub(encryptionService, 'isEncryptionAvailable').resolves(false);
+			const encrypt = sinon.spy(encryptionService, 'encrypt');
+			const decrypt = sinon.spy(encryptionService, 'decrypt');
+			const service = store.add(new BaseSecretStorageService(false, storageService, encryptionService, logService));
+
+			await assert.rejects(service.get('my-secret'), isUnavailable);
+			await assert.rejects(service.set('my-secret', 'replacement-value'), isUnavailable);
+			await assert.rejects(service.set('other-secret', 'other-value'), isUnavailable);
+			await assert.rejects(service.delete('my-secret'), isUnavailable);
+			await assert.rejects(service.keys(), isUnavailable);
+
+			assert.deepStrictEqual(snapshot(storageService), before, 'the persisted storage is byte-identical');
+			assert.notStrictEqual(service.type, 'in-memory');
+			assert.strictEqual(encrypt.callCount, 0);
+			assert.strictEqual(decrypt.callCount, 0);
+			assert.strictEqual(available.callCount, 5, 'a failed initialization is not remembered: every call checks again');
+			assert.strictEqual(logService.errors.length, 5, 'one error line per failed call');
+			for (const line of logService.errors) {
+				assert.ok(line.includes('Secret storage is unavailable') && !line.includes('my-secret-value'), line);
+			}
+
+			available.resolves(true);
+			assert.strictEqual(await service.get('my-secret'), 'my-secret-value');
+			assert.strictEqual(service.type, 'persisted');
+			assert.strictEqual(await service.get('other-secret'), undefined, 'nothing written while unavailable is held anywhere');
+			assert.deepStrictEqual(snapshot(storageService), before);
+			encrypt.restore();
+			decrypt.restore();
+			available.restore();
 		});
 
-		teardown(() => {
-			sandbox.restore();
-		});
+		test('in-memory mode is unchanged: it never consults encryption and keeps secrets in memory only', async () => {
+			const encryptionService = new TestNoEncryptionService();
+			const available = sinon.spy(encryptionService, 'isEncryptionAvailable');
+			const storageService = store.add(new InMemoryStorageService());
+			const service = store.add(new BaseSecretStorageService(true, storageService, encryptionService, store.add(new NullLogService())));
 
-		test('type', async () => {
-			assert.strictEqual(service.type, 'unknown');
-			// trigger lazy initialization
 			await service.set('my-secret', 'my-secret-value');
-
+			assert.strictEqual(await service.get('my-secret'), 'my-secret-value');
 			assert.strictEqual(service.type, 'in-memory');
-		});
-
-		test('set and get', async () => {
-			const key = 'my-secret';
-			const value = 'my-secret-value';
-			await service.set(key, value);
-			const result = await service.get(key);
-			assert.strictEqual(result, value);
-
-			// Additionally ensure the encryptionservice was not used
-			assert.strictEqual(spyNoEncryptionService.encrypt.callCount, 0);
-			assert.strictEqual(spyNoEncryptionService.decrypt.callCount, 0);
+			assert.strictEqual(available.callCount, 0);
+			assert.deepStrictEqual(snapshot(storageService), [], 'the persisted storage is not written');
+			available.restore();
 		});
 	});
 });

@@ -246,6 +246,31 @@ type HttpModeT =
 const MAX_FOLLOW_REDIRECTS = 5;
 const REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308];
 
+/** The explicit reset of a stored dynamic client registration and its sessions (RemoveDynamicAuthenticationProvidersAction). */
+const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND = `'Authentication: Remove Dynamic Authentication Providers' (workbench.action.removeDynamicAuthenticationProviders)`;
+
+/**
+ * The server rejected a request that carried the stored authorization (HTTP 401/403). Nothing is removed or registered
+ * anew automatically: the stored client registration and sessions are kept, and the operation stops.
+ */
+export class McpAuthorizationRejectedError extends Error {
+	override readonly name = 'McpAuthorizationRejectedError';
+	constructor(readonly status: number) {
+		super(`The server rejected the stored authorization (HTTP ${status}). The stored sign-in is kept; sign out and sign in again, or remove it with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}.`);
+	}
+}
+
+/**
+ * No token could be obtained for a server that asks for one. The request is not sent without authorization: the
+ * operation stops. The message carries no token and no stored value.
+ */
+export class McpAuthenticationFailedError extends Error {
+	override readonly name = 'McpAuthenticationFailedError';
+	constructor(source: 'server metadata' | 'provided authentication config') {
+		super(`Could not get a token from the ${source}; the request was not sent without authorization.`);
+	}
+}
+
 /**
  * Implementation of both MCP HTTP Streaming as well as legacy SSE.
  *
@@ -406,7 +431,12 @@ export class McpHTTPHandle extends Disposable {
 		const endpoint = await this._attachSSE();
 		if (endpoint) {
 			this._mode = { value: HttpMode.SSE, endpoint };
-			await this._sendLegacySSE(endpoint, message);
+			// Not awaited by its callers: a failure (such as an authentication failure) is shown on the server here.
+			try {
+				await this._sendLegacySSE(endpoint, message);
+			} catch (err) {
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._launch.uri}: ${String(err)}` });
+			}
 		}
 	}
 
@@ -485,6 +515,11 @@ export class McpHTTPHandle extends Disposable {
 					headers
 				);
 			} catch (e) {
+				if (e instanceof McpAuthorizationRejectedError || e instanceof McpAuthenticationFailedError) {
+					// Retrying cannot succeed without an act of the user; stop, as for any other 4xx status below.
+					this._log(LogLevel.Warning, `Async notifications from ${this._launch.uri} are disabled: ${e.message}`);
+					return;
+				}
 				this._log(LogLevel.Info, `Error connecting to ${this._launch.uri} for async notifications, will retry`);
 				continue;
 			}
@@ -530,10 +565,10 @@ export class McpHTTPHandle extends Disposable {
 			...Object.fromEntries(this._launch.headers),
 			'Accept': 'text/event-stream',
 		};
-		await this._addAuthHeader(headers);
 
 		let res: CommonResponse;
 		try {
+			await this._addAuthHeader(headers);
 			res = await this._fetchWithAuthRetry(
 				this._launch.uri.toString(true),
 				{
@@ -616,7 +651,11 @@ export class McpHTTPHandle extends Disposable {
 		} while (!chunk.done);
 	}
 
-	private async _addAuthHeader(headers: Record<string, string>, forceNewRegistration?: boolean) {
+	/**
+	 * A failure to get a token stops the operation (McpAuthenticationFailedError): the request is never sent without the
+	 * authorization the server asked for.
+	 */
+	private async _addAuthHeader(headers: Record<string, string>) {
 		if (this._authMetadata) {
 			try {
 				const authDetails: IMcpAuthenticationDetails = {
@@ -630,7 +669,6 @@ export class McpHTTPHandle extends Disposable {
 					authDetails,
 					{
 						errorOnUserInteraction: this._errorOnUserInteraction,
-						forceNewRegistration
 					});
 				if (token) {
 					headers['Authorization'] = `Bearer ${token}`;
@@ -641,6 +679,7 @@ export class McpHTTPHandle extends Disposable {
 					throw new CancellationError();
 				}
 				this._log(LogLevel.Warning, `Error getting token from server metadata: ${String(e)}`);
+				throw new McpAuthenticationFailedError('server metadata');
 			}
 		}
 		if (this._launch.authentication) {
@@ -652,7 +691,6 @@ export class McpHTTPHandle extends Disposable {
 					this._launch.authentication.scopes,
 					{
 						errorOnUserInteraction: this._errorOnUserInteraction,
-						forceNewRegistration
 					}
 				);
 				if (token) {
@@ -665,6 +703,7 @@ export class McpHTTPHandle extends Disposable {
 					throw new CancellationError();
 				}
 				this._log(LogLevel.Warning, `Error getting token from provided authentication config: ${String(e)}`);
+				throw new McpAuthenticationFailedError('provided authentication config');
 			}
 		}
 		return headers;
@@ -719,12 +758,12 @@ export class McpHTTPHandle extends Disposable {
 				}
 			}
 		}
-		// If we have an Authorization header and still get an auth error, we should retry with a new auth registration
+		// The server rejected the stored authorization. No new registration is forced: that would remove the stored client
+		// registration and sessions without an act of the user. The operation stops and names the explicit reset.
 		if (headers['Authorization'] && isAuthStatusCode(res.status)) {
 			const errorText = await this._getErrText(res);
-			this._log(LogLevel.Debug, `Received ${res.status} status with Authorization header, retrying with new auth registration. Error details: ${errorText || 'no additional details'}`);
-			await this._addAuthHeader(headers, true);
-			res = await doFetch();
+			this._log(LogLevel.Warning, `Received ${res.status} status with Authorization header; the stored authorization is kept and the request stops. Error details: ${errorText || 'no additional details'}`);
+			throw new McpAuthorizationRejectedError(res.status);
 		}
 		return res;
 	}

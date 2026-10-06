@@ -8,6 +8,8 @@ import * as sinon from 'sinon';
 import { LogLevel } from '../../../../platform/log/common/log.js';
 import { createAuthMetadata, CommonResponse, IAuthMetadata } from '../../common/extHostMcp.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+import { SecretDecryptionError } from '../../../../platform/secrets/common/secrets.js';
+import { createMcpHttpHarness, errorStateMessages } from './mcpHttpHandleHarness.js';
 
 // Test constants to avoid magic strings
 const TEST_MCP_URL = 'https://example.com/mcp';
@@ -734,3 +736,58 @@ suite('ExtHostMcp', () => {
 	});
 });
 
+
+// F-SECRETS-3: no automatic path removes, replaces or registers anew a stored credential; each fails visibly and stops.
+suite('McpHTTPHandle authentication failures', () => {
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('a 401 to a request carrying the stored authorization stops: no new registration is forced, and the server state names the failure', async () => {
+		const harness = createMcpHttpHarness([401, 401], async () => 'stored-token');
+		store.add(harness.handle);
+
+		await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+
+		assert.deepStrictEqual(harness.tokenRequests.map(o => o?.forceNewRegistration), [undefined], 'one token request, never forcing a new registration');
+		assert.deepStrictEqual(harness.posts, [undefined, 'Bearer stored-token'], 'no retry after the rejection');
+		const errors = errorStateMessages(harness.states);
+		assert.strictEqual(errors.length, 1);
+		assert.ok(errors[0].includes('McpAuthorizationRejectedError') && errors[0].includes('HTTP 401'), errors[0]);
+		assert.ok(errors[0].includes('Remove Dynamic Authentication Providers'), 'the message names the explicit reset');
+		assert.ok(!errors[0].includes('stored-token'), 'the message carries no token');
+	});
+
+	test('a 403 to a request carrying the stored authorization stops the same way', async () => {
+		const harness = createMcpHttpHarness([401, 403], async () => 'stored-token');
+		store.add(harness.handle);
+
+		await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+
+		assert.deepStrictEqual(harness.tokenRequests.map(o => o?.forceNewRegistration), [undefined]);
+		assert.deepStrictEqual(harness.posts, [undefined, 'Bearer stored-token']);
+		const errors = errorStateMessages(harness.states);
+		assert.ok(errors.length === 1 && errors[0].includes('McpAuthorizationRejectedError') && errors[0].includes('HTTP 403'), errors.join('\n'));
+	});
+
+	test('a failed stored read while getting the token stops the operation: no request is sent without authorization', async () => {
+		let tokenReads = 0;
+		const harness = createMcpHttpHarness([401, 500], async () => {
+			if (++tokenReads === 1) {
+				return 'stored-token';
+			}
+			throw new SecretDecryptionError('dynamic-auth-sessions');
+		});
+		store.add(harness.handle);
+
+		// The first message learns that the server asks for authorization; the server then fails it (500).
+		await harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+		assert.deepStrictEqual(harness.posts, [undefined, 'Bearer stored-token']);
+
+		// The next message cannot read the stored session: it must not go out unauthenticated.
+		await harness.handle.send('{"jsonrpc":"2.0","id":2,"method":"ping"}');
+
+		assert.deepStrictEqual(harness.posts, [undefined, 'Bearer stored-token'], 'no request after the failed read');
+		const errors = errorStateMessages(harness.states);
+		assert.strictEqual(errors.length, 2);
+		assert.ok(errors[1].includes('McpAuthenticationFailedError'), errors[1]);
+	});
+});

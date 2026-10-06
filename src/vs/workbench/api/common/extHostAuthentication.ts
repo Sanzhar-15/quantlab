@@ -361,6 +361,31 @@ class TaskSingler<T> {
 	}
 }
 
+/** The explicit reset of a stored dynamic client registration and its sessions (RemoveDynamicAuthenticationProvidersAction). */
+const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND = `'Authentication: Remove Dynamic Authentication Providers' (workbench.action.removeDynamicAuthenticationProviders)`;
+
+/**
+ * Refreshing stored sessions failed. They stay stored: a failure may be transient, and a refresh token is a credential.
+ * Only an explicit act of the user (signing out, or removing the provider) removes them. The message carries no token.
+ */
+export class DynamicAuthSessionRefreshError extends Error {
+	override readonly name = 'DynamicAuthSessionRefreshError';
+	constructor(readonly providerId: string, label: string, count: number) {
+		super(`Refreshing ${count} stored session(s) of '${label}' failed; they are kept. Try again, sign out and sign in again, or remove them with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}.`);
+	}
+}
+
+/**
+ * The authorization server rejected the stored client registration (invalid_client). It is kept, with its sessions: a new
+ * registration is made only after an explicit act of the user has removed the stored one. The message carries no secret.
+ */
+export class DynamicAuthClientRejectedError extends Error {
+	override readonly name = 'DynamicAuthClientRejectedError';
+	constructor(readonly providerId: string, label: string) {
+		super(`The authorization server rejected the stored client registration of '${label}'; it is kept. Remove it with the command ${REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND}, then sign in again.`);
+	}
+}
+
 export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	readonly id: string;
 	readonly label: string;
@@ -453,6 +478,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		if (sessions.length) {
 			const newTokens: IAuthorizationToken[] = [];
 			const removedTokens: IAuthorizationToken[] = [];
+			const refreshedTokens = new Set<IAuthorizationToken>();
 			const tokenMap = new Map<string, IAuthorizationToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
 			for (const session of sessions) {
 				const token = tokenMap.get(session.accessToken);
@@ -478,6 +504,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 							}
 							this._logger.info(`Successfully created a new token for scopes ${session.scopes.join(' ')}.`);
 							newTokens.push(newToken);
+							refreshedTokens.add(token);
 						} catch (err) {
 							this._logger.error(`Failed to refresh token: ${err}`);
 						}
@@ -485,11 +512,18 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					}
 				}
 			}
-			if (newTokens.length || removedTokens.length) {
-				this._tokenStore.update({ added: newTokens, removed: removedTokens });
+			// A token whose refresh failed stays stored (a failure may be transient; its refresh token is a credential) and
+			// this operation rejects. Only an explicit act of the user removes it: signing out, or removing the provider.
+			const failedRefreshTokens = removedTokens.filter(t => t.refresh_token && !refreshedTokens.has(t));
+			const settledTokens = removedTokens.filter(t => !failedRefreshTokens.includes(t));
+			if (newTokens.length || settledTokens.length) {
+				this._tokenStore.update({ added: newTokens, removed: settledTokens });
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
+			}
+			if (failedRefreshTokens.length) {
+				throw new DynamicAuthSessionRefreshError(this.id, this.label, failedRefreshTokens.length);
 			}
 			this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
 			return sessions;
@@ -515,6 +549,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					break;
 				}
 			} catch (err) {
+				if (err instanceof DynamicAuthClientRejectedError) {
+					// Every flow uses the same client registration: stop, naming the explicit reset.
+					throw err;
+				}
 				const nextMode = this._createFlows[i + 1]?.label;
 				if (!nextMode) {
 					break; // No more flows to try
@@ -724,9 +762,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.info(`Successfully exchanged authorization code for token.`);
 			return result;
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
-			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
-			await this._generateNewClientId();
-			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
+			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+			throw new DynamicAuthClientRejectedError(this.id, this.label);
 		}
 		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
 	}
@@ -767,9 +804,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				created_at: Date.now(),
 			};
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
-			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
-			await this._generateNewClientId();
-			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
+			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+			throw new DynamicAuthClientRejectedError(this.id, this.label);
 		}
 		throw new Error(`Invalid authorization token response: ${JSON.stringify(result)}`);
 	}
