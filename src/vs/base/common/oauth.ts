@@ -803,6 +803,29 @@ export function isAuthorizationTokenResponse(obj: unknown): obj is IAuthorizatio
 	return response.access_token !== undefined && response.token_type !== undefined;
 }
 
+/**
+ * A token response whose fields have the types that are logged and stored: the strings are strings and a lifetime is a
+ * finite number. A value of another type (a credential in `scope`, text in `expires_in`) is not an accepted response.
+ */
+export function isValidAuthorizationTokenResponse(obj: unknown): obj is IAuthorizationTokenResponse {
+	if (!isAuthorizationTokenResponse(obj)) {
+		return false;
+	}
+	const response = obj as unknown as Record<string, unknown>;
+	if (typeof response.access_token !== 'string' || typeof response.token_type !== 'string') {
+		return false;
+	}
+	if (response.expires_in !== undefined && (typeof response.expires_in !== 'number' || !Number.isFinite(response.expires_in))) {
+		return false;
+	}
+	for (const optional of ['scope', 'refresh_token', 'id_token']) {
+		if (response[optional] !== undefined && typeof response[optional] !== 'string') {
+			return false;
+		}
+	}
+	return true;
+}
+
 export function isAuthorizationDeviceResponse(obj: unknown): obj is IAuthorizationDeviceResponse {
 	if (typeof obj !== 'object' || obj === null) {
 		return false;
@@ -825,6 +848,196 @@ export function isAuthorizationRegistrationErrorResponse(obj: unknown): obj is I
 	}
 	const response = obj as IAuthorizationRegistrationErrorResponse;
 	return response.error !== undefined;
+}
+
+//#endregion
+
+//#region safe error reporting
+// A token, registration, device-code or metadata response holds credentials (client secret, access, refresh and id tokens,
+// device code), and so can a status line, a URL or a transport error. None of it may reach a log argument or an Error
+// message or cause. The helpers below describe a failure ONLY by the numeric HTTP status, by an OAuth `error` code that is
+// on the allowlist below, and by fixed outcome names; operation labels are static strings chosen by the caller. A parse,
+// read or transport failure is reported with a NEW error and no cause, because parser messages quote the text they failed
+// on and transport messages quote the URL.
+
+/**
+ * The OAuth error codes that may be reported: RFC 6749 (sections 4.1.2.1 and 5.2), RFC 8628 (3.5), RFC 7591 (3.2.2) and
+ * RFC 6750 (3.1). Any other value, even a short token-like one, may be a credential and is never reported.
+ */
+const ALLOWED_OAUTH_ERROR_CODES: ReadonlySet<string> = new Set<string>([
+	AuthorizationErrorType.InvalidRequest,
+	AuthorizationErrorType.InvalidClient,
+	AuthorizationErrorType.InvalidGrant,
+	AuthorizationErrorType.UnauthorizedClient,
+	AuthorizationErrorType.UnsupportedGrantType,
+	AuthorizationErrorType.InvalidScope,
+	AuthorizationDeviceCodeErrorType.AuthorizationPending,
+	AuthorizationDeviceCodeErrorType.SlowDown,
+	AuthorizationDeviceCodeErrorType.AccessDenied,
+	AuthorizationDeviceCodeErrorType.ExpiredToken,
+	AuthorizationRegistrationErrorType.InvalidRedirectUri,
+	AuthorizationRegistrationErrorType.InvalidClientMetadata,
+	AuthorizationRegistrationErrorType.InvalidSoftwareStatement,
+	AuthorizationRegistrationErrorType.UnapprovedSoftwareStatement,
+	'unsupported_response_type',
+	'server_error',
+	'temporarily_unavailable',
+	'invalid_token',
+	'insufficient_scope'
+]);
+
+/**
+ * An error whose message is built ONLY from fixed text, a numeric HTTP status and an allowlisted OAuth error code. The type
+ * is the evidence that the message may be logged and shown: a comment is not. Every other error that reaches a log or a
+ * message in a dynamic OAuth flow is described through `describeOAuthFailure`, which keeps the message of this type only.
+ */
+export class OAuthSafeError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'OAuthSafeError';
+	}
+}
+
+/**
+ * The text to use for a caught error in a log line or in a new message: the message of an OAuthSafeError, otherwise the
+ * fixed `fallback` (a static description of what failed). The text of any other error is never used, because it can quote
+ * a credential or a URL; no cause is kept either.
+ */
+export function describeOAuthFailure(error: unknown, fallback: string): string {
+	return error instanceof OAuthSafeError || error instanceof OAuthSafeAggregateError ? error.message : fallback;
+}
+
+/**
+ * The aggregate of the failed attempts of one discovery: a fixed message, and the errors of the attempts, which are all of
+ * the safe type.
+ */
+export class OAuthSafeAggregateError extends AggregateError {
+	constructor(errors: OAuthSafeError[], message: string) {
+		super(errors, message);
+		this.name = 'OAuthSafeAggregateError';
+	}
+}
+
+/**
+ * The subset of a fetch Response the safe error helpers read.
+ */
+export interface IOAuthTextResponse {
+	readonly status: number;
+	text(): Promise<string>;
+}
+
+/**
+ * Returns the OAuth `error` code of a parsed response body only when it is on the allowlist, otherwise undefined.
+ */
+export function getSafeOAuthErrorCode(body: unknown): string | undefined {
+	if (typeof body !== 'object' || body === null) {
+		return undefined;
+	}
+	const errorCode = (body as { error?: unknown }).error;
+	return typeof errorCode === 'string' && ALLOWED_OAUTH_ERROR_CODES.has(errorCode) ? errorCode : undefined;
+}
+
+/**
+ * Describes a parsed body for a message: an allowlisted error code, or a fixed outcome that never repeats the value.
+ */
+function describeOAuthBody(body: unknown): string {
+	const errorCode = getSafeOAuthErrorCode(body);
+	if (errorCode) {
+		return errorCode;
+	}
+	const hasError = typeof body === 'object' && body !== null && (body as { error?: unknown }).error !== undefined;
+	return hasError ? 'unrecognised error code' : 'no error code in body';
+}
+
+/**
+ * The numeric HTTP status. The reason phrase is server supplied text and is never used.
+ */
+function describeOAuthHttpStatus(response: Pick<IOAuthTextResponse, 'status'>): string {
+	return typeof response.status === 'number' && Number.isInteger(response.status) ? String(response.status) : 'unknown status';
+}
+
+/**
+ * What reading the body of a failed response gave. Each outcome is named in the failure message, so a missing error code is
+ * never silent.
+ */
+export type OAuthBodyOutcome =
+	| { readonly kind: 'json'; readonly body: unknown }
+	| { readonly kind: 'not-json' }
+	| { readonly kind: 'unreadable' };
+
+/**
+ * Builds the message of an HTTP failure from a static operation label, the numeric status and the outcome of reading the
+ * body: an allowlisted OAuth error code, or the name of what went wrong. No body text and no URL is included.
+ */
+export function formatOAuthHttpFailure(operation: string, response: Pick<IOAuthTextResponse, 'status'>, outcome: OAuthBodyOutcome): string {
+	let detail: string;
+	switch (outcome.kind) {
+		case 'json': detail = describeOAuthBody(outcome.body); break;
+		case 'not-json': detail = 'body not JSON'; break;
+		case 'unreadable': detail = 'body unreadable'; break;
+	}
+	return `${operation} failed: ${describeOAuthHttpStatus(response)} (${detail})`;
+}
+
+/**
+ * Creates the error for a request that did not complete (a rejected fetch). Whatever the transport said is dropped: its
+ * message can quote the URL, which can hold credentials. No cause is kept.
+ */
+export function createOAuthTransportError(operation: string): OAuthSafeError {
+	return new OAuthSafeError(`${operation} failed: the request could not be completed`);
+}
+
+/**
+ * Reads a response body as text and parses it as JSON. When the body cannot be read or parsed this throws a new error that
+ * names the operation, the numeric status and which of the two went wrong: it carries no cause and no parser message.
+ */
+export async function readOAuthJsonResponse(response: IOAuthTextResponse, operation: string): Promise<unknown> {
+	let text: string;
+	try {
+		text = await response.text();
+	} catch {
+		throw new OAuthSafeError(`${operation} failed: the response body could not be read (${describeOAuthHttpStatus(response)})`);
+	}
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw new OAuthSafeError(`${operation} failed: the response body is not valid JSON (${describeOAuthHttpStatus(response)})`);
+	}
+}
+
+/**
+ * Reads the body of a response that is already known to be a failure. The result names the outcome instead of hiding it:
+ * parsed JSON, text that is not JSON, or a body that could not be read. No part of the body or of a parser message is kept
+ * outside of a parsed `json` outcome.
+ */
+export async function readOAuthErrorBody(response: IOAuthTextResponse): Promise<OAuthBodyOutcome> {
+	let text: string;
+	try {
+		text = await response.text();
+	} catch {
+		return { kind: 'unreadable' };
+	}
+	try {
+		return { kind: 'json', body: JSON.parse(text) };
+	} catch {
+		return { kind: 'not-json' };
+	}
+}
+
+/**
+ * Creates the error for a non-ok response: numeric status plus the allowlisted OAuth error code, or the named outcome of
+ * reading the body.
+ */
+export async function createOAuthHttpError(operation: string, response: IOAuthTextResponse): Promise<OAuthSafeError> {
+	return new OAuthSafeError(formatOAuthHttpFailure(operation, response, await readOAuthErrorBody(response)));
+}
+
+/**
+ * Creates the error for a response that parsed but does not have the expected shape: static description, numeric status and
+ * an allowlisted error code or fixed outcome.
+ */
+export function createOAuthInvalidResponseError(description: string, response: Pick<IOAuthTextResponse, 'status'>, body: unknown): OAuthSafeError {
+	return new OAuthSafeError(`Invalid ${description} response: ${describeOAuthHttpStatus(response)} (${describeOAuthBody(body)})`);
 }
 
 //#endregion
@@ -856,7 +1069,7 @@ const grantTypesSupported = ['authorization_code', 'refresh_token', 'urn:ietf:pa
 export const DEFAULT_AUTH_FLOW_PORT = 33418;
 export async function fetchDynamicRegistration(serverMetadata: IAuthorizationServerMetadata, clientName: string, scopes?: string[]): Promise<IAuthorizationDynamicClientRegistrationResponse> {
 	if (!serverMetadata.registration_endpoint) {
-		throw new Error('Server does not support dynamic registration');
+		throw new OAuthSafeError('Server does not support dynamic registration');
 	}
 
 	const requestBody: IAuthorizationDynamicClientRegistrationRequest = {
@@ -881,35 +1094,29 @@ export async function fetchDynamicRegistration(serverMetadata: IAuthorizationSer
 		application_type: 'native'
 	};
 
-	const response = await fetch(serverMetadata.registration_endpoint, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify(requestBody)
-	});
-
-	if (!response.ok) {
-		const result = await response.text();
-		let errorDetails: string = result;
-
-		try {
-			const errorResponse = JSON.parse(result);
-			if (isAuthorizationRegistrationErrorResponse(errorResponse)) {
-				errorDetails = `${errorResponse.error}${errorResponse.error_description ? `: ${errorResponse.error_description}` : ''}`;
-			}
-		} catch {
-			// JSON parsing failed, use raw text
-		}
-
-		throw new Error(`Registration to ${serverMetadata.registration_endpoint} failed: ${errorDetails}`);
+	let response: Response;
+	try {
+		response = await fetch(serverMetadata.registration_endpoint, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify(requestBody)
+		});
+	} catch {
+		// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
+		throw createOAuthTransportError('Dynamic client registration');
 	}
 
-	const registration = await response.json();
+	if (!response.ok) {
+		throw await createOAuthHttpError('Dynamic client registration', response);
+	}
+
+	const registration = await readOAuthJsonResponse(response, 'Dynamic client registration');
 	if (isAuthorizationDynamicClientRegistrationResponse(registration)) {
 		return registration;
 	}
-	throw new Error(`Invalid authorization dynamic client registration response: ${JSON.stringify(registration)}`);
+	throw createOAuthInvalidResponseError('dynamic client registration', response, registration);
 }
 
 export interface IAuthenticationChallenge {
@@ -1023,24 +1230,28 @@ export function getClaimsFromJWT(token: string): IAuthorizationJWTClaims {
 
 	const [header, payload, _signature] = parts;
 
+	// Parser messages quote the text they fail on (a token fragment), so every failure here is a fixed message with no cause
+	let decodedHeader: unknown;
 	try {
-		const decodedHeader = JSON.parse(decodeBase64(header).toString());
-		if (typeof decodedHeader !== 'object') {
-			throw new Error('Invalid JWT token format: header is not a JSON object');
-		}
-
-		const decodedPayload = JSON.parse(decodeBase64(payload).toString());
-		if (typeof decodedPayload !== 'object') {
-			throw new Error('Invalid JWT token format: payload is not a JSON object');
-		}
-
-		return decodedPayload;
-	} catch (e) {
-		if (e instanceof Error) {
-			throw new Error(`Failed to parse JWT token: ${e.message}`);
-		}
-		throw new Error('Failed to parse JWT token');
+		decodedHeader = JSON.parse(decodeBase64(header).toString());
+	} catch {
+		throw new Error('Failed to parse JWT token: the header is not valid base64 JSON');
 	}
+	if (typeof decodedHeader !== 'object') {
+		throw new Error('Failed to parse JWT token: Invalid JWT token format: header is not a JSON object');
+	}
+
+	let decodedPayload: unknown;
+	try {
+		decodedPayload = JSON.parse(decodeBase64(payload).toString());
+	} catch {
+		throw new Error('Failed to parse JWT token: the payload is not valid base64 JSON');
+	}
+	if (typeof decodedPayload !== 'object') {
+		throw new Error('Failed to parse JWT token: Invalid JWT token format: payload is not a JSON object');
+	}
+
+	return decodedPayload as IAuthorizationJWTClaims;
 }
 
 /**
@@ -1112,7 +1323,7 @@ export async function fetchResourceMetadata(
 	targetResource: string,
 	resourceMetadataUrl: string | undefined,
 	options: IFetchResourceMetadataOptions = {}
-): Promise<{ metadata: IAuthorizationProtectedResourceMetadata; errors: Error[] }> {
+): Promise<{ metadata: IAuthorizationProtectedResourceMetadata; errors: OAuthSafeError[] }> {
 	const {
 		sameOriginHeaders = {},
 		fetch: fetchImpl = fetch
@@ -1120,13 +1331,19 @@ export async function fetchResourceMetadata(
 
 	const targetResourceUrlObj = new URL(targetResource);
 
-	const fetchPrm = async (prmUrl: string, validateUrl: string) => {
+	const fetchPrm = async (prmUrl: string, validateUrl: string, attempt: string) => {
 		// Determine if we should include same-origin headers
 		let headers: Record<string, string> = {
 			'Accept': 'application/json'
 		};
 
-		const resourceMetadataUrlObj = new URL(prmUrl);
+		let resourceMetadataUrlObj: URL;
+		try {
+			resourceMetadataUrlObj = new URL(prmUrl);
+		} catch {
+			// The URL error carries the rejected input: report a new error without it
+			throw new OAuthSafeError(`Failed to fetch resource metadata from ${attempt}: the URL is not a valid URL`);
+		}
 		if (resourceMetadataUrlObj.origin === targetResourceUrlObj.origin) {
 			headers = {
 				...headers,
@@ -1134,39 +1351,55 @@ export async function fetchResourceMetadata(
 			};
 		}
 
-		const response = await fetchImpl(prmUrl, { method: 'GET', headers });
+		// Metadata errors reach logs and can follow a request that carried same-origin credentials: they name the attempt by a
+		// fixed label (a URL, even its path, can hold a credential), the numeric status, and never the response body, the
+		// reason phrase or a transport message
+		let response: CommonResponse;
+		try {
+			response = await fetchImpl(prmUrl, { method: 'GET', headers });
+		} catch {
+			// The transport error quotes the URL, which can hold credentials: report a new error without it
+			throw new OAuthSafeError(`Failed to fetch resource metadata from ${attempt}: the request could not be completed`);
+		}
 		if (response.status !== 200) {
-			let errorText: string;
-			try {
-				errorText = await response.text();
-			} catch {
-				errorText = response.statusText;
-			}
-			throw new Error(`Failed to fetch resource metadata from ${prmUrl}: ${response.status} ${errorText}`);
+			throw new OAuthSafeError(`Failed to fetch resource metadata from ${attempt}: ${response.status}`);
 		}
 
-		const body = await response.json();
+		let body: unknown;
+		try {
+			body = await response.json();
+		} catch {
+			// The parser message quotes the body: report a new error without it
+			throw new OAuthSafeError(`Failed to fetch resource metadata from ${attempt}: the response body is not valid JSON`);
+		}
 		if (isAuthorizationProtectedResourceMetadata(body)) {
 			// Validate that the resource matches the target resource
 			// Use URL constructor for normalization - it handles hostname case and trailing slashes
-			const prmValue = new URL(body.resource).toString();
+			let prmValue: string;
+			try {
+				prmValue = new URL(body.resource).toString();
+			} catch {
+				// The URL error carries the rejected input: report a new error without it
+				throw new OAuthSafeError(`Invalid resource metadata from ${attempt}: the 'resource' property is not a valid URL`);
+			}
 			const expectedResource = new URL(validateUrl).toString();
 			if (prmValue !== expectedResource) {
-				throw new Error(`Protected Resource Metadata 'resource' property value "${prmValue}" does not match expected value "${expectedResource}" for URL ${prmUrl}. Per RFC 9728, these MUST match. See https://datatracker.ietf.org/doc/html/rfc9728#PRConfigurationValidation`);
+				// The 'resource' value is server supplied text and is not repeated; the expected value is ours
+				throw new OAuthSafeError(`Protected Resource Metadata 'resource' property value does not match the expected resource for ${attempt}. Per RFC 9728, these MUST match. See https://datatracker.ietf.org/doc/html/rfc9728#PRConfigurationValidation`);
 			}
 			return body;
 		} else {
-			throw new Error(`Invalid resource metadata from ${prmUrl}. Expected to follow shape of https://datatracker.ietf.org/doc/html/rfc9728#name-protected-resource-metadata (Hints: is scopes_supported an array? Is resource a string?). Current payload: ${JSON.stringify(body)}`);
+			throw new OAuthSafeError(`Invalid resource metadata from ${attempt}. Expected to follow shape of https://datatracker.ietf.org/doc/html/rfc9728#name-protected-resource-metadata (Hints: is scopes_supported an array? Is resource a string?).`);
 		}
 	};
 
-	const errors: Error[] = [];
+	const errors: OAuthSafeError[] = [];
 	if (resourceMetadataUrl) {
 		try {
-			const metadata = await fetchPrm(resourceMetadataUrl, targetResource);
+			const metadata = await fetchPrm(resourceMetadataUrl, targetResource, 'the resource metadata URL given by the server');
 			return { metadata, errors };
 		} catch (e) {
-			errors.push(e instanceof Error ? e : new Error(String(e)));
+			errors.push(new OAuthSafeError(describeOAuthFailure(e, 'Failed to fetch resource metadata: the request failed unexpectedly')));
 		}
 	}
 
@@ -1177,26 +1410,26 @@ export async function fetchResourceMetadata(
 	if (hasPathComponent) {
 		const pathAppendedUrl = `${rootUrl}${targetResourceUrlObj.pathname}`;
 		try {
-			const metadata = await fetchPrm(pathAppendedUrl, targetResource);
+			const metadata = await fetchPrm(pathAppendedUrl, targetResource, 'the path-appended well-known URL');
 			return { metadata, errors };
 		} catch (e) {
-			errors.push(e instanceof Error ? e : new Error(String(e)));
+			errors.push(new OAuthSafeError(describeOAuthFailure(e, 'Failed to fetch resource metadata: the request failed unexpectedly')));
 		}
 	}
 
 	// Finally, try root discovery
 	try {
-		const metadata = await fetchPrm(rootUrl, targetResourceUrlObj.origin);
+		const metadata = await fetchPrm(rootUrl, targetResourceUrlObj.origin, 'the root well-known URL');
 		return { metadata, errors };
 	} catch (e) {
-		errors.push(e instanceof Error ? e : new Error(String(e)));
+		errors.push(new OAuthSafeError(describeOAuthFailure(e, 'Failed to fetch resource metadata: the request failed unexpectedly')));
 	}
 
 	// If we've tried all methods and none worked, throw the error(s)
 	if (errors.length === 1) {
 		throw errors[0];
 	} else {
-		throw new AggregateError(errors, 'Failed to fetch resource metadata from all attempted URLs');
+		throw new OAuthSafeAggregateError(errors, 'Failed to fetch resource metadata from all attempted URLs');
 	}
 }
 
@@ -1225,15 +1458,6 @@ async function tryParseAuthServerMetadata(response: CommonResponse): Promise<IAu
 		// Failed to parse as JSON or not valid metadata
 	}
 	return undefined;
-}
-
-/** Helper to get error text from response */
-async function getErrText(res: CommonResponse): Promise<string> {
-	try {
-		return await res.text();
-	} catch {
-		return res.statusText;
-	}
 }
 
 /**
@@ -1270,9 +1494,9 @@ export async function fetchAuthorizationServerMetadata(
 	const authorizationServerUrl = new URL(authorizationServer);
 	const extraPath = authorizationServerUrl.pathname === '/' ? '' : authorizationServerUrl.pathname;
 
-	const errors: Error[] = [];
+	const errors: OAuthSafeError[] = [];
 
-	const doFetch = async (url: string): Promise<IAuthorizationServerMetadata | undefined> => {
+	const doFetch = async (url: string, attempt: string): Promise<IAuthorizationServerMetadata | undefined> => {
 		try {
 			const rawResponse = await fetchImpl(url, {
 				method: 'GET',
@@ -1286,11 +1510,11 @@ export async function fetchAuthorizationServerMetadata(
 				return metadata;
 			}
 			// No metadata found, collect error from response
-			errors.push(new Error(`Failed to fetch authorization server metadata from ${url}: ${rawResponse.status} ${await getErrText(rawResponse)}`));
+			errors.push(new OAuthSafeError(`Failed to fetch authorization server metadata from ${attempt}: ${rawResponse.status}`));
 			return undefined;
-		} catch (e) {
-			// Collect error from fetch failure
-			errors.push(e instanceof Error ? e : new Error(String(e)));
+		} catch {
+			// Collect the fetch failure. The transport error quotes the URL, which can hold credentials: it is replaced
+			errors.push(new OAuthSafeError(`Failed to fetch authorization server metadata from ${attempt}: the request could not be completed`));
 			return undefined;
 		}
 	};
@@ -1299,7 +1523,7 @@ export async function fetchAuthorizationServerMetadata(
 	// the well known path after the origin and before the path.
 	// https://datatracker.ietf.org/doc/html/rfc8414#section-3
 	const pathToFetch = new URL(AUTH_SERVER_METADATA_DISCOVERY_PATH, authorizationServer).toString() + extraPath;
-	let metadata = await doFetch(pathToFetch);
+	let metadata = await doFetch(pathToFetch, 'the OAuth 2.0 discovery URL (path insertion)');
 	if (metadata) {
 		return metadata;
 	}
@@ -1308,7 +1532,7 @@ export async function fetchAuthorizationServerMetadata(
 	// For issuer URLs with path components, this inserts the well-known path
 	// after the origin and before the path.
 	const openidPathInsertionUrl = new URL(OPENID_CONNECT_DISCOVERY_PATH, authorizationServer).toString() + extraPath;
-	metadata = await doFetch(openidPathInsertionUrl);
+	metadata = await doFetch(openidPathInsertionUrl, 'the OpenID Connect discovery URL (path insertion)');
 	if (metadata) {
 		return metadata;
 	}
@@ -1319,7 +1543,7 @@ export async function fetchAuthorizationServerMetadata(
 	const openidPathAdditionUrl = authorizationServer.endsWith('/')
 		? authorizationServer + OPENID_CONNECT_DISCOVERY_PATH.substring(1) // Remove leading slash if authServer ends with slash
 		: authorizationServer + OPENID_CONNECT_DISCOVERY_PATH;
-	metadata = await doFetch(openidPathAdditionUrl);
+	metadata = await doFetch(openidPathAdditionUrl, 'the OpenID Connect discovery URL (path addition)');
 	if (metadata) {
 		return metadata;
 	}
@@ -1328,6 +1552,6 @@ export async function fetchAuthorizationServerMetadata(
 	if (errors.length === 1) {
 		throw errors[0];
 	} else {
-		throw new AggregateError(errors, 'Failed to fetch authorization server metadata from all attempted URLs');
+		throw new OAuthSafeAggregateError(errors, 'Failed to fetch authorization server metadata from all attempted URLs');
 	}
 }
