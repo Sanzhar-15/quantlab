@@ -8,8 +8,8 @@ import * as sinon from 'sinon';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { IEncryptionService, KnownStorageProvider } from '../../../encryption/common/encryptionService.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { BaseSecretStorageService } from '../../common/secrets.js';
-import { InMemoryStorageService } from '../../../storage/common/storage.js';
+import { BaseSecretStorageService, SecretDecryptionError } from '../../common/secrets.js';
+import { InMemoryStorageService, StorageScope } from '../../../storage/common/storage.js';
 
 class TestEncryptionService implements IEncryptionService {
 	_serviceBrand: undefined;
@@ -174,6 +174,26 @@ suite('secrets', () => {
 			}));
 			await service.set(key, value);
 			assert.strictEqual(eventFired, true);
+		});
+	});
+
+	suite('BaseSecretStorageService useInMemoryStorage=false, decrypt fails', () => {
+		// F-SECRETS-1: a denied or unavailable keychain must not cost the user a stored secret.
+		test('a failed decrypt keeps the stored secret and rejects, naming the key; a later read succeeds', async () => {
+			const encryptionService = new TestEncryptionService();
+			const storageService = store.add(new InMemoryStorageService());
+			const service = store.add(new BaseSecretStorageService(false, storageService, encryptionService, store.add(new NullLogService())));
+			await service.set('my-secret', 'my-secret-value');
+			const stored = storageService.get('secret://my-secret', StorageScope.APPLICATION);
+			assert.ok(stored);
+
+			const decrypt = sinon.stub(encryptionService, 'decrypt').rejects(new Error('keychain access denied'));
+			await assert.rejects(service.get('my-secret'), (e: unknown) => e instanceof SecretDecryptionError && e.key === 'my-secret' && !e.message.includes('my-secret-value'));
+			assert.deepStrictEqual(await service.keys(), ['my-secret']);
+			assert.strictEqual(storageService.get('secret://my-secret', StorageScope.APPLICATION), stored);
+
+			decrypt.restore();
+			assert.strictEqual(await service.get('my-secret'), 'my-secret-value');
 		});
 	});
 
