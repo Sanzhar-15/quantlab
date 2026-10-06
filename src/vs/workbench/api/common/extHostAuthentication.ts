@@ -275,7 +275,17 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 			// Still no client id so dynamic client registration was either not supported or failed
 			if (!clientId) {
 				this._logService.info('Prompting user for client registration details');
-				const clientDetails = await this._proxy.$promptForClientRegistration(authorizationServer.toString());
+				let clientDetails: Awaited<ReturnType<MainThreadAuthenticationShape['$promptForClientRegistration']>>;
+				try {
+					clientDetails = await this._proxy.$promptForClientRegistration(authorizationServer.toString());
+				} catch (promptError) {
+					if (isCancellationError(promptError)) {
+						// A received cancellation is recognised by name and message only: its stack and properties are not trusted, so it is replaced
+						throw new CancellationError();
+					}
+					// The error comes from another process and its text and causes are not trusted: report a new error
+					throw new OAuthSafeError('Failed to prompt for client registration details');
+				}
 				if (!clientDetails) {
 					throw new Error('User did not provide client details');
 				}
@@ -532,7 +542,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					result = await this._proxy.$showContinueNotification(message);
 				} catch (notificationError) {
 					if (isCancellationError(notificationError)) {
-						throw notificationError;
+						// A received cancellation is recognised by name and message only: its stack and properties are not trusted, so it is replaced
+						throw new CancellationError();
 					}
 					// The error comes from another process: report a new error without its text
 					throw new OAuthSafeError('Failed to show the continue notification');
@@ -636,7 +647,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
 		} catch (openError) {
 			if (isCancellationError(openError)) {
-				throw openError;
+				// A received cancellation is recognised by name and message only: its stack and properties are not trusted, so it is replaced
+				throw new CancellationError();
 			}
 			// The error comes from another process and can quote the authorization URL: report a new error without its text
 			throw new OAuthSafeError('Failed to open the authorization URL');
@@ -696,7 +708,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			result = await this._proxy.$waitForUriHandler(expectedState);
 		} catch (err) {
 			if (isCancellationError(err)) {
-				throw err;
+				// A received cancellation is recognised by name and message only: its stack and properties are not trusted, so it is replaced
+				throw new CancellationError();
 			}
 			// The error comes from another process and its text is not trusted: report a new error
 			throw new OAuthSafeError('Failed to wait for the authorization redirect');
