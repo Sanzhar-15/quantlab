@@ -115,7 +115,10 @@ const vscodeResourceIncludes = [
 
 	// QuantLab terminal view (R-52)
 	'out-build/vs/code/electron-main/ql-client/terminal/preload.cjs',
-	'out-build/vs/code/electron-main/ql-client/terminal/renderer/**'
+	'out-build/vs/code/electron-main/ql-client/terminal/renderer/**',
+
+	// QuantLab host (U7): the bundled chrome policy file (the chrome keys the user cannot change, CH-2)
+	'out-build/vs/code/electron-main/qlHost/ql-chrome-policy.json'
 ];
 
 const vscodeResources = [

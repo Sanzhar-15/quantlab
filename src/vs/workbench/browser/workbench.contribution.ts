@@ -13,6 +13,7 @@ import { ConfigurationKeyValuePairs, ConfigurationMigrationWorkbenchContribution
 import { WorkbenchPhase, registerWorkbenchContribution2 } from '../common/contributions.js';
 import { CustomEditorLabelService } from '../services/editor/common/customEditorLabelService.js';
 import { ActivityBarPosition, EditorActionsLocation, EditorTabsMode, LayoutSettings } from '../services/layout/browser/layoutService.js';
+import { QL_POLICY_ACTIVITY_BAR_LOCATION, QL_POLICY_SIDE_BAR_LOCATION } from '../../platform/policy/common/qlChromePolicy.js'; // QuantLab host (U7)
 import { defaultWindowTitle, defaultWindowTitleSeparator } from './parts/titlebar/windowTitle.js';
 
 const registry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
@@ -543,7 +544,8 @@ const registry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Con
 				'type': 'string',
 				'enum': ['left', 'right'],
 				'default': 'left',
-				'description': localize('sideBarLocation', "Controls the location of the primary side bar and activity bar. They can either show on the left or right of the workbench. The secondary side bar will show on the opposite side of the workbench.")
+				'description': localize('sideBarLocation', "Controls the location of the primary side bar and activity bar. They can either show on the left or right of the workbench. The secondary side bar will show on the opposite side of the workbench."),
+				'policy': QL_POLICY_SIDE_BAR_LOCATION // QuantLab host (U7)
 			},
 			'workbench.panel.showLabels': {
 				'type': 'boolean',
@@ -601,6 +603,7 @@ const registry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Con
 					localize('workbench.activityBar.location.bottom', "Show the Activity Bar at the bottom of the Primary and Secondary Side Bars."),
 					localize('workbench.activityBar.location.hide', "Hide the Activity Bar in the Primary and Secondary Side Bars.")
 				],
+				'policy': QL_POLICY_ACTIVITY_BAR_LOCATION, // QuantLab host (U7)
 			},
 			'workbench.activityBar.iconClickBehavior': {
 				'type': 'string',
