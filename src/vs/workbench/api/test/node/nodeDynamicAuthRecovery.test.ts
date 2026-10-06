@@ -10,7 +10,7 @@ import { Emitter } from '../../../../base/common/event.js';
 import { IAuthorizationServerMetadata, IAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { ILoggerService, NullLogger } from '../../../../platform/log/common/log.js';
+import { ILogger, ILoggerService, NullLogger } from '../../../../platform/log/common/log.js';
 import { MainThreadAuthenticationShape } from '../../common/extHost.protocol.js';
 import { DynamicAuthClientRejectedError } from '../../common/extHostAuthentication.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
@@ -23,6 +23,15 @@ const AUTH_SERVER = 'https://auth.example.com';
 const DEVICE_ENDPOINT = `${AUTH_SERVER}/device`;
 const TOKEN_ENDPOINT = `${AUTH_SERVER}/token`;
 const REGISTRATION_ENDPOINT = `${AUTH_SERVER}/register`;
+
+class RecordingLogger extends NullLogger {
+	readonly lines: string[] = [];
+	override trace(message: string): void { this.lines.push(message); }
+	override debug(message: string): void { this.lines.push(message); }
+	override info(message: string): void { this.lines.push(message); }
+	override warn(message: string): void { this.lines.push(message); }
+	override error(message: string | Error): void { this.lines.push(String(message)); }
+}
 
 // F-SECRETS-3: invalid_client in the device-code flow keeps the client registration; sign-in stops, named.
 suite('NodeDynamicAuthProvider - device code invalid_client keeps the registration', () => {
@@ -126,4 +135,51 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 			assertRegistrationKept(provider, calls);
 		});
 	}
+
+	// F-SECRETS-3 item-7 class: no error text or response body in a log line of the sign-in flows.
+	test('no planted marker from a failed app URI or a device authorization body reaches a log line', async () => {
+		const M = 'MARKER-SIGNIN-6a1';
+		fetchStub.callsFake(async (input: string | URL | Request) => String(input) === DEVICE_ENDPOINT
+			? new Response(`{"echo":"${M}"}`, { status: 500 })
+			: new Response('', { status: 404 }));
+		const logger = new RecordingLogger();
+		let continuePrompts = 0;
+		const proxy: Partial<MainThreadAuthenticationShape> = {
+			$showContinueNotification: async () => { continuePrompts++; return true; },
+			$setSessionsForDynamicAuthProvider: async () => { },
+		};
+		const serverMetadata: IAuthorizationServerMetadata = {
+			issuer: AUTH_SERVER,
+			response_types_supported: ['code'],
+			authorization_endpoint: `${AUTH_SERVER}/authorize`,
+			token_endpoint: TOKEN_ENDPOINT,
+			device_authorization_endpoint: DEVICE_ENDPOINT,
+		};
+		const emitter = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: (IAuthorizationTokenResponse & { created_at: number })[] }>());
+		const provider = new NodeDynamicAuthProvider(
+			{} as IExtHostWindow,
+			{ createAppUri: async () => { throw new Error(`url service said ${M}`); } } as unknown as IExtHostUrlsService,
+			{ environment: { appName: 'Test', appUriScheme: 'test' }, remote: { isRemote: false } } as unknown as IExtHostInitDataService,
+			{ withProgressFromSource: (_source: unknown, _options: unknown, task: (progress: { report(): void }, token: CancellationToken) => Promise<unknown>) => task({ report() { } }, CancellationToken.None) } as unknown as IExtHostProgress,
+			{ createLogger: (): ILogger => logger } as unknown as ILoggerService,
+			proxy as MainThreadAuthenticationShape,
+			URI.parse(AUTH_SERVER),
+			serverMetadata,
+			undefined,
+			'client-1',
+			undefined,
+			emitter,
+			[],
+		);
+		store.add({ dispose: () => provider.dispose() });
+
+		// Loopback (app URI fails), then URL handler (app URI fails), then device code (500 with a body).
+		await assert.rejects(provider.createSession(['read'], {}));
+
+		assert.strictEqual(continuePrompts, 2, 'all three flows ran');
+		assert.strictEqual(fetchStub.getCalls().filter(c => String(c.args[0]) === DEVICE_ENDPOINT).length, 1);
+		for (const line of logger.lines) {
+			assert.ok(!line.includes(M), `a marker reached a log line: ${line}`);
+		}
+	});
 });

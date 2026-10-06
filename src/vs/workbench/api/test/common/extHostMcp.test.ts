@@ -9,7 +9,7 @@ import { LogLevel } from '../../../../platform/log/common/log.js';
 import { createAuthMetadata, CommonResponse, IAuthMetadata } from '../../common/extHostMcp.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { SecretDecryptionError } from '../../../../platform/secrets/common/secrets.js';
-import { createMcpHttpHarness, createMcpHttpHarnessFrom, errorStateMessages, HARNESS_MCP_URL, harnessResponse } from './mcpHttpHandleHarness.js';
+import { createMcpHttpHarness, createMcpHttpHarnessFrom, errorStateMessages, HARNESS_MCP_URL, harnessResponse, harnessStreamResponse, IMcpHttpHarness } from './mcpHttpHandleHarness.js';
 
 // Test constants to avoid magic strings
 const TEST_MCP_URL = 'https://example.com/mcp';
@@ -792,9 +792,10 @@ suite('McpHTTPHandle authentication failures', () => {
 	});
 
 	/** Waits (bounded) for the handle's background work, such as the unawaited legacy SSE fallback. */
-	async function waitFor(condition: () => boolean, what: string): Promise<void> {
-		for (let i = 0; i < 200 && !condition(); i++) {
-			await new Promise(resolve => setTimeout(resolve, 0));
+	async function waitFor(condition: () => boolean, what: string, timeoutMs = 500): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!condition() && Date.now() < deadline) {
+			await new Promise(resolve => setTimeout(resolve, 5));
 		}
 		assert.ok(condition(), `timed out waiting for ${what}`);
 	}
@@ -887,5 +888,101 @@ suite('McpHTTPHandle authentication failures', () => {
 			}
 		}
 		assert.deepStrictEqual(providerFails.requests, [], 'no request without the authorization the server asked for');
+	});
+
+	// F-SECRETS-3 item-7 class: no response body, header value or error text on any transport path of the handle.
+	test('no planted marker from a response body, a response header or a transport error reaches a log line or the server state', async () => {
+		const M = 'MARKER-TRANSPORT-0b4';
+		const SSE = { 'content-type': 'text/event-stream', 'x-echo': M };
+		const messagesUrl = 'https://mcp.example.com/messages';
+		const harnesses: [string, IMcpHttpHarness][] = [];
+		const make = (name: string, transport: (url: string, method: string | undefined, nth: number) => Promise<CommonResponse>) => {
+			const counts = new Map<string, number>();
+			const harness = createMcpHttpHarnessFrom({
+				getToken: async () => undefined,
+				getTokenForProvider: () => Promise.reject(new Error('not used')),
+				authentication: undefined,
+				transport: (url, init) => {
+					const key = `${init?.method} ${url}`;
+					const nth = (counts.get(key) ?? 0) + 1;
+					counts.set(key, nth);
+					return transport(url, init?.method, nth);
+				},
+			});
+			store.add(harness.handle);
+			harnesses.push([name, harness]);
+			return harness;
+		};
+		const send = (harness: IMcpHttpHarness) => harness.handle.send('{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+		const sawLog = (harness: IMcpHttpHarness, text: string) => () => harness.logs.some(l => l.includes(text));
+		const sawError = (harness: IMcpHttpHarness, text: string) => () => errorStateMessages(harness.states).some(m => m.includes(text));
+
+		// Streamable HTTP: an error status with a body and a header (status state, response trace).
+		const status500 = make('POST 500', async url => harnessResponse(500, url, { 'x-echo': M }, `{"echo":"${M}"}`));
+		await send(status500);
+		await waitFor(sawError(status500, '500 status sending message'), 'the 500 state');
+
+		// Streamable HTTP: a successful response that is neither JSON nor SSE.
+		const unexpected = make('POST 200 text', async url => harnessResponse(200, url, { 'content-type': 'text/plain' }, `not json ${M}`));
+		await send(unexpected);
+		await waitFor(sawLog(unexpected, 'Unexpected 200 response'), 'the unexpected-response line');
+
+		// Streamable HTTP: an SSE response whose stream fails.
+		const streamFails = make('POST SSE read error', async url => harnessStreamResponse(200, url, SSE, '', new Error(`stream said ${M}`)));
+		await send(streamFails);
+		await waitFor(sawLog(streamFails, 'Error reading SSE stream'), 'the SSE read line');
+
+		// OAuth metadata lookups that fail.
+		const metadataFails = make('metadata errors', async (url, method) => {
+			if (url === HARNESS_MCP_URL && method === 'POST') {
+				return harnessResponse(401, url, { 'WWW-Authenticate': 'Bearer realm="example"' });
+			}
+			throw new Error(`lookup said ${M}`);
+		});
+		await send(metadataFails);
+		await waitFor(() => metadataFails.logs.some(l => /resource metadata|auth server metadata/.test(l)), 'a metadata line');
+
+		// The async-notification backchannel: a stream that fails, then an error status with a body.
+		const backchannel = make('backchannel', async (url, method, nth) => {
+			if (method === 'POST') {
+				return harnessResponse(202, url);
+			}
+			if (method === 'GET' && nth === 1) {
+				return harnessStreamResponse(200, url, SSE, '', new Error(`async stream said ${M}`));
+			}
+			return harnessResponse(405, url, { 'x-echo': M }, `{"echo":"${M}"}`);
+		});
+		await send(backchannel);
+		await waitFor(sawLog(backchannel, 'for async notifications; they will be disabled'), 'the backchannel to stop', 3000);
+		assert.ok(backchannel.logs.some(l => l.includes('Error reading from async stream')));
+
+		// Legacy SSE: the attach fails with a body; a stream that fails after the endpoint; a POST that fails with a body.
+		const legacyAttach = make('legacy attach 500', async (url, method) => method === 'POST'
+			? harnessResponse(405, url)
+			: harnessResponse(500, url, { 'x-echo': M }, `{"echo":"${M}"}`));
+		await send(legacyAttach);
+		await waitFor(sawError(legacyAttach, 'as SSE'), 'the legacy attach state');
+
+		const legacy = make('legacy stream and POST', async (url, method) => {
+			if (url === HARNESS_MCP_URL && method === 'POST') {
+				return harnessResponse(405, url);
+			}
+			if (url === HARNESS_MCP_URL && method === 'GET') {
+				return harnessStreamResponse(200, url, SSE, 'event: endpoint\ndata: /messages\n\n', new Error(`legacy stream said ${M}`));
+			}
+			if (url === messagesUrl) {
+				return harnessResponse(500, url, { 'x-echo': M }, `{"echo":"${M}"}`);
+			}
+			return harnessResponse(404, url);
+		});
+		await send(legacy);
+		await waitFor(sawError(legacy, 'Error reading SSE stream'), 'the legacy stream state');
+		await waitFor(sawLog(legacy, '500 status sending message'), 'the legacy POST line');
+
+		for (const [name, harness] of harnesses) {
+			for (const line of [...harness.logs, ...harness.states.map(state => JSON.stringify(state))]) {
+				assert.ok(!line.includes(M), `${name}: a marker reached a log line or the state: ${line}`);
+			}
+		}
 	});
 });

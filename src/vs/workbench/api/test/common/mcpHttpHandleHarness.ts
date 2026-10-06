@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { URI } from '../../../../base/common/uri.js';
-import { ILogService, NullLogService } from '../../../../platform/log/common/log.js';
+import { ILogService, LogLevel, NullLogService } from '../../../../platform/log/common/log.js';
 import { McpConnectionState, McpServerTransportHTTP, McpServerTransportHTTPAuthentication, McpServerTransportType } from '../../../contrib/mcp/common/mcpTypes.js';
 import { IMcpAuthenticationDetails, IMcpAuthenticationOptions, MainThreadMcpShape } from '../../common/extHost.protocol.js';
 import { CommonRequestInit, CommonResponse, McpHTTPHandle } from '../../common/extHostMcp.js';
@@ -21,6 +21,40 @@ export function harnessResponse(status: number, url: string, headers: Record<str
 		json: async () => JSON.parse(body),
 		text: async () => body,
 	};
+}
+
+/**
+ * A streamed response: `text` (if any), then an error (if given) or the end. With `headers`, for example an SSE content type.
+ */
+export function harnessStreamResponse(status: number, url: string, headers: Record<string, string>, text: string, error: Error | undefined): CommonResponse {
+	// The text is read first; the error or the end comes on the next read (erroring at once would drop queued text).
+	let sentText = !text;
+	const body = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			if (!sentText) {
+				sentText = true;
+				controller.enqueue(new TextEncoder().encode(text));
+			} else if (error) {
+				controller.error(error);
+			} else {
+				controller.close();
+			}
+		}
+	});
+	return {
+		status,
+		statusText: String(status),
+		url,
+		headers: new Headers(headers),
+		body,
+		json: async () => { throw new Error('not used'); },
+		text: async () => { throw new Error('not used'); },
+	};
+}
+
+/** Publishes trace lines too, so the request/response trace lines are covered. */
+class TraceLogService extends NullLogService {
+	override getLevel(): LogLevel { return LogLevel.Trace; }
 }
 
 class TestMcpHTTPHandle extends McpHTTPHandle {
@@ -76,7 +110,7 @@ export function createMcpHttpHarnessFrom(setup: IMcpHttpHarnessSetup): IMcpHttpH
 		$getTokenForProviderId: (_id, providerId, scopes) => setup.getTokenForProvider(providerId, scopes),
 	};
 	const launch: McpServerTransportHTTP = { type: McpServerTransportType.HTTP, uri: URI.parse(HARNESS_MCP_URL), headers: [], authentication: setup.authentication };
-	const handle = new TestMcpHTTPHandle(launch, proxy as MainThreadMcpShape, new NullLogService(), (url, init) => {
+	const handle = new TestMcpHTTPHandle(launch, proxy as MainThreadMcpShape, new TraceLogService(), (url, init) => {
 		requests.push({ method: init?.method, url, authorization: init?.headers['Authorization'] });
 		if (url === HARNESS_MCP_URL && init?.method === 'POST') {
 			posts.push(init.headers['Authorization']);

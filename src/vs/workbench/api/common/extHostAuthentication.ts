@@ -29,6 +29,14 @@ import { CancellationError, isCancellationError } from '../../../base/common/err
 import { raceCancellationError, SequencerByKey } from '../../../base/common/async.js';
 
 export interface IExtHostAuthentication extends ExtHostAuthentication { }
+
+/**
+ * The class of an error, for a log line or an error message on an authentication path: an error's text (a response body,
+ * a request, a token) is not safe by construction, so it is never shown.
+ */
+export function errorClassName(error: unknown): string {
+	return error instanceof Error ? error.name : typeof error;
+}
 export const IExtHostAuthentication = createDecorator<IExtHostAuthentication>('IExtHostAuthentication');
 
 interface ProviderWithMetadata {
@@ -268,7 +276,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					clientId = registration.client_id;
 					clientSecret = registration.client_secret;
 				} catch (err) {
-					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${err.message}. Prompting user for client ID and client secret...`);
+					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${errorClassName(err)}. Prompting user for client ID and client secret...`);
 				}
 			}
 			// Still no client id so dynamic client registration was either not supported or failed
@@ -663,7 +671,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		try {
 			state = await this._extHostUrls.createAppUri(callbackUri);
 		} catch (error) {
-			throw new Error(`Failed to create external URI: ${error}`);
+			throw new Error(`Failed to create external URI: ${errorClassName(error)}`);
 		}
 
 		// Prepare the authorization request URL

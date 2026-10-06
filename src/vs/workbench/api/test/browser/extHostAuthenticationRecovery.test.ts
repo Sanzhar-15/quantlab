@@ -22,7 +22,8 @@ import { IAuthenticationService } from '../../../services/authentication/common/
 import { IDynamicAuthenticationProviderStorageService } from '../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { TestStorageService } from '../../../test/common/workbenchTestServices.js';
 import { MainThreadAuthenticationShape } from '../../common/extHost.protocol.js';
-import { DynamicAuthClientRejectedError, DynamicAuthProvider, DynamicAuthSessionExpiredError, DynamicAuthSessionPersistError, DynamicAuthSessionRefreshError } from '../../common/extHostAuthentication.js';
+import { DynamicAuthClientRejectedError, DynamicAuthProvider, DynamicAuthSessionExpiredError, DynamicAuthSessionPersistError, DynamicAuthSessionRefreshError, ExtHostAuthentication } from '../../common/extHostAuthentication.js';
+import { IExtHostRpcService } from '../../common/extHostRpcService.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
 import { IExtHostProgress } from '../../common/extHostProgress.js';
 import { IExtHostUrlsService } from '../../common/extHostUrls.js';
@@ -356,6 +357,38 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 			assert.strictEqual(await snapshot(), before);
 		});
 	}
+
+	// F-SECRETS-3 item-7 class: a failed dynamic registration is logged by class, never with the response body.
+	test('a failed dynamic client registration logs no response body', async () => {
+		const M = 'MARKER-REGISTRATION-2f9';
+		fetchStub.callsFake(async () => new Response(JSON.stringify({ error: 'invalid_client_metadata', error_description: M }), { status: 400 }));
+		const lines: string[] = [];
+		class RecordingLogService extends NullLogService {
+			override trace(message: string): void { lines.push(message); }
+			override debug(message: string): void { lines.push(message); }
+			override info(message: string): void { lines.push(message); }
+			override warn(message: string): void { lines.push(message); }
+			override error(message: string | Error): void { lines.push(String(message)); }
+		}
+		const proxy: Partial<MainThreadAuthenticationShape> = { $promptForClientRegistration: async () => undefined };
+		const auth = new ExtHostAuthentication(
+			{ getProxy: () => proxy } as unknown as IExtHostRpcService,
+			{ environment: { appName: 'Test', appUriScheme: 'test' } } as unknown as IExtHostInitDataService,
+			{} as IExtHostWindow,
+			{} as IExtHostUrlsService,
+			{} as IExtHostProgress,
+			{ createLogger: (): ILogger => new NullLogger() } as unknown as ILoggerService,
+			store.add(new RecordingLogService()),
+		);
+		const serverMetadata: IAuthorizationServerMetadata = { issuer: AUTH_SERVER, response_types_supported: ['code'], registration_endpoint: REGISTRATION_ENDPOINT };
+
+		await assert.rejects(auth.$registerDynamicAuthProvider(URI.parse(AUTH_SERVER).toJSON(), serverMetadata, undefined, undefined, undefined, undefined), /User did not provide client details/);
+
+		assert.ok(lines.some(l => l.includes('Dynamic registration failed')), lines.join('\n'));
+		for (const line of lines) {
+			assert.ok(!line.includes(M), `a marker reached a log line: ${line}`);
+		}
+	});
 
 	test('the explicit reset removes exactly the selected provider: its list entry, client registration and sessions', async () => {
 		const storageService = store.add(new TestStorageService());

@@ -414,7 +414,7 @@ export class McpHTTPHandle extends Disposable {
 
 			this._proxy.$onDidChangeState(this._id, {
 				state: McpConnectionState.Kind.Error,
-				message: `${res.status} status sending message to ${this._launch.uri}: ${await this._getErrTextUnlessAuth(res)}` + (retryWithSessionId ? `; will retry with new session ID` : ''),
+				message: `${res.status} status sending message to ${this._launch.uri}` + (retryWithSessionId ? `; will retry with new session ID` : ''),
 				shouldRetry: retryWithSessionId,
 			});
 			return;
@@ -465,7 +465,7 @@ export class McpHTTPHandle extends Disposable {
 			try {
 				await this._doSSE(parser, res);
 			} catch (err) {
-				this._log(LogLevel.Warning, `Error reading SSE stream: ${String(err)}`);
+				this._log(LogLevel.Warning, `Error reading SSE stream: ${safeErrorText(err)}`);
 			}
 		} else if (contentType.startsWith('application/json')) {
 			this._proxy.$onDidReceiveMessage(this._id, await res.text());
@@ -474,7 +474,8 @@ export class McpHTTPHandle extends Disposable {
 			if (isJSON(responseBody)) { // try to read as JSON even if the server didn't set the content type
 				this._proxy.$onDidReceiveMessage(this._id, responseBody);
 			} else {
-				this._log(LogLevel.Warning, `Unexpected ${res.status} response for request: ${responseBody}`);
+				// Not the body: a response may echo a credential.
+				this._log(LogLevel.Warning, `Unexpected ${res.status} response for request: content type '${contentType}', ${responseBody.length} characters, not JSON`);
 			}
 		}
 	}
@@ -529,7 +530,7 @@ export class McpHTTPHandle extends Disposable {
 			}
 
 			if (res.status >= 400) {
-				this._log(LogLevel.Debug, `${res.status} status connecting to ${this._launch.uri} for async notifications; they will be disabled: ${await this._getErrTextUnlessAuth(res)}`);
+				this._log(LogLevel.Debug, `${res.status} status connecting to ${this._launch.uri} for async notifications; they will be disabled`);
 				return;
 			}
 
@@ -554,7 +555,7 @@ export class McpHTTPHandle extends Disposable {
 			try {
 				await this._doSSE(parser, res);
 			} catch (e) {
-				this._log(LogLevel.Info, `Error reading from async stream, we will reconnect: ${e}`);
+				this._log(LogLevel.Info, `Error reading from async stream, we will reconnect: ${safeErrorText(e)}`);
 			}
 		}
 	}
@@ -582,7 +583,7 @@ export class McpHTTPHandle extends Disposable {
 				headers
 			);
 			if (res.status >= 300) {
-				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `${res.status} status connecting to ${this._launch.uri} as SSE: ${await this._getErrTextUnlessAuth(res)}` });
+				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `${res.status} status connecting to ${this._launch.uri} as SSE` });
 				return;
 			}
 		} catch (e) {
@@ -600,7 +601,7 @@ export class McpHTTPHandle extends Disposable {
 
 		this._register(toDisposable(() => postEndpoint.cancel()));
 		this._doSSE(parser, res).catch(err => {
-			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error reading SSE stream: ${String(err)}` });
+			this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error reading SSE stream: ${safeErrorText(err)}` });
 		});
 
 		return postEndpoint.p;
@@ -630,7 +631,7 @@ export class McpHTTPHandle extends Disposable {
 			throw new McpAuthorizationRejectedError(res.status);
 		}
 		if (res.status >= 300) {
-			this._log(LogLevel.Warning, `${res.status} status sending message to ${this._postEndpoint}: ${await this._getErrTextUnlessAuth(res)}`);
+			this._log(LogLevel.Warning, `${res.status} status sending message to ${this._postEndpoint}`);
 		}
 	}
 
@@ -726,22 +727,6 @@ export class McpHTTPHandle extends Disposable {
 		}
 	}
 
-	/** The response body, except for an authentication failure (401/403), whose body may echo a credential. */
-	private async _getErrTextUnlessAuth(res: CommonResponse) {
-		if (isAuthStatusCode(res.status)) {
-			return `${res.status} (response body not shown for an authentication failure)`;
-		}
-		return this._getErrText(res);
-	}
-
-	private async _getErrText(res: CommonResponse) {
-		try {
-			return await res.text();
-		} catch {
-			return res.statusText;
-		}
-	}
-
 	/**
 	 * Helper method to perform fetch with authentication retry logic.
 	 * If the initial request returns an auth error and we don't have auth metadata,
@@ -831,11 +816,12 @@ export class McpHTTPHandle extends Disposable {
 		}
 
 		if (canLog(this._logService.getLevel(), LogLevel.Trace)) {
-			const headers: Record<string, string> = {};
-			response.headers.forEach((value, key) => { headers[key] = value; });
+			// Header names only: a header value (such as a cookie) may carry a credential.
+			const headerNames: string[] = [];
+			response.headers.forEach((_value, key) => { headerNames.push(key); });
 			this._log(LogLevel.Trace, `Fetched ${currentUrl}: ${JSON.stringify({
 				status: response.status,
-				headers: headers,
+				headers: headerNames,
 			})}`);
 		}
 
@@ -1019,7 +1005,7 @@ export async function createAuthMetadata(
 			fetch: (url, init) => fetch(url, init as MinimalRequestInit)
 		});
 		for (const err of errors) {
-			log(LogLevel.Warning, `Error fetching resource metadata: ${err}`);
+			log(LogLevel.Warning, `Error fetching resource metadata: ${safeErrorText(err)}`);
 		}
 		// TODO:@TylerLeonhardt support multiple authorization servers
 		// Consider using one that has an auth provider first, over the dynamic flow
@@ -1028,7 +1014,7 @@ export async function createAuthMetadata(
 		scopesChallenge ??= metadata.scopes_supported;
 		resource = metadata;
 	} catch (e) {
-		log(LogLevel.Warning, `Could not fetch resource metadata: ${String(e)}`);
+		log(LogLevel.Warning, `Could not fetch resource metadata: ${safeErrorText(e)}`);
 	}
 
 	const baseUrl = new URL(originalResponse.url).origin;
@@ -1060,7 +1046,7 @@ export async function createAuthMetadata(
 			log
 		);
 	} catch (e) {
-		log(LogLevel.Warning, `Error populating auth server metadata for ${serverMetadataUrl}: ${String(e)}`);
+		log(LogLevel.Warning, `Error populating auth server metadata for ${serverMetadataUrl}: ${safeErrorText(e)}`);
 	}
 
 	// If there's no well-known server metadata, then use the default values based off of the url.

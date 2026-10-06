@@ -6,7 +6,7 @@
 import * as nls from '../../../nls.js';
 import type * as vscode from 'vscode';
 import { URL } from 'url';
-import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, IExtHostAuthentication } from '../common/extHostAuthentication.js';
+import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, errorClassName, IExtHostAuthentication } from '../common/extHostAuthentication.js';
 import { IExtHostRpcService } from '../common/extHostRpcService.js';
 import { IExtHostInitDataService } from '../common/extHostInitDataService.js';
 import { IExtHostWindow } from '../common/extHostWindow.js';
@@ -92,7 +92,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		try {
 			appUri = await this._extHostUrls.createAppUri(callbackUri);
 		} catch (error) {
-			throw new Error(`Failed to create external URI: ${error}`);
+			throw new Error(`Failed to create external URI: ${errorClassName(error)}`);
 		}
 
 		// Prepare the authorization request URL
@@ -119,7 +119,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		try {
 			await server.start();
 		} catch (err) {
-			throw new Error(`Failed to start loopback server: ${err}`);
+			throw new Error(`Failed to start loopback server: ${errorClassName(err)}`);
 		}
 
 		// Update the authorization URL with the actual redirect URI
@@ -152,8 +152,8 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 					this._logger.info('Authorization code request was cancelled by the user.');
 					throw err;
 				}
-				this._logger.error(`Failed to receive authorization code: ${err}`);
-				throw new Error(`Failed to receive authorization code: ${err}`);
+				this._logger.error(`Failed to receive authorization code: ${errorClassName(err)}`);
+				throw new Error(`Failed to receive authorization code: ${errorClassName(err)}`);
 			}
 			this._logger.info(`Authorization code received for scopes: ${scopeString}`);
 
@@ -211,8 +211,8 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 			throw new DynamicAuthClientRejectedError(this.id, this.label);
 		}
 		if (!deviceCodeResponse.ok) {
-			const text = await deviceCodeResponse.text();
-			throw new Error(`Device code request failed: ${deviceCodeResponse.status} ${deviceCodeResponse.statusText} - ${text}`);
+			// Not the body: a response may echo a credential.
+			throw new Error(`Device code request failed: ${deviceCodeResponse.status}`);
 		}
 
 		const deviceCodeData: IAuthorizationDeviceResponse = await deviceCodeResponse.json();
@@ -306,7 +306,8 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 						this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
 						throw new DynamicAuthClientRejectedError(this.id, this.label);
 					} else {
-						throw new Error(`Token request failed: ${errorData.error_description || errorData.error || 'Unknown error'}`);
+						// Not the description: it is server text from the response body.
+						throw new Error(`Token request failed with status ${tokenResponse.status}`);
 					}
 				}
 			} catch (error) {
