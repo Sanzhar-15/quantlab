@@ -27,6 +27,19 @@ interface IStoredData {
 
 interface IHydratedData extends IStoredData {
 	unsealedSecrets?: Record<string, IResolvedValue>;
+	/** The unseal in flight for this record: concurrent callers share it, so only one decrypted map is ever installed. */
+	unsealing?: Promise<Record<string, IResolvedValue>>;
+}
+
+/**
+ * An operation was overtaken: clearAll() replaced the stored record while it ran, so applying its result would write
+ * into a record nobody reads, or return values the user just cleared. The operation is not applied, and rejects.
+ */
+export class McpInputsOvertakenError extends Error {
+	override readonly name = 'McpInputsOvertakenError';
+	constructor(operation: string) {
+		super(`The stored MCP inputs were cleared while '${operation}' was running; the operation was not applied.`);
+	}
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -53,22 +66,6 @@ export class McpRegistryInputStorage extends Disposable {
 
 	private _encryptionKey: Promise<CryptoKey> | undefined;
 
-	/** Imports the stored key text. It never quotes the text, and a failure is named and keeps the stored key. */
-	private async _importStoredKey(existing: string): Promise<CryptoKey> {
-		let parsed: JsonWebKey;
-		try {
-			parsed = JSON.parse(existing);
-		} catch {
-			// The parse error quotes the stored text, so it is not carried.
-			throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not valid JSON');
-		}
-		try {
-			return await crypto.subtle.importKey('jwk', parsed, MCP_ENCRYPTION_KEY_ALGORITHM, false, ['encrypt', 'decrypt']);
-		} catch (e) {
-			throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not a usable encryption key', { cause: e });
-		}
-	}
-
 	/** Forgets the imported key, so that the next use reads the stored key again. */
 	private _forgetEncryptionKey(): void {
 		this._encryptionKey = undefined;
@@ -87,7 +84,18 @@ export class McpRegistryInputStorage extends Disposable {
 			const existing = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
 			// Only undefined is absence: a stored empty string is a present key that is unusable, and is kept.
 			if (existing !== undefined) {
-				return this._importStoredKey(existing);
+				let parsed: JsonWebKey;
+				try {
+					parsed = JSON.parse(existing);
+				} catch {
+					// The parse error quotes the stored text, so it is not carried.
+					throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not valid JSON');
+				}
+				try {
+					return await crypto.subtle.importKey('jwk', parsed, MCP_ENCRYPTION_KEY_ALGORITHM, false, ['encrypt', 'decrypt']);
+				} catch (e) {
+					throw new InvalidStoredSecretError(MCP_ENCRYPTION_KEY_NAME, 'is not a usable encryption key', { cause: e });
+				}
 			}
 
 			const key = await crypto.subtle.generateKey(
@@ -193,62 +201,35 @@ export class McpRegistryInputStorage extends Disposable {
 		this._didChange = true;
 	}
 
-	/**
-	 * Explicit recovery of this scope's sealed secrets: drops them and keeps the plain values. It is for the user who
-	 * accepts that sealed secrets which cannot be unsealed are lost. It never touches the shared encryption key and
-	 * never the other scope.
-	 */
-	public discardSealedSecrets(): void {
-		const record = this._getRecord();
-		record.secrets = undefined;
-		record.unsealedSecrets = undefined;
-		this._didChange = true;
-	}
-
-	/**
-	 * Explicit recovery of a stored encryption key that cannot be imported (empty, not JSON, not a key): deletes that
-	 * key, so that the next sealing makes a new one, and discards this scope's sealed secrets, which only that key
-	 * could unseal. It is for an explicit act of the user. A usable key is never deleted: it rejects. The other
-	 * scope's sealed secrets are not touched; its user discards them with discardSealedSecrets() there.
-	 * Clearing inputs never deletes the shared key.
-	 */
-	public async resetUnusableEncryptionKey(): Promise<void> {
-		// The record is read first, so that a record that cannot be read leaves the key in place.
-		const record = this._getRecord();
-		await McpRegistryInputStorage.secretSequencer.queue(async () => {
-			const existing = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
-			if (existing === undefined) {
-				throw new Error(`The stored secret '${MCP_ENCRYPTION_KEY_NAME}' does not exist; there is nothing to reset.`);
-			}
-			// The import failure itself is the condition for the reset, not an error to report.
-			const unusable = await this._importStoredKey(existing).then(() => false, () => true);
-			if (!unusable) {
-				throw new Error(`The stored secret '${MCP_ENCRYPTION_KEY_NAME}' is a usable key; it is kept.`);
-			}
-			await this._secretStorageService.delete(MCP_ENCRYPTION_KEY_NAME);
-			this._forgetEncryptionKey();
-			record.secrets = undefined;
-			record.unsealedSecrets = undefined;
-			this._didChange = true;
-		});
+	/** The record this operation works on is still the current one: clearAll() did not replace it meanwhile. */
+	private _assertCurrent(record: IHydratedData, operation: string): void {
+		if (this._hydrated !== record) {
+			const error = new McpInputsOvertakenError(operation);
+			this._logService.error(error);
+			throw error;
+		}
 	}
 
 	/** Delete a single collection data from the storage. */
 	public async clear(inputKey: string) {
-		const secrets = await this._unsealSecrets();
-		delete this._getRecord().values[inputKey];
+		const record = this._getRecord();
+		const secrets = await this._unsealSecrets(record);
+		this._assertCurrent(record, 'clear');
+		delete record.values[inputKey];
 		this._didChange = true;
 
 		if (secrets.hasOwnProperty(inputKey)) {
 			delete secrets[inputKey];
-			await this._sealSecrets();
+			await this._sealSecrets(record, 'clear');
 		}
 	}
 
 	/** Gets a mapping of saved input data. */
 	public async getMap() {
-		const secrets = await this._unsealSecrets();
-		return { ...this._getRecord().values, ...secrets };
+		const record = this._getRecord();
+		const secrets = await this._unsealSecrets(record);
+		this._assertCurrent(record, 'getMap');
+		return { ...record.values, ...secrets };
 	}
 
 	/** Updates the input data mapping. */
@@ -259,15 +240,19 @@ export class McpRegistryInputStorage extends Disposable {
 
 	/** Updates the input secrets mapping. */
 	public async setSecrets(values: Record<string, IResolvedValue>) {
-		const unsealed = await this._unsealSecrets();
+		const record = this._getRecord();
+		const unsealed = await this._unsealSecrets(record);
+		this._assertCurrent(record, 'setSecrets');
 		Object.assign(unsealed, values);
-		await this._sealSecrets();
+		await this._sealSecrets(record, 'setSecrets');
 	}
 
-	private async _sealSecrets() {
+	private async _sealSecrets(record: IHydratedData, operation: string) {
 		const key = await this._getEncryptionKey();
-		const record = this._getRecord();
+		this._assertCurrent(record, operation);
 		return this._secretsSealerSequencer.queue(async () => {
+			// The turn in the sealer queue may come after a clearAll().
+			this._assertCurrent(record, operation);
 			if (!record.unsealedSecrets || isEmptyObject(record.unsealedSecrets)) {
 				record.secrets = undefined;
 				return;
@@ -281,23 +266,41 @@ export class McpRegistryInputStorage extends Disposable {
 				new TextEncoder().encode(toSeal).buffer as ArrayBuffer,
 			);
 
+			// Not written into a record that was replaced while encrypting.
+			this._assertCurrent(record, operation);
 			const enc = encodeBase64(VSBuffer.wrap(new Uint8Array(encrypted)));
 			record.secrets = { iv: encodeBase64(VSBuffer.wrap(iv)), value: enc };
 			this._didChange = true;
 		});
 	}
 
-	private async _unsealSecrets(): Promise<Record<string, IResolvedValue>> {
-		const record = this._getRecord();
-		const sealed = record.secrets;
-		if (!sealed) {
-			return record.unsealedSecrets ??= {};
+	/** The unsealed secrets of the record. Concurrent callers share one decrypt, so no caller's changes are overwritten by a later one's map. */
+	private _unsealSecrets(record: IHydratedData): Promise<Record<string, IResolvedValue>> {
+		if (!record.secrets) {
+			return Promise.resolve(record.unsealedSecrets ??= {});
 		}
 
 		if (record.unsealedSecrets) {
-			return record.unsealedSecrets;
+			return Promise.resolve(record.unsealedSecrets);
 		}
 
+		if (record.unsealing) {
+			return record.unsealing;
+		}
+
+		const pending = this._unsealRecord(record, record.secrets);
+		record.unsealing = pending;
+		// The callers still receive the rejection; this only forgets the settled attempt, so the next call reads again.
+		const settled = () => {
+			if (record.unsealing === pending) {
+				record.unsealing = undefined;
+			}
+		};
+		pending.then(settled, settled);
+		return pending;
+	}
+
+	private async _unsealRecord(record: IHydratedData, sealed: { value: string; iv: string }): Promise<Record<string, IResolvedValue>> {
 		// Sealed secrets that cannot be unsealed are kept: only clearAll() or clear(), the user's acts, remove them.
 		const key = await this._getEncryptionKey();
 		let decrypted: ArrayBuffer;
@@ -327,6 +330,8 @@ export class McpRegistryInputStorage extends Disposable {
 		if (!isResolvedValueMap(unsealedSecrets)) {
 			throw this._invalidStored('unsealed to something that is not a map of input values');
 		}
+		// Not installed into a record that was replaced while decrypting.
+		this._assertCurrent(record, 'unseal');
 		record.unsealedSecrets = unsealedSecrets;
 		return unsealedSecrets;
 	}

@@ -5,6 +5,7 @@
 
 import * as assert from 'assert';
 import { encodeBase64, VSBuffer } from '../../../../../base/common/buffer.js';
+import { DeferredPromise } from '../../../../../base/common/async.js';
 import { Event } from '../../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
@@ -12,7 +13,7 @@ import { InvalidStoredSecretError, SecretDecryptionError } from '../../../../../
 import { TestSecretStorageService } from '../../../../../platform/secrets/test/common/testSecretStorageService.js';
 import { StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { TestStorageService } from '../../../../test/common/workbenchTestServices.js';
-import { McpRegistryInputStorage } from '../../common/mcpRegistryInputStorage.js';
+import { McpInputsOvertakenError, McpRegistryInputStorage } from '../../common/mcpRegistryInputStorage.js';
 
 suite('Workbench - MCP - RegistryInputStorage', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
@@ -518,7 +519,6 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 
 		suite('a malformed shared key, in both scopes', () => {
 			let secrets: CountingSecretStorageService;
-			let profileSealed: string;
 			let workspaceSealed: string;
 
 			setup(async () => {
@@ -530,9 +530,8 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 				await workspace.setPlainText({ 'wPlain': { value: 'workspace-plain' } });
 				await workspace.setSecrets({ 'wSecret': { value: 'workspace-secret' } });
 				await testStorageService.flush();
-				profileSealed = storedInputs(StorageScope.PROFILE)!;
 				workspaceSealed = storedInputs(StorageScope.WORKSPACE)!;
-				assert.ok(profileSealed.includes('"secrets"') && workspaceSealed.includes('"secrets"'));
+				assert.ok(storedInputs(StorageScope.PROFILE)!.includes('"secrets"') && workspaceSealed.includes('"secrets"'));
 
 				await secrets.set(keyName, notAKey);
 				secrets.setCalls = 0;
@@ -559,73 +558,151 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 				assert.strictEqual(storedInputs(StorageScope.WORKSPACE), workspaceSealed);
 				await assert.rejects(workspace.getMap(), namedKey);
 			});
+		});
+	});
 
-			test('resetUnusableEncryptionKey, an explicit act, deletes the key, drops this scope\'s sealed secrets and keeps its plain values', async () => {
-				const profile = createInstance(secrets, StorageScope.PROFILE);
-				await assert.rejects(profile.getMap(), namedKey);
+	// F-SECRETS-1 review c3 (MUST-1 class): an operation that is overtaken by another one never loses the other's values
+	// and never writes into a record that clearAll() replaced. WebCrypto is paused with a deferred to hold the operation.
+	suite('operations overtaken in flight', () => {
 
-				await profile.resetUnusableEncryptionKey();
+		/** Holds every call of one WebCrypto method until released. */
+		function pauseWebCrypto(method: 'decrypt' | 'encrypt') {
+			const subtle = crypto.subtle as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+			const wasOwn = Object.prototype.hasOwnProperty.call(subtle, method);
+			const original = subtle[method];
+			const gate = new DeferredPromise<void>();
+			let calls = 0;
+			subtle[method] = (...args: unknown[]) => {
+				calls++;
+				return gate.p.then(() => original.apply(crypto.subtle, args));
+			};
+			return {
+				get calls() { return calls; },
+				/** The first call is held, and every operation that would start one has had time to. */
+				async reached(): Promise<void> {
+					while (calls === 0) {
+						await new Promise<void>(resolve => setTimeout(resolve, 1));
+					}
+					await new Promise<void>(resolve => setTimeout(resolve, 20));
+				},
+				release(): void { gate.complete(); },
+				restore(): void {
+					gate.complete();
+					if (wasOwn) {
+						subtle[method] = original;
+					} else {
+						delete subtle[method];
+					}
+				},
+			};
+		}
 
-				assert.strictEqual(await secrets.get(keyName), undefined);
-				assert.strictEqual(secrets.deleteCalls, 1);
-				assert.deepStrictEqual(await profile.getMap(), { 'pPlain': { value: 'profile-plain' } });
-				// A new key is made at the next sealing, and sealing works again.
-				await profile.setSecrets({ 'pSecret2': { value: 'profile-secret2' } });
-				assert.strictEqual(secrets.setCalls, 1);
-				assert.ok(await secrets.get(keyName));
-				await testStorageService.flush();
-				const map = await createInstance(secrets, StorageScope.PROFILE).getMap();
-				assert.strictEqual(map.pPlain.value, 'profile-plain');
-				assert.strictEqual(map.pSecret2.value, 'profile-secret2');
-				assert.strictEqual(map.pSecret, undefined);
-			});
+		function createInstance(): McpRegistryInputStorage {
+			return store.add(new McpRegistryInputStorage(StorageScope.APPLICATION, StorageTarget.MACHINE, testStorageService, testSecretStorageService, testLogService));
+		}
 
-			test('the other scope keeps its sealed secrets after a reset, until its own explicit discard; its plain values survive both', async () => {
-				const profile = createInstance(secrets, StorageScope.PROFILE);
-				await profile.resetUnusableEncryptionKey();
-				await profile.setSecrets({ 'pSecret2': { value: 'profile-secret2' } });
-				await testStorageService.flush();
+		/** Seals one secret, saves it, and returns a new instance whose record is sealed and not yet unsealed. */
+		async function reopenWithSealed(): Promise<McpRegistryInputStorage> {
+			await createInstance().setSecrets({ 's0': { value: 'sealed0' } });
+			await testStorageService.flush();
+			return createInstance();
+		}
 
-				const workspace = createInstance(secrets, StorageScope.WORKSPACE);
-				await assert.rejects(workspace.getMap(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs');
-				await testStorageService.flush();
-				assert.strictEqual(storedInputs(StorageScope.WORKSPACE), workspaceSealed);
+		function overtaken(e: unknown): boolean {
+			return e instanceof McpInputsOvertakenError && e.name === 'McpInputsOvertakenError' && !e.message.includes('sealed0');
+		}
 
-				workspace.discardSealedSecrets();
-				assert.deepStrictEqual(await workspace.getMap(), { 'wPlain': { value: 'workspace-plain' } });
-				await testStorageService.flush();
-				const stored = JSON.parse(storedInputs(StorageScope.WORKSPACE)!);
-				assert.strictEqual(stored.secrets, undefined);
-				assert.strictEqual(stored.values.wPlain.value, 'workspace-plain');
-			});
+		test('(a) concurrent first unseals share one decrypt, and a concurrent setSecrets values survive in memory and after a flush and reopen', async () => {
+			const second = await reopenWithSealed();
+			const pause = pauseWebCrypto('decrypt');
+			try {
+				const pending = [second.setSecrets({ 'a': { value: 'valueA' } }), second.setSecrets({ 'b': { value: 'valueB' } }), second.getMap()];
+				await pause.reached();
+				assert.strictEqual(pause.calls, 1, 'one decrypt is shared by every concurrent caller');
+				pause.release();
+				await Promise.all(pending);
+			} finally {
+				pause.restore();
+			}
 
-			test('resetUnusableEncryptionKey never deletes a key that can be used', async () => {
-				const good = await newKeyText();
-				await secrets.set(keyName, good);
-				secrets.setCalls = 0;
-
-				await assert.rejects(createInstance(secrets, StorageScope.PROFILE).resetUnusableEncryptionKey(), /is a usable key; it is kept/);
-				assert.strictEqual(await secrets.get(keyName), good);
-				assert.strictEqual(secrets.deleteCalls, 0);
-				assert.strictEqual(secrets.setCalls, 0);
-			});
-
-			test('resetUnusableEncryptionKey leaves the key in place when this scope\'s record cannot be read', async () => {
-				testStorageService.store('mcpInputs', JSON.stringify({ ...JSON.parse(profileSealed), version: 2 }), StorageScope.PROFILE, StorageTarget.MACHINE);
-				const unreadable = storedInputs(StorageScope.PROFILE);
-
-				await assert.rejects(createInstance(secrets, StorageScope.PROFILE).resetUnusableEncryptionKey(), (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs');
-				assert.strictEqual(await secrets.get(keyName), notAKey);
-				assert.strictEqual(secrets.deleteCalls, 0);
-				assert.strictEqual(storedInputs(StorageScope.PROFILE), unreadable);
-			});
+			const expected = { 's0': { value: 'sealed0' }, 'a': { value: 'valueA' }, 'b': { value: 'valueB' } };
+			assert.deepStrictEqual(await second.getMap(), expected);
+			await testStorageService.flush();
+			assert.deepStrictEqual(await createInstance().getMap(), expected);
 		});
 
-		test('resetUnusableEncryptionKey with no stored key rejects: there is nothing to reset', async () => {
-			const secrets = new CountingSecretStorageService();
-			await assert.rejects(createInstance(secrets).resetUnusableEncryptionKey(), /does not exist/);
-			assert.strictEqual(secrets.deleteCalls, 0);
-			assert.strictEqual(secrets.setCalls, 0);
+		test('(a) a failed shared unseal rejects every caller, is not remembered, and a later read succeeds', async () => {
+			const second = await reopenWithSealed();
+			const wrongKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+			const goodKey = (await testSecretStorageService.get('mcpEncryptionKey'))!;
+			await testSecretStorageService.set('mcpEncryptionKey', JSON.stringify(await crypto.subtle.exportKey('jwk', wrongKey)));
+
+			await Promise.all([second.getMap(), second.setSecrets({ 'a': { value: 'valueA' } })].map(p => assert.rejects(p, (e: unknown) => e instanceof InvalidStoredSecretError && e.key === 'mcpInputs')));
+			await testSecretStorageService.set('mcpEncryptionKey', goodKey);
+			assert.strictEqual((await second.getMap()).s0.value, 'sealed0');
+		});
+
+		test('(b) clearAll during an in-flight unseal: getMap rejects named, and the cleared secrets are never returned', async () => {
+			const second = await reopenWithSealed();
+			const pause = pauseWebCrypto('decrypt');
+			try {
+				// The rejection is asserted below; it is held so that it is not reported unhandled meanwhile.
+				const outcome = second.getMap().then(() => undefined, e => e);
+				await pause.reached();
+				second.clearAll();
+				pause.release();
+				assert.ok(overtaken(await outcome), 'the overtaken getMap rejects with the named error');
+			} finally {
+				pause.restore();
+			}
+
+			assert.deepStrictEqual(await second.getMap(), {});
+			await testStorageService.flush();
+			assert.deepStrictEqual(await createInstance().getMap(), {});
+			assert.ok(!testStorageService.get('mcpInputs', StorageScope.APPLICATION)!.includes('"secrets"'));
+		});
+
+		test('(c) clearAll during an in-flight setSecrets: it rejects named, the new record stays empty after a flush and reopen, and a later setSecrets succeeds', async () => {
+			const second = await reopenWithSealed();
+			await second.getMap(); // unsealed; only the encryption of the next setSecrets is held
+			const pause = pauseWebCrypto('encrypt');
+			try {
+				const outcome = second.setSecrets({ 'k': { value: 'valueK' } }).then(() => undefined, e => e);
+				await pause.reached();
+				second.clearAll();
+				pause.release();
+				assert.ok(overtaken(await outcome), 'the overtaken setSecrets rejects with the named error');
+			} finally {
+				pause.restore();
+			}
+
+			assert.deepStrictEqual(await second.getMap(), {});
+			await testStorageService.flush();
+			assert.deepStrictEqual(await createInstance().getMap(), {});
+			assert.ok(!testStorageService.get('mcpInputs', StorageScope.APPLICATION)!.includes('"secrets"'));
+
+			await second.setSecrets({ 'n': { value: 'valueN' } });
+			assert.deepStrictEqual(await second.getMap(), { 'n': { value: 'valueN' } });
+			await testStorageService.flush();
+			assert.deepStrictEqual(await createInstance().getMap(), { 'n': { value: 'valueN' } });
+		});
+
+		test('clearAll during an in-flight clear rejects named and writes nothing into the new record', async () => {
+			const second = await reopenWithSealed();
+			await second.setPlainText({ 'p': { value: 'plain' } });
+			await second.getMap();
+			const pause = pauseWebCrypto('encrypt');
+			try {
+				const outcome = second.clear('s0').then(() => undefined, e => e);
+				await pause.reached();
+				second.clearAll();
+				pause.release();
+				assert.ok(overtaken(await outcome));
+			} finally {
+				pause.restore();
+			}
+			await testStorageService.flush();
+			assert.deepStrictEqual(await createInstance().getMap(), {});
 		});
 	});
 });
