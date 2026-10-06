@@ -140,7 +140,8 @@ export class EncryptionMainServiceWithElectron implements IEncryptionMainService
 				this.logService.trace('[EncryptionMainService] Selected storage backend: ', result);
 				return Promise.resolve(result);
 			} catch (e) {
-				this.logService.error(e);
+				// LOG-1: the class only; the caught error's message or stack never reaches a log line (F-PACK-13 check 7).
+				this.logService.error(`[EncryptionMainService] getSelectedStorageBackend failed (${errorClassOf(e)})`);
 			}
 		}
 		return Promise.resolve(KnownStorageProvider.unknown);

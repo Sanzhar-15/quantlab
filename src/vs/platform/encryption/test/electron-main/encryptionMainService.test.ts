@@ -6,6 +6,7 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
+import { isMacintosh, isWindows } from '../../../../base/common/platform.js';
 import { EncryptionKeychainError, EncryptionMainServiceWithElectron, IEncryptionApp, IEncryptionSafeStorage } from '../../electron-main/encryptionMainService.js';
 
 // Planted values: none of them may appear in any log line (LOG-1).
@@ -60,6 +61,10 @@ class StubSafeStorage implements IEncryptionSafeStorage {
 		this.enter('decryptString');
 		assert.strictEqual(encrypted.toString(), PLANTED_CIPHERTEXT);
 		return PLANTED_PLAINTEXT;
+	}
+	getSelectedStorageBackend(): string {
+		this.enter('getSelectedStorageBackend');
+		return 'basic_text';
 	}
 }
 
@@ -219,6 +224,15 @@ suite('EncryptionMainService (F-PACK-13 keychain lines, LOG-1)', () => {
 			`info: [EncryptionMainService] keychain: isEncryptionAvailable ${ITEM} failed (KeychainDeniedError)`,
 			'error: [EncryptionMainService] isEncryptionAvailable failed (KeychainDeniedError)',
 		]);
+		assertNoPlantedValueLogged(PLANTED_CREDENTIAL);
+	});
+
+	// getKeyStorageProvider reaches the backend call only off macOS and Windows (where it answers without a Keychain call).
+	(isMacintosh || isWindows ? test.skip : test)('a getSelectedStorageBackend failure logs the error class only, never its message or stack', async () => {
+		const denied = credentialBearing();
+		safeStorage.failWith = denied;
+		await service.getKeyStorageProvider();
+		assert.ok(logService.events.includes('error: [EncryptionMainService] getSelectedStorageBackend failed (KeychainDeniedError)'), logService.events.join('\n'));
 		assertNoPlantedValueLogged(PLANTED_CREDENTIAL);
 	});
 });
