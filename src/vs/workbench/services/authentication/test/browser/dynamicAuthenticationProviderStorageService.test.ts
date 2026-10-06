@@ -91,6 +91,8 @@ suite('DynamicAuthenticationProviderStorageService', () => {
 				assert.throws(() => service.getClientId('p1'), (error: unknown) => {
 					isNamedError(error);
 					assert.strictEqual((error as InvalidStoredProviderListError).reason, reason);
+					// The localized message (the English default here) carries the key and the reason through its placeholders.
+					assert.strictEqual((error as Error).message, `Stored dynamic authentication provider list '${PROVIDERS_STORAGE_KEY}' is invalid: ${reason}. It was left unchanged.`);
 					assert.ok(!(error as Error).message.includes(raw), 'error message holds the stored text');
 					return true;
 				});
