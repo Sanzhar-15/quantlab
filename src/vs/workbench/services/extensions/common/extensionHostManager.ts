@@ -29,7 +29,7 @@ import { IExtensionHostProxy, IResolveAuthorityResult } from './extensionHostPro
 import { ExtensionRunningLocation } from './extensionRunningLocation.js';
 import { ActivationKind, ExtensionActivationReason, ExtensionHostStartup, IExtensionHost, IExtensionInspectInfo, IInternalExtensionService } from './extensions.js';
 import { Proxied, ProxyIdentifier } from './proxyIdentifier.js';
-import { IRPCProtocolLogger, RPCProtocol, RequestInitiator, ResponsiveState } from './rpcProtocol.js';
+import { IRPCProtocolLogger, RPCPayloadShape, RPCProtocol, RequestInitiator, ResponsiveState } from './rpcProtocol.js';
 
 // Enable to see detailed message communication between window and extension host
 const LOG_EXTENSION_HOST_COMMUNICATION = false;
@@ -482,27 +482,7 @@ const colorTables = [
 	['#8B564C', '#E177C0', '#7F7F7F', '#BBBE3D', '#2EBECD']
 ];
 
-function prettyWithoutArrays(data: any): any {
-	if (Array.isArray(data)) {
-		return data;
-	}
-	if (data && typeof data === 'object' && typeof data.toString === 'function') {
-		const result = data.toString();
-		if (result !== '[object Object]') {
-			return result;
-		}
-	}
-	return data;
-}
-
-function pretty(data: any): any {
-	if (Array.isArray(data)) {
-		return data.map(prettyWithoutArrays);
-	}
-	return prettyWithoutArrays(data);
-}
-
-class RPCLogger implements IRPCProtocolLogger {
+export class RPCLogger implements IRPCProtocolLogger {
 
 	private _totalIncoming = 0;
 	private _totalOutgoing = 0;
@@ -511,29 +491,29 @@ class RPCLogger implements IRPCProtocolLogger {
 		private readonly _kind: ExtensionHostKind
 	) { }
 
-	private _log(direction: string, totalLength: number, msgLength: number, req: number, initiator: RequestInitiator, str: string, data: any): void {
-		data = pretty(data);
-
+	private _log(direction: string, totalLength: number, msgLength: number, req: number, initiator: RequestInitiator, str: string, shape: RPCPayloadShape | undefined): void {
 		const colorTable = colorTables[initiator];
 		const color = LOG_USE_COLORS ? colorTable[req % colorTable.length] : '#000000';
 		let args = [`%c[${extensionHostKindToString(this._kind)}][${direction}]%c[${String(totalLength).padStart(7)}]%c[len: ${String(msgLength).padStart(5)}]%c${String(req).padStart(5)} - ${str}`, 'color: darkgreen', 'color: grey', 'color: grey', `color: ${color}`];
 		if (/\($/.test(str)) {
-			args = args.concat(data);
+			if (shape) {
+				args = args.concat(shape);
+			}
 			args.push(')');
-		} else {
-			args.push(data);
+		} else if (shape) {
+			args.push(...shape);
 		}
 		console.log.apply(console, args as [string, ...string[]]);
 	}
 
-	logIncoming(msgLength: number, req: number, initiator: RequestInitiator, str: string, data?: any): void {
+	logIncoming(msgLength: number, req: number, initiator: RequestInitiator, str: string, shape?: RPCPayloadShape): void {
 		this._totalIncoming += msgLength;
-		this._log('Ext \u2192 Win', this._totalIncoming, msgLength, req, initiator, str, data);
+		this._log('Ext \u2192 Win', this._totalIncoming, msgLength, req, initiator, str, shape);
 	}
 
-	logOutgoing(msgLength: number, req: number, initiator: RequestInitiator, str: string, data?: any): void {
+	logOutgoing(msgLength: number, req: number, initiator: RequestInitiator, str: string, shape?: RPCPayloadShape): void {
 		this._totalOutgoing += msgLength;
-		this._log('Win \u2192 Ext', this._totalOutgoing, msgLength, req, initiator, str, data);
+		this._log('Win \u2192 Ext', this._totalOutgoing, msgLength, req, initiator, str, shape);
 	}
 }
 

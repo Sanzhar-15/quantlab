@@ -44,10 +44,19 @@ const PARSER_LEAK = 'MARK-PARSER-LEAK-e5f2';
 const URL_USERINFO = 'MARK-URL-USERINFO-c3d9';
 const URL_QUERY = 'MARK-URL-QUERY-f4a8';
 
+// Text of an error that comes back from another process over RPC: the message and a nested cause both quote a credential
+const RPC_PROMPT_ERROR = 'MARK-RPC-PROMPT-ERROR-d2a6';
+const RPC_PROMPT_CAUSE = 'MARK-RPC-PROMPT-CAUSE-1f8b';
+const RPC_URIWAIT_ERROR = 'MARK-RPC-URIWAIT-ERROR-93c4';
+const RPC_URIWAIT_CAUSE = 'MARK-RPC-URIWAIT-CAUSE-5e0a';
+
+// The stack of a cancellation that comes back from another process
+const RPC_CANCEL_STACK = 'MARK-RPC-CANCEL-STACK-7a9d';
+
 const ALL_MARKERS = [
 	CLIENT_SECRET, AUTH_CODE, PKCE_VERIFIER, DEVICE_CODE, ACCESS_TOKEN, REFRESH_TOKEN, ID_TOKEN,
 	STORED_ACCESS_TOKEN, STORED_REFRESH_TOKEN, NEW_CLIENT_SECRET, REGISTRATION_TOKEN, USER_CODE, PARSER_LEAK,
-	URL_USERINFO, URL_QUERY
+	URL_USERINFO, URL_QUERY, RPC_PROMPT_ERROR, RPC_PROMPT_CAUSE, RPC_URIWAIT_ERROR, RPC_URIWAIT_CAUSE, RPC_CANCEL_STACK
 ];
 
 // Credentials that can arrive in an `error` field, a reason phrase or a transport message
@@ -114,6 +123,8 @@ class TestProxy {
 	registrationPrompts = 0;
 	continueAnswer = true;
 	waitForUriHandlerError: unknown;
+	uriHandlerWaits = 0;
+	promptError: unknown;
 	deviceModalError: unknown;
 	continueError: unknown;
 	promptAnswer: { clientId: string; clientSecret?: string } | undefined;
@@ -123,6 +134,7 @@ class TestProxy {
 		this.persisted.push(sessions);
 	}
 	async $waitForUriHandler(): Promise<unknown> {
+		this.uriHandlerWaits++;
 		if (this.waitForUriHandlerError) {
 			throw this.waitForUriHandlerError;
 		}
@@ -144,6 +156,9 @@ class TestProxy {
 	}
 	async $promptForClientRegistration(): Promise<{ clientId: string; clientSecret?: string } | undefined> {
 		this.registrationPrompts++;
+		if (this.promptError) {
+			throw this.promptError;
+		}
 		return this.promptAnswer;
 	}
 	async $registerDynamicAuthenticationProvider(): Promise<void> { }
@@ -220,15 +235,16 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 		return respond(status, JSON.stringify(body));
 	}
 
-	function createProvider(options: { initialTokens?: any[]; metadata?: Partial<IAuthorizationServerMetadata>; createAppUriError?: unknown; openUriError?: unknown; progressErrors?: unknown[]; authorizationServer?: URI } = {}) {
+	function createProvider(options: { initialTokens?: any[]; metadata?: Partial<IAuthorizationServerMetadata>; createAppUriError?: unknown; openUriError?: unknown; progressErrors?: unknown[]; authorizationServer?: URI; isRemote?: boolean; onOpenUri?: (url: string) => Promise<void> } = {}) {
 		const logger = store.add(new RecordingLogger());
 		const proxy = new TestProxy();
 		const loggerService = { createLogger: () => logger } as unknown as ILoggerService;
 		const extHostWindow = {
-			openUri: async () => {
+			openUri: async (url: string) => {
 				if (options.openUriError) {
 					throw options.openUriError;
 				}
+				await options.onOpenUri?.(url);
 				return true;
 			}
 		} as unknown as IExtHostWindow;
@@ -242,7 +258,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 		} as unknown as IExtHostUrlsService;
 		const initData = {
 			environment: { appUriScheme: 'vscode', appName: 'Test' },
-			remote: { isRemote: true }
+			remote: { isRemote: options.isRemote !== false }
 		} as unknown as IExtHostInitDataService;
 		const progress = {
 			withProgressFromSource: async (_source: unknown, _options: unknown, task: (progress: { report(): void }, token: CancellationToken) => Thenable<unknown>) => {
@@ -1194,6 +1210,104 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 	suite('every await in a create flow is a boundary: upstream text never reaches a log or an error', () => {
 		const upstream = (marker: string) => new Error(`upstream ${marker}`, { cause: new Error(`cause ${marker}`) });
 
+		// The two shapes of a cancellation that arrives over RPC: a decoded plain Error with the fixed name and message, and a
+		// CancellationError. Both carry a marker in the stack.
+		function receivedCancellations(): { label: string; error: Error }[] {
+			const decoded = new Error('Canceled');
+			decoded.name = 'Canceled';
+			decoded.stack = `Canceled: Canceled\n    at ${RPC_CANCEL_STACK}`;
+			const cancellation = new CancellationError();
+			cancellation.stack = `Canceled: Canceled\n    at ${RPC_CANCEL_STACK}`;
+			return [{ label: 'a decoded Error named Canceled', error: decoded }, { label: 'a CancellationError', error: cancellation }];
+		}
+
+		/** A cancellation is still a cancellation, but it is a fresh error that carries nothing of the received one */
+		function assertFreshCancellation(result: Error, received: Error, logger: RecordingLogger, label: string): void {
+			assert.ok(isCancellationError(result), `${label}: expected a cancellation, got ${result.message}`);
+			assert.notStrictEqual(result, received, `${label}: the received error was rethrown`);
+			assert.strictEqual(result.cause, undefined, `${label}: a cause was carried`);
+			assert.deepStrictEqual(findMarkers(result), [], `${label}: a marker is in the error`);
+			assert.ok(!(result.stack ?? '').includes(RPC_CANCEL_STACK), `${label}: the received stack was carried`);
+			assert.deepStrictEqual(Object.getOwnPropertyNames(result).filter(name => !['stack', 'message'].includes(name)).sort(), ['name'], `${label}: unexpected own properties`);
+			assert.deepStrictEqual(findMarkers(logger.records), [], `${label}: a marker is in a log argument`);
+		}
+
+		const boundaries: { label: string; run: (received: Error) => Promise<{ error: Error; logger: RecordingLogger }> }[] = [
+			{
+				label: 'common: $promptForClientRegistration',
+				run: async received => {
+					const logger = store.add(new RecordingLogger());
+					const proxy = new TestProxy();
+					proxy.promptError = received;
+					const loggerService = { createLogger: () => logger } as unknown as ILoggerService;
+					const initData = { environment: { appUriScheme: 'vscode', appName: 'Test' }, remote: { isRemote: true } } as unknown as IExtHostInitDataService;
+					const progress = { withProgressFromSource: async (_s: unknown, _o: unknown, task: (p: { report(): void }, t: CancellationToken) => Thenable<unknown>) => task({ report: () => undefined }, CancellationToken.None) } as unknown as IExtHostProgress;
+					const extHostAuthentication = new NodeExtHostAuthentication({ getProxy: () => proxy } as never, initData, { openUri: async () => true } as unknown as IExtHostWindow, {} as IExtHostUrlsService, progress, loggerService, logger as unknown as ILogService);
+					fetchQueue.push(rejectTransport(ACCESS_TOKEN));
+					const issuer = { scheme: 'https', authority: 'auth.example.com', path: '', query: '', fragment: '' };
+					const metadata: IAuthorizationServerMetadata = { issuer: AUTH_SERVER, token_endpoint: TOKEN_ENDPOINT, registration_endpoint: REGISTRATION_ENDPOINT, response_types_supported: ['code'] };
+					return { error: await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuer, metadata, undefined, undefined, undefined, undefined)), logger };
+				}
+			},
+			{
+				label: 'common: $showContinueNotification',
+				run: async received => {
+					const { provider, logger, proxy } = createProvider();
+					proxy.continueError = received;
+					fetchQueue.push(respondJson(400, { error: 'invalid_grant' }));
+					return { error: await rejection(provider.createSession(['read'], {})), logger };
+				}
+			},
+			{
+				label: 'common: the browser opening (URL handler flow)',
+				run: async received => {
+					const { provider, logger } = createProvider({ openUriError: received });
+					return { error: await rejection(provider.runFlow(0)), logger };
+				}
+			},
+			{
+				label: 'common: $waitForUriHandler (redirect wait)',
+				run: async received => {
+					const { provider, logger, proxy } = createProvider();
+					proxy.waitForUriHandlerError = received;
+					return { error: await rejection(provider.runFlow(0)), logger };
+				}
+			},
+			{
+				label: 'node: the browser opening (loopback flow)',
+				run: async received => {
+					const { provider, logger } = createProvider({ isRemote: false, openUriError: received });
+					return { error: await rejection(provider.runFlow(0)), logger };
+				}
+			},
+			{
+				label: 'node: $showDeviceCodeModal',
+				run: async received => {
+					const { provider, logger, proxy } = createProvider();
+					proxy.deviceModalError = received;
+					fetchQueue.push(respondJson(200, deviceBody));
+					return { error: await rejection(provider.runFlow(1)), logger };
+				}
+			}
+		];
+
+		for (const { label, run } of boundaries) {
+			test(`${label}: a received cancellation is replaced by a fresh CancellationError`, async () => {
+				for (const received of receivedCancellations()) {
+					fetchQueue.length = 0;
+					const { error, logger } = await run(received.error);
+					assertFreshCancellation(error, received.error, logger, `${label} / ${received.label}`);
+				}
+			});
+		}
+
+		test('the cancellation check itself sees a marker in a received cancellation', () => {
+			for (const received of receivedCancellations()) {
+				assert.ok(isCancellationError(received.error));
+				assert.deepStrictEqual(findMarkers(received.error), [RPC_CANCEL_STACK]);
+			}
+		});
+
 		test('the browser cannot be opened (URL handler flow): a fresh error without the upstream text', async () => {
 			const { provider, logger } = createProvider({ openUriError: upstream(ACCESS_TOKEN) });
 
@@ -1404,6 +1518,94 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			await rejection(ctx.provider.refresh(STORED_REFRESH_TOKEN));
 			assert.deepStrictEqual(findMarkers(ctx.logger.records), []);
 			assert.ok(ctx.logger.messages('info').includes('User provided client ID'), ctx.logger.messages('info').join('\n'));
+		});
+
+		suite('a rejected UI RPC is replaced by a fresh error or logged with fixed text (the text and causes come from another process)', () => {
+			const hostileError = (marker: string, causeMarker: string) => new Error(`rpc ${marker}`, { cause: new Error(`cause ${causeMarker}`, { cause: new Error(`root cause ${causeMarker}`) }) });
+
+			test('initial registration: a rejected $promptForClientRegistration becomes a fresh fixed error without a cause', async () => {
+				const logger = store.add(new RecordingLogger());
+				const proxy = new TestProxy();
+				proxy.promptError = hostileError(RPC_PROMPT_ERROR, RPC_PROMPT_CAUSE);
+				const extHostAuthentication = createExtHostAuthentication(logger, proxy);
+				fetchQueue.push(rejectTransport(ACCESS_TOKEN));
+
+				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+
+				assert.strictEqual(proxy.registrationPrompts, 1);
+				assert.strictEqual(error.message, 'Failed to prompt for client registration details');
+				assert.strictEqual(error.cause, undefined);
+				assert.deepStrictEqual(findMarkers(error), []);
+				assert.ok(logger.records.length >= 2);
+				assert.deepStrictEqual(findMarkers(logger.records), []);
+			});
+
+			test('initial registration: a cancelled prompt stays a cancellation', async () => {
+				const logger = store.add(new RecordingLogger());
+				const proxy = new TestProxy();
+				proxy.promptError = new CancellationError();
+				const extHostAuthentication = createExtHostAuthentication(logger, proxy);
+				fetchQueue.push(rejectTransport(ACCESS_TOKEN));
+
+				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+
+				assert.ok(isCancellationError(error), `expected a cancellation, got ${error.message}`);
+			});
+
+			/**
+			 * A full loopback exchange: the browser is opened (the mock requests the redirect URI with a code), the code is
+			 * exchanged for tokens. The auxiliary $waitForUriHandler call rejects.
+			 */
+			async function loopbackExchangeWithRejectedUriHandler(uriHandlerError: unknown) {
+				const unhandled: unknown[] = [];
+				const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+				process.on('unhandledRejection', onUnhandled);
+				try {
+					const ctx = createProvider({
+						isRemote: false,
+						onOpenUri: async url => {
+							const authorizationUrl = new URL(url);
+							const redirectUri = authorizationUrl.searchParams.get('redirect_uri');
+							const state = authorizationUrl.searchParams.get('state');
+							assert.ok(redirectUri && state, 'the authorization URL carries the loopback redirect and the state');
+							await new Promise<void>((resolve, reject) => {
+								http.get(`${redirectUri}?code=${encodeURIComponent(AUTH_CODE)}&state=${encodeURIComponent(state)}`, { agent: false }, res => { res.resume(); res.on('end', resolve); }).on('error', reject);
+							});
+						}
+					});
+					ctx.proxy.waitForUriHandlerError = uriHandlerError;
+					fetchQueue.push(respondJson(200, tokenBody));
+
+					const result = await ctx.provider.runFlow(0);
+
+					// the unhandled rejection event is dispatched after the microtask queue drains
+					await new Promise<void>(resolve => setImmediate(resolve));
+					await new Promise<void>(resolve => setImmediate(resolve));
+					return { ctx, result, unhandled };
+				} finally {
+					process.off('unhandledRejection', onUnhandled);
+				}
+			}
+
+			test('loopback flow: a rejected $waitForUriHandler leaves the exchange complete, nothing unhandled, only fixed text logged', async () => {
+				const { ctx, result, unhandled } = await loopbackExchangeWithRejectedUriHandler(hostileError(RPC_URIWAIT_ERROR, RPC_URIWAIT_CAUSE));
+
+				assert.strictEqual(ctx.proxy.uriHandlerWaits, 1);
+				assert.strictEqual(result.access_token, ACCESS_TOKEN, 'the flow still completes with the token');
+				assert.deepStrictEqual(unhandled.map(reason => collectStrings(reason).join(' ')), [], 'a rejection was left unhandled');
+				assert.deepStrictEqual(ctx.logger.messages('warn'), ['The URI handler wait failed; the loopback redirect is not affected.']);
+				assertClean(ctx.logger);
+			});
+
+			test('loopback flow: a cancelled $waitForUriHandler leaves the exchange complete, nothing unhandled, fixed text only', async () => {
+				const { ctx, result, unhandled } = await loopbackExchangeWithRejectedUriHandler(new CancellationError());
+
+				assert.strictEqual(result.access_token, ACCESS_TOKEN);
+				assert.deepStrictEqual(unhandled, []);
+				assert.deepStrictEqual(ctx.logger.messages('warn'), []);
+				assert.ok(ctx.logger.messages('trace').includes('The URI handler wait was cancelled.'), ctx.logger.messages('trace').join('\n'));
+				assertClean(ctx.logger);
+			});
 		});
 	});
 
