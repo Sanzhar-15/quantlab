@@ -52,11 +52,19 @@ function seedText(): string {
  * than "it already exists": nothing is defaulted and nothing is retried.
  */
 export async function seedQlChromeSettings(settingsResource: URI, logService: ILogService): Promise<QlChromeSeedOutcome> {
-	if (settingsResource.scheme !== Schemas.file) {
-		throw new Error(`QuantLab host (U6): chrome seed: the default profile's settings resource ${settingsResource.toString()} is not a file: resource`);
+	// The default profile's `settingsResource` is a `vscode-userdata:` URI (main.ts registers FileUserDataProvider over the disk
+	// provider with the SAME path, scheme swapped), so it is read as that file. Any other scheme is an error, not a default
+	// (package 5b, folds/HOST/U5-LAUNCH-2.md: the `file:`-only check killed every launch before a window).
+	let fileResource: URI;
+	if (settingsResource.scheme === Schemas.file) {
+		fileResource = settingsResource;
+	} else if (settingsResource.scheme === Schemas.vscodeUserData) {
+		fileResource = settingsResource.with({ scheme: Schemas.file });
+	} else {
+		throw new Error(`QuantLab host (U6): chrome seed: the default profile's settings resource ${settingsResource.toString()} is neither a file: nor a vscode-userdata: resource`);
 	}
 
-	const file = settingsResource.fsPath;
+	const file = fileResource.fsPath;
 	await promises.mkdir(dirname(file), { recursive: true });
 
 	try {
