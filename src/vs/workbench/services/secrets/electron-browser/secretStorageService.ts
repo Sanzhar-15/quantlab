@@ -38,13 +38,14 @@ export class NativeSecretStorageService extends BaseSecretStorageService {
 		);
 	}
 
-	override async set(key: string, value: string): Promise<void> {
-		// Queued before the write on the same key, so a choice made in the notification (such as "Use weaker
-		// encryption", which reinitializes) applies to this write. When encryption stays unavailable the write
-		// rejects with SecretStorageUnavailableError; a failed notification rejects the set as well.
-		const notified = this._sequencer.queue(key, () => this.notifyIfEncryptionUnavailable());
-		const stored = super.set(key, value);
-		await Promise.all([notified, stored]);
+	override set(key: string, value: string): Promise<void> {
+		// One sequenced operation: the notification, then the write. A choice made in the notification (such as "Use
+		// weaker encryption", which reinitializes) applies to this write; a failed notification aborts it, so a rejected
+		// set never writes. When encryption stays unavailable the write rejects with SecretStorageUnavailableError.
+		return this._sequencer.queue(key, async () => {
+			await this.notifyIfEncryptionUnavailable();
+			await this.writeUnqueued(key, value);
+		});
 	}
 
 	private async notifyIfEncryptionUnavailable(): Promise<void> {

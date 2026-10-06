@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import * as sinon from 'sinon';
 import { isLinux } from '../../../../../base/common/platform.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
@@ -32,7 +33,7 @@ class TestEncryptionService implements IEncryptionService {
 suite('NativeSecretStorageService, encryption not available', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	function createService(pressUseWeakerEncryption: boolean) {
+	function createService(pressUseWeakerEncryption: boolean, argvWriteFails: boolean) {
 		const encryptionService = new TestEncryptionService();
 		const storageService = store.add(new InMemoryStorageService());
 		const shown = { dialogs: 0, notifications: 0, argvWrites: 0 };
@@ -53,7 +54,14 @@ suite('NativeSecretStorageService, encryption not available', () => {
 				return undefined;
 			}
 		} as unknown as INotificationService;
-		const jsonEditingService = { async write() { shown.argvWrites++; } } as unknown as IJSONEditingService;
+		const jsonEditingService = {
+			async write() {
+				shown.argvWrites++;
+				if (argvWriteFails) {
+					throw new Error('argv denied');
+				}
+			}
+		} as unknown as IJSONEditingService;
 		const environmentService = { useInMemorySecretStorage: false, argvResource: URI.file('/argv.json') } as unknown as INativeEnvironmentService;
 		const service = store.add(new NativeSecretStorageService(
 			notificationService,
@@ -66,11 +74,11 @@ suite('NativeSecretStorageService, encryption not available', () => {
 			store.add(new NullLogService())
 		));
 		const secretKeys = () => storageService.keys(StorageScope.APPLICATION, StorageTarget.MACHINE).filter(key => key.startsWith('secret://'));
-		return { service, shown, secretKeys, storageService };
+		return { service, shown, secretKeys, storageService, encryptionService };
 	}
 
 	test('set rejects named, the notification is shown once, and nothing is stored', async () => {
-		const { service, shown, secretKeys } = createService(false);
+		const { service, shown, secretKeys } = createService(false, false);
 
 		await assert.rejects(service.set('my-secret', 'my-secret-value'), (e: unknown) => e instanceof SecretStorageUnavailableError);
 		await assert.rejects(service.set('my-secret', 'my-secret-value'), (e: unknown) => e instanceof SecretStorageUnavailableError);
@@ -81,7 +89,7 @@ suite('NativeSecretStorageService, encryption not available', () => {
 	});
 
 	(isLinux ? test : test.skip)('Linux: "Use weaker encryption" reinitializes and the pending write is persisted', async () => {
-		const { service, shown, storageService } = createService(true);
+		const { service, shown, storageService } = createService(true, false);
 
 		await service.set('my-secret', 'my-secret-value');
 
@@ -90,5 +98,31 @@ suite('NativeSecretStorageService, encryption not available', () => {
 		assert.strictEqual(service.type, 'persisted');
 		assert.strictEqual(storageService.get('secret://my-secret', StorageScope.APPLICATION), 'encrypted+my-secret-value');
 		assert.strictEqual(await service.get('my-secret'), 'my-secret-value');
+	});
+
+	// review-c1 MUST-4: the notification and the write are one sequenced operation.
+	(isLinux ? test : test.skip)('Linux: a failed "Use weaker encryption" (argv not writable) rejects the set and writes nothing', async () => {
+		const { service, storageService } = createService(true, true);
+		storageService.store('secret://my-secret', 'encrypted+old', StorageScope.APPLICATION, StorageTarget.MACHINE);
+		const storeSpy = sinon.spy(storageService, 'store');
+
+		await assert.rejects(service.set('my-secret', 'new'), /argv denied/);
+		// A read on the same key runs after anything the rejected set still had queued.
+		assert.strictEqual(await service.get('my-secret'), 'old');
+
+		assert.strictEqual(storeSpy.callCount, 0, 'no write after the failed notification');
+		assert.strictEqual(storageService.get('secret://my-secret', StorageScope.APPLICATION), 'encrypted+old');
+		storeSpy.restore();
+	});
+
+	test('same-key order is kept: a get queued after a set reads its value', async () => {
+		const { service, encryptionService } = createService(false, false);
+		encryptionService.available = true;
+
+		const set = service.set('my-secret', 'my-secret-value');
+		const get = service.get('my-secret');
+
+		await set;
+		assert.strictEqual(await get, 'my-secret-value');
 	});
 });
