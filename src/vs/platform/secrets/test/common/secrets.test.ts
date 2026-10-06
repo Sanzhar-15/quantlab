@@ -9,7 +9,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { IEncryptionService, KnownStorageProvider } from '../../../encryption/common/encryptionService.js';
 import { transformErrorForSerialization } from '../../../../base/common/errors.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { BaseSecretStorageService, SecretDecryptionCause, SecretDecryptionError } from '../../common/secrets.js';
+import { BaseSecretStorageService, SecretDecryptionCause, SecretDecryptionError, SecretEncryptionCause, SecretEncryptionError } from '../../common/secrets.js';
 import { InMemoryStorageService, StorageScope, StorageTarget } from '../../../storage/common/storage.js';
 
 class TestEncryptionService implements IEncryptionService {
@@ -195,6 +195,106 @@ suite('secrets', () => {
 
 			decrypt.restore();
 			assert.strictEqual(await service.get('my-secret'), 'my-secret-value');
+		});
+	});
+
+	// F-SECRETS-7: a failed encrypt is logged and rejected as a named error that carries the key and the failure class only.
+	suite('BaseSecretStorageService useInMemoryStorage=false, encrypt fails', () => {
+		const marker = 'PLANTED-SECRET-VALUE-MARKER';
+
+		/** Every string an observer can read out of a value, at any depth: own properties, message, stack, cause chain. */
+		function deepText(value: unknown, seen: Set<unknown> = new Set()): string {
+			if (typeof value === 'string') {
+				return value;
+			}
+			if (typeof value !== 'object' || value === null) {
+				return String(value);
+			}
+			if (seen.has(value)) {
+				return '';
+			}
+			seen.add(value);
+			const parts: string[] = [];
+			if (value instanceof Error) {
+				parts.push(value.name, value.message, String(value.stack));
+			}
+			for (const name of Object.getOwnPropertyNames(value)) {
+				parts.push(name, deepText((value as Record<string, unknown>)[name], seen));
+			}
+			return parts.join('\n');
+		}
+
+		/** Records every argument of every log call, of any level. */
+		class CapturingLogService extends NullLogService {
+			readonly calls: unknown[][] = [];
+			override trace(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+			override debug(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+			override info(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+			override warn(message: string, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+			override error(message: string | Error, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+			override critical(message: string | Error, ...args: unknown[]): void { this.calls.push([message, ...args]); }
+		}
+
+		async function failingSet(failure: unknown) {
+			const encryptionService = new TestEncryptionService();
+			sinon.stub(encryptionService, 'encrypt').callsFake(() => Promise.reject(failure));
+			const storageService = store.add(new InMemoryStorageService());
+			const logService = store.add(new CapturingLogService());
+			const service = store.add(new BaseSecretStorageService(false, storageService, encryptionService, logService));
+			let rejection: unknown;
+			try {
+				await service.set('my-secret', 'my-secret-value');
+			} catch (e) {
+				rejection = e;
+			}
+			return { service, storageService, logService, rejection };
+		}
+
+		test('rejects a named error that names the key; the marker is in no log argument, message, stack or cause; nothing is stored', async () => {
+			const failure = new Error(`encrypt denied ${marker}`, { cause: new Error(`nested ${marker}`, { cause: marker }) });
+			failure.stack = `Error: encrypt denied ${marker}\n    at ${marker}`;
+			const { service, storageService, logService, rejection } = await failingSet(failure);
+
+			assert.ok(rejection instanceof SecretEncryptionError, String(rejection));
+			assert.notStrictEqual(rejection, failure);
+			assert.strictEqual(rejection.name, 'SecretEncryptionError');
+			assert.strictEqual(rejection.key, 'my-secret');
+			assert.strictEqual(rejection.message, `The secret 'my-secret' could not be encrypted; nothing was stored.`);
+			assert.ok(rejection.cause instanceof SecretEncryptionCause);
+			assert.strictEqual((rejection.cause as SecretEncryptionCause).kind, 'Error');
+			assert.strictEqual((rejection.cause as SecretEncryptionCause).cause, undefined);
+			assert.ok(!deepText(rejection).includes(marker));
+			assert.ok(!JSON.stringify(transformErrorForSerialization(rejection)).includes(marker));
+
+			assert.ok(logService.calls.some(args => args.some(arg => arg instanceof SecretEncryptionError)), 'the failure is logged');
+			for (const args of logService.calls) {
+				assert.ok(!deepText(args).includes(marker), deepText(args));
+				assert.ok(!args.includes(failure), 'the raw error is not a log argument');
+			}
+
+			assert.strictEqual(storageService.get('secret://my-secret', StorageScope.APPLICATION), undefined);
+			assert.deepStrictEqual(await service.keys(), []);
+		});
+
+		test('the cause names the class of the failure; a name that is not a plain identifier, or a failure that is not an error, names no kind', async () => {
+			const denied = new Error(`denied ${marker}`);
+			denied.name = 'KeychainDeniedError';
+			const named = new Error('x');
+			named.name = `${marker} with spaces`;
+			const expected: [unknown, string][] = [[denied, 'KeychainDeniedError'], [named, 'unknown'], [marker, 'unknown'], [{ message: marker }, 'unknown'], [null, 'unknown']];
+			for (const [failure, kind] of expected) {
+				const { logService, rejection } = await failingSet(failure);
+				assert.ok(rejection instanceof SecretEncryptionError);
+				assert.strictEqual((rejection.cause as SecretEncryptionCause).kind, kind);
+				assert.ok(!deepText(rejection).includes(marker));
+				assert.ok(!deepText(logService.calls).includes(marker));
+			}
+		});
+
+		test('an error built without a failure has no cause', () => {
+			const error = new SecretEncryptionError('my-secret');
+			assert.strictEqual(error.cause, undefined);
+			assert.strictEqual(error.name, 'SecretEncryptionError');
 		});
 	});
 

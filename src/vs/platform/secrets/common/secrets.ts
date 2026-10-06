@@ -14,12 +14,17 @@ import { Lazy } from '../../../base/common/lazy.js';
 
 export const ISecretStorageService = createDecorator<ISecretStorageService>('secretStorageService');
 
+/** The class name of a failure when it is a plain identifier, otherwise 'unknown'. Nothing else of a failure is ever kept. */
+function plainFailureClass(failureClass: string | undefined): string {
+	return typeof failureClass === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(failureClass) ? failureClass : 'unknown';
+}
+
 /** The only cause a SecretDecryptionError carries: it names the class of the failure and nothing of its content. */
 export class SecretDecryptionCause extends Error {
 	override readonly name = 'SecretDecryptionCause';
 	readonly kind: string;
-	constructor(failure: unknown) {
-		const kind = failure instanceof Error && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(failure.name) ? failure.name : 'unknown';
+	constructor(failureClass: string) {
+		const kind = plainFailureClass(failureClass);
 		super(`The encryption service failed (${kind}).`);
 		this.kind = kind;
 	}
@@ -30,17 +35,42 @@ export class SecretDecryptionCause extends Error {
  * value is kept: a later read can succeed, and only an explicit act of the user removes a stored secret.
  *
  * Safe by construction: the error from the encryption layer can carry the encrypted value or the text of a parse
- * error, and a cause survives RPC serialization and logs, so it is never carried. The cause is a new error that names
- * only the class of the failure.
+ * error, and a cause survives RPC serialization and logs, so it is never carried, and never passed in. The caller
+ * passes the class name of the failure (a string); the cause is a new error that names only that class.
  */
 export class SecretDecryptionError extends Error {
 	override readonly name = 'SecretDecryptionError';
 	/**
-	 * @param failure what the encryption layer threw. Only the name of its class is kept, and only when it is a plain
-	 * identifier; nothing else of it, so neither its message nor its stack nor its own cause.
+	 * @param failureClass the class name of what the encryption layer threw. It is kept only when it is a plain
+	 * identifier, otherwise the kind is 'unknown'; nothing else of the failure is ever known here.
 	 */
-	constructor(readonly key: string, failure?: unknown) {
-		super(`The stored secret '${key}' could not be decrypted; it is kept.`, failure === undefined ? undefined : { cause: new SecretDecryptionCause(failure) });
+	constructor(readonly key: string, failureClass?: string) {
+		super(`The stored secret '${key}' could not be decrypted; it is kept.`, failureClass === undefined ? undefined : { cause: new SecretDecryptionCause(failureClass) });
+	}
+}
+
+/** The only cause a SecretEncryptionError carries: it names the class of the failure and nothing of its content. */
+export class SecretEncryptionCause extends Error {
+	override readonly name = 'SecretEncryptionCause';
+	readonly kind: string;
+	constructor(failureClass: string) {
+		const kind = plainFailureClass(failureClass);
+		super(`The encryption service failed (${kind}).`);
+		this.kind = kind;
+	}
+}
+
+/**
+ * A secret could not be encrypted, so nothing was stored under its key. Safe by construction like
+ * SecretDecryptionError: the error from the encryption layer is never carried, only the name of its class.
+ */
+export class SecretEncryptionError extends Error {
+	override readonly name = 'SecretEncryptionError';
+	/**
+	 * @param failureClass the class name of what the encryption layer threw; kept only when it is a plain identifier.
+	 */
+	constructor(readonly key: string, failureClass?: string) {
+		super(`The secret '${key}' could not be encrypted; nothing was stored.`, failureClass === undefined ? undefined : { cause: new SecretEncryptionCause(failureClass) });
 	}
 }
 
@@ -126,7 +156,9 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 				this._logService.trace('[secrets] decrypted secret for key:', fullKey);
 				return result;
 			} catch (e) {
-				const error = new SecretDecryptionError(key, e);
+				// Only the class of the failure is read from it: its message and stack can carry the encrypted value.
+				const failureClass = e instanceof Error ? e.name : 'unknown';
+				const error = new SecretDecryptionError(key, failureClass);
 				this._logService.error(error);
 				throw error;
 			}
@@ -145,8 +177,11 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 					? value
 					: await this._encryptionService.encrypt(value);
 			} catch (e) {
-				this._logService.error(e);
-				throw e;
+				// Only the class of the failure is read from it: its message and stack can carry the secret value.
+				const failureClass = e instanceof Error ? e.name : 'unknown';
+				const error = new SecretEncryptionError(key, failureClass);
+				this._logService.error(error);
+				throw error;
 			}
 			const fullKey = this.getKey(key);
 			this._logService.trace('[secrets] storing encrypted secret for key:', fullKey);

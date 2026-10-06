@@ -177,7 +177,7 @@ suite('Authentication - callers of a stored read that rejects', () => {
 				denied = true;
 				override async get(key: string): Promise<string | undefined> {
 					if (this.denied && key === sessionsKey) {
-						throw new SecretDecryptionError(key, new Error(marker));
+						throw new SecretDecryptionError(key, marker) /* not a plain identifier: dropped to kind unknown, so the marker assertions below stay meaningful */;
 					}
 					return super.get(key);
 				}
@@ -319,7 +319,7 @@ suite('Authentication - callers of a stored read that rejects', () => {
 				async () => {
 					reads.count++;
 					if (reads.fail) {
-						throw new SecretDecryptionError(loginKey, new Error(marker));
+						throw new SecretDecryptionError(loginKey, marker) /* not a plain identifier: dropped to kind unknown */;
 					}
 					return protectedSession;
 				},
