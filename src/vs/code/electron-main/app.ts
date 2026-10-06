@@ -1432,10 +1432,15 @@ export class CodeApplication extends Disposable {
 			if (!terminalView) {
 				throw new Error('QuantLab host (DRIVER): the started host registered no terminal view');
 			}
+			// `ql-test:toggle` is the toggle key's own path (`view-switch start` / `done` in the host log, which PERF's SW-1 reads),
+			// for the same reason: no injected key reaches the key watch. It is watched on the terminal page only.
 			terminalView.webContents.on('console-message', event => {
 				if (event.message === 'ql-test:show-workbench') {
 					this.logService.info('QuantLab host: test build: workbench requested by the test driver');
 					qlWorkbenchHost.requestWorkbench('test driver');
+				} else if (event.message === 'ql-test:toggle') {
+					this.logService.info('QuantLab host: test build: toggle requested by the test driver');
+					qlWorkbenchHost.requestToggle('test driver toggle');
 				}
 			});
 		}

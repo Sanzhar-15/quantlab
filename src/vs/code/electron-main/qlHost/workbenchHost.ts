@@ -247,6 +247,11 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		host.log(`view-switch done to=${to} t=${Date.now()}`);
 	}
 
+	/** The toggle for a caller with nobody to tell about a failure (the toggle key; a test build's driver request): a failure is reported as the key's is. */
+	requestToggle(cause: string): void {
+		this.toggle().catch(error => this.reportFailure(cause, error));
+	}
+
 	/** A request that wants the workbench on screen and has nobody to tell about a failure (launch arguments, the gate's open requests). */
 	requestWorkbench(cause: string): void {
 		this.showWorkbench(cause).catch(error => this.reportFailure(cause, error));
@@ -299,7 +304,7 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 					return;
 				}
 
-				this.toggle().catch(error => this.reportFailure('toggle key', error));
+				this.requestToggle('toggle key');
 
 				return;
 			}
