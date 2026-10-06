@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { timeout } from '../../../../../base/common/async.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { TestSecretStorageService } from '../../../../../platform/secrets/test/common/testSecretStorageService.js';
@@ -13,10 +14,45 @@ import { DynamicAuthenticationProviderStorageService, InvalidStoredProviderListE
 
 const PROVIDERS_STORAGE_KEY = 'dynamicAuthProviders';
 
+/** Independent credential markers: none may reach a log argument or a propagated error, whole or alone. */
+const LIST_MARKER = 'mkr-list-7c3e';
+const CREDENTIAL_MARKER = 'mkr-cred-2b9d';
+const SESSION_MARKER = 'mkr-sess-5f1a';
+const MARKERS = [LIST_MARKER, CREDENTIAL_MARKER, SESSION_MARKER];
+
+const CREDENTIALS_KEY = 'dynamicAuthProvider:clientRegistration:p1';
+const CREDENTIALS_VALUE = JSON.stringify({ clientId: 'client-1', clientSecret: CREDENTIAL_MARKER });
+const SESSIONS_KEY = JSON.stringify({ isDynamicAuthProvider: true, authProviderId: 'p1', clientId: 'client-1' });
+const SESSIONS_VALUE = JSON.stringify([{ access_token: SESSION_MARKER, token_type: 'Bearer', created_at: 1 }]);
+
+/** Every text an error carries: message, stack, cause chain and own properties. */
+function errorTexts(error: unknown): string[] {
+	if (!(error instanceof Error)) {
+		return [String(error), String(JSON.stringify(error))];
+	}
+	const texts = [error.message, String(error.stack), JSON.stringify(error)];
+	if (error.cause !== undefined) {
+		texts.push(...errorTexts(error.cause));
+	}
+	return texts;
+}
+
+function argumentTexts(arg: unknown): string[] {
+	if (typeof arg === 'string') {
+		return [arg];
+	}
+	return arg instanceof Error ? errorTexts(arg) : [String(arg), String(JSON.stringify(arg))];
+}
+
 class RecordingLogService extends NullLogService {
 	readonly lines: string[] = [];
 	readonly errors: string[] = [];
+	/** Each logged argument (message included) on its own, at every level. */
+	readonly argumentTexts: string[] = [];
 	private record(level: string, message: string | Error, args: unknown[]): string {
+		for (const arg of [message, ...args]) {
+			this.argumentTexts.push(...argumentTexts(arg));
+		}
 		const line = [level, String(message), ...args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg))].join(' ');
 		this.lines.push(line);
 		return line;
@@ -29,17 +65,43 @@ class RecordingLogService extends NullLogService {
 	override critical(message: string | Error, ...args: unknown[]): void { this.record('critical', message, args); }
 }
 
+/** Records every store and remove, whatever the key or bytes. */
+class RecordingStorageService extends TestStorageService {
+	readonly mutations: string[] = [];
+	override store(...args: Parameters<TestStorageService['store']>): void {
+		this.mutations.push(`store ${args[0]}`);
+		super.store(...args);
+	}
+	override remove(...args: Parameters<TestStorageService['remove']>): void {
+		this.mutations.push(`remove ${args[0]}`);
+		super.remove(...args);
+	}
+}
+
+/** Records every secret set and delete, whatever the key or bytes. */
+class RecordingSecretStorageService extends TestSecretStorageService {
+	readonly mutations: string[] = [];
+	override async set(key: string, value: string): Promise<void> {
+		this.mutations.push(`set ${key}`);
+		return super.set(key, value);
+	}
+	override async delete(key: string): Promise<void> {
+		this.mutations.push(`delete ${key}`);
+		return super.delete(key);
+	}
+}
+
 suite('DynamicAuthenticationProviderStorageService', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 
-	let storageService: TestStorageService;
-	let secretStorageService: TestSecretStorageService;
+	let storageService: RecordingStorageService;
+	let secretStorageService: RecordingSecretStorageService;
 	let logService: RecordingLogService;
 	let service: DynamicAuthenticationProviderStorageService;
 
 	setup(() => {
-		storageService = disposables.add(new TestStorageService());
-		secretStorageService = disposables.add(new TestSecretStorageService());
+		storageService = disposables.add(new RecordingStorageService());
+		secretStorageService = disposables.add(new RecordingSecretStorageService());
 		logService = disposables.add(new RecordingLogService());
 		service = disposables.add(new DynamicAuthenticationProviderStorageService(storageService, secretStorageService, logService));
 	});
@@ -52,75 +114,96 @@ suite('DynamicAuthenticationProviderStorageService', () => {
 		return storageService.get(PROVIDERS_STORAGE_KEY, StorageScope.APPLICATION);
 	}
 
-	function isNamedError(error: unknown): boolean {
-		assert.ok(error instanceof InvalidStoredProviderListError, `expected InvalidStoredProviderListError, got ${error}`);
-		assert.strictEqual(error.name, 'InvalidStoredProviderListError');
-		assert.strictEqual(error.storageKey, PROVIDERS_STORAGE_KEY);
-		return true;
-	}
-
 	const invalidStoredValues: { name: string; raw: string; reason: string }[] = [
 		{ name: 'not JSON', raw: 'not json', reason: 'not valid JSON (SyntaxError)' },
+		{ name: 'not JSON, holding a marker', raw: `${LIST_MARKER} is not json`, reason: 'not valid JSON (SyntaxError)' },
+		{ name: 'truncated JSON holding a marker', raw: `[{"providerId":"p1","clientSecret":"${LIST_MARKER}"`, reason: 'not valid JSON (SyntaxError)' },
 		{ name: 'an object, not an array', raw: '{}', reason: 'not an array (object)' },
 		{ name: 'an array with a null entry', raw: '[null]', reason: 'entry 0 is not an object (null)' },
-		{ name: 'an entry without a string providerId', raw: '[{"providerId":7,"clientSecret":"sentinel-a91f"}]', reason: 'entry 0 field providerId is not a string (number)' },
-		{ name: 'an entry with a non-string clientId', raw: '[{"providerId":"p1","clientId":7,"label":false,"authorizationServer":{}}]', reason: 'entry 0 field clientId is not a string (number)' },
-		{ name: 'an entry with a non-string label', raw: '[{"providerId":"p1","clientId":"client-1","label":false,"authorizationServer":"https://as.example"}]', reason: 'entry 0 field label is not a string (boolean)' },
-		{ name: 'an entry with a non-string authorizationServer', raw: '[{"providerId":"p1","clientId":"client-1","label":"Label","authorizationServer":{}}]', reason: 'entry 0 field authorizationServer is not a string (object)' },
-		{ name: 'a legacy entry with a non-string issuer', raw: '[{"providerId":"p1","clientId":"client-1","label":"Label","issuer":5}]', reason: 'entry 0 field issuer is not a string (number)' },
-		{ name: 'a legacy entry with neither authorizationServer nor issuer', raw: '[{"providerId":"p1","clientId":"client-1","label":"Label"}]', reason: 'entry 0 has no authorizationServer and no legacy issuer' },
+		{ name: 'an entry without a string providerId', raw: `[{"providerId":7,"clientSecret":"${LIST_MARKER}"}]`, reason: 'entry 0 field providerId is not a string (number)' },
+		{ name: 'an entry with a non-string clientId', raw: `[{"providerId":"p1","clientId":7,"label":false,"authorizationServer":{},"clientSecret":"${LIST_MARKER}"}]`, reason: 'entry 0 field clientId is not a string (number)' },
+		{ name: 'an entry with a non-string label', raw: `[{"providerId":"p1","clientId":"${LIST_MARKER}","label":false,"authorizationServer":"https://as.example"}]`, reason: 'entry 0 field label is not a string (boolean)' },
+		{ name: 'an entry with a non-string authorizationServer', raw: `[{"providerId":"p1","clientId":"${LIST_MARKER}","label":"Label","authorizationServer":{}}]`, reason: 'entry 0 field authorizationServer is not a string (object)' },
+		{ name: 'a legacy entry with a non-string issuer', raw: `[{"providerId":"p1","clientId":"${LIST_MARKER}","label":"Label","issuer":5}]`, reason: 'entry 0 field issuer is not a string (number)' },
+		{ name: 'a legacy entry with neither authorizationServer nor issuer', raw: `[{"providerId":"p1","clientId":"${LIST_MARKER}","label":"Label"}]`, reason: 'entry 0 has no authorizationServer and no legacy issuer' },
+		{ name: 'a valid entry followed by an invalid entry', raw: `[{"providerId":"p1","clientId":"${LIST_MARKER}","label":"Label","authorizationServer":"https://as.example"},{"providerId":"p2","clientId":7,"label":"Other","authorizationServer":"https://as.example"}]`, reason: 'entry 1 field clientId is not a string (number)' },
 	];
 
 	for (const { name, raw, reason } of invalidStoredValues) {
 		suite(`stored list is ${name}`, () => {
-			setup(() => {
+			setup(async () => {
 				storeRaw(raw);
+				await secretStorageService.set(CREDENTIALS_KEY, CREDENTIALS_VALUE);
+				await secretStorageService.set(SESSIONS_KEY, SESSIONS_VALUE);
+				// Let the service's secret-change listener finish reading the seeded sessions before recording starts.
+				await timeout(0);
+				storageService.mutations.length = 0;
+				secretStorageService.mutations.length = 0;
+				logService.lines.length = 0;
+				logService.errors.length = 0;
+				logService.argumentTexts.length = 0;
 			});
 
-			function assertKeptAndNotLeaked(expectedErrorLines: number): void {
+			/** The named error, carrying the key and reason through its placeholders, and no marker anywhere. */
+			function isSafeNamedError(error: unknown): true {
+				assert.ok(error instanceof InvalidStoredProviderListError, `expected InvalidStoredProviderListError, got ${error}`);
+				assert.strictEqual(error.name, 'InvalidStoredProviderListError');
+				assert.strictEqual(error.storageKey, PROVIDERS_STORAGE_KEY);
+				assert.strictEqual(error.reason, reason);
+				// The localized message (the English default here) carries the key and the reason through its placeholders.
+				assert.strictEqual(error.message, `Stored dynamic authentication provider list '${PROVIDERS_STORAGE_KEY}' is invalid: ${reason}. It was left unchanged.`);
+				assert.strictEqual(error.cause, undefined, 'the error carries no cause');
+				for (const text of errorTexts(error)) {
+					for (const marker of MARKERS) {
+						assert.ok(!text.includes(marker), `the propagated error holds marker ${marker}`);
+					}
+				}
+				return true;
+			}
+
+			async function assertNothingMutatedOrLeaked(): Promise<void> {
 				assert.strictEqual(readRaw(), raw, 'the stored list must stay byte-identical');
-				assert.strictEqual(logService.errors.length, expectedErrorLines, 'one error line per failed read');
-				for (const line of logService.lines) {
-					assert.ok(!line.includes(raw), `log line holds the stored text: ${line}`);
-					assert.ok(line.includes(PROVIDERS_STORAGE_KEY), `log line names the key: ${line}`);
-					assert.ok(line.includes(reason), `log line names the reason: ${line}`);
+				assert.deepStrictEqual(storageService.mutations, [], 'no list store or remove after a failed read');
+				assert.deepStrictEqual(secretStorageService.mutations, [], 'no secret set or delete after a failed read');
+				assert.strictEqual(await secretStorageService.get(CREDENTIALS_KEY), CREDENTIALS_VALUE, 'the stored credentials must stay byte-identical');
+				assert.strictEqual(await secretStorageService.get(SESSIONS_KEY), SESSIONS_VALUE, 'the stored sessions must stay byte-identical');
+
+				assert.strictEqual(logService.errors.length, 1, 'one error line per failed read');
+				assert.strictEqual(logService.lines.length, 1, 'no other log line');
+				const [line] = logService.lines;
+				assert.ok(!line.includes(raw), `log line holds the stored text: ${line}`);
+				assert.ok(line.includes(PROVIDERS_STORAGE_KEY), `log line names the key: ${line}`);
+				assert.ok(line.includes(reason), `log line names the reason: ${line}`);
+				for (const text of logService.argumentTexts) {
+					for (const marker of MARKERS) {
+						assert.ok(!text.includes(marker), `a log argument holds marker ${marker}: ${text}`);
+					}
 				}
 			}
 
-			test('getClientId throws the named error', () => {
-				assert.throws(() => service.getClientId('p1'), (error: unknown) => {
-					isNamedError(error);
-					assert.strictEqual((error as InvalidStoredProviderListError).reason, reason);
-					// The localized message (the English default here) carries the key and the reason through its placeholders.
-					assert.strictEqual((error as Error).message, `Stored dynamic authentication provider list '${PROVIDERS_STORAGE_KEY}' is invalid: ${reason}. It was left unchanged.`);
-					assert.ok(!(error as Error).message.includes(raw), 'error message holds the stored text');
-					return true;
-				});
-				assertKeptAndNotLeaked(1);
+			test('getClientId throws the named error', async () => {
+				assert.throws(() => service.getClientId('p1'), isSafeNamedError);
+				await assertNothingMutatedOrLeaked();
 			});
 
-			test('getInteractedProviders throws the named error', () => {
-				assert.throws(() => service.getInteractedProviders(), isNamedError);
-				assertKeptAndNotLeaked(1);
+			test('getInteractedProviders throws the named error', async () => {
+				assert.throws(() => service.getInteractedProviders(), isSafeNamedError);
+				await assertNothingMutatedOrLeaked();
 			});
 
-			test('getClientRegistration with no secret stored rejects with the named error', async () => {
-				await assert.rejects(service.getClientRegistration('p1'), isNamedError);
-				assertKeptAndNotLeaked(1);
+			test('getClientRegistration for a provider with no stored credentials rejects with the named error', async () => {
+				await assert.rejects(service.getClientRegistration('p0'), isSafeNamedError);
+				await assertNothingMutatedOrLeaked();
 			});
 
 			test('storeClientRegistration rejects with the named error and writes nothing', async () => {
-				await assert.rejects(service.storeClientRegistration('p1', 'https://as.example', 'client-1', 'secret-1', 'Label'), isNamedError);
-				assertKeptAndNotLeaked(1);
-				assert.deepStrictEqual(await secretStorageService.keys(), [], 'no secret is written after a failed read');
+				await assert.rejects(service.storeClientRegistration('p1', 'https://as.example', 'client-1', 'secret-new', 'Label'), isSafeNamedError);
+				await assertNothingMutatedOrLeaked();
 			});
 
 			test('removeDynamicProvider rejects with the named error and deletes nothing', async () => {
-				const credentialsKey = 'dynamicAuthProvider:clientRegistration:p1';
-				await secretStorageService.set(credentialsKey, JSON.stringify({ clientId: 'client-1' }));
-				await assert.rejects(service.removeDynamicProvider('p1'), isNamedError);
-				assertKeptAndNotLeaked(1);
-				assert.deepStrictEqual(await secretStorageService.keys(), [credentialsKey], 'no secret is deleted after a failed read');
+				await assert.rejects(service.removeDynamicProvider('p1'), isSafeNamedError);
+				await assertNothingMutatedOrLeaked();
 			});
 		});
 	}
