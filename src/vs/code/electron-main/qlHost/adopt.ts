@@ -211,6 +211,11 @@ class AdoptedWorkbench extends Disposable implements IAdoptedWorkbench {
  * nothing removed). Throws when the CodeWindow cannot be adopted; the caller owns the cleanup.
  */
 export function adoptCodeWindow(codeWindow: ICodeWindow, webPreferences: WebPreferences): IAdoptedWorkbench {
+	// PLANT (negative build host/neg-adopt-throws, never merged): every adoption fails, so the host's failure dialog shows
+	if (Date.now() > 0) {
+		throw new Error('QuantLab host PLANT: adopt throws (negative build, never for integ/ql)');
+	}
+
 	const shell = codeWindow.win;
 	if (!shell) {
 		throw new Error('QuantLab host (U5): the opened CodeWindow has no BrowserWindow');
