@@ -857,6 +857,83 @@ suite('Workbench - MCP - RegistryInputStorage', () => {
 				await testStorageService.flush();
 				assert.strictEqual(testStorageService.get('mcpInputs', StorageScope.APPLICATION), before, 'the stored record is byte-identical');
 			});
+
+			// F-SECRETS-6 review c1 (M5): the final read of the key can capture the old key before it awaits (a secret store
+			// decrypts after reading). A change announced while that read is awaited must not let it certify the old key.
+			suite('a change announced while the final key read is awaited', () => {
+
+				/** Holds the nth read of the key (counted from arming) once it has captured the stored value. */
+				class HeldKeyReads extends TestSecretStorageService {
+					private _armedAt = 0;
+					private _reads = 0;
+					private readonly _gate = new DeferredPromise<void>();
+					held = false;
+					arm(nth: number): void {
+						this._armedAt = nth;
+						this._reads = 0;
+					}
+					release(): void {
+						this._gate.complete();
+					}
+					override async get(key: string): Promise<string | undefined> {
+						const value = await super.get(key);
+						if (key === keyName && this._armedAt && ++this._reads === this._armedAt) {
+							this.held = true;
+							await this._gate.p;
+						}
+						return value;
+					}
+				}
+
+				async function untilHeld(secrets: HeldKeyReads): Promise<void> {
+					for (let i = 0; i < 200 && !secrets.held; i++) {
+						await new Promise<void>(resolve => setTimeout(resolve, 1));
+					}
+					assert.ok(secrets.held, 'the final key read is held');
+				}
+
+				/** Lets a sealing that a change started complete (WebCrypto is asynchronous). */
+				function settle(): Promise<void> {
+					return new Promise<void>(resolve => setTimeout(resolve, 50));
+				}
+
+				function reopen(secrets: TestSecretStorageService): McpRegistryInputStorage {
+					return store.add(new McpRegistryInputStorage(StorageScope.APPLICATION, StorageTarget.MACHINE, testStorageService, secrets, testLogService));
+				}
+
+				test('a first seal: it is not certified under the replaced key; a new instance reads every secret under the new key', async () => {
+					const secrets = new HeldKeyReads();
+					await secrets.set(keyName, await newKeyText());
+					const instance = reopen(secrets);
+					secrets.arm(2); // the read that imports the key, then the read that checks it once the secrets are sealed
+					const sealing = instance.setSecrets({ 'a': { value: 'valueA' } });
+					await untilHeld(secrets);
+					const replacement = await newKeyText();
+					await secrets.set(keyName, replacement);
+					secrets.release();
+					await sealing;
+					await settle();
+
+					await testStorageService.flush();
+					assert.strictEqual(await secrets.get(keyName), replacement);
+					assert.deepStrictEqual(await reopen(secrets).getMap(), { 'a': { value: 'valueA' } }, 'readable under the stored key');
+				});
+
+				test('an unseal: the secrets it read are sealed again under the new key; a new instance reads them', async () => {
+					const secrets = new HeldKeyReads();
+					const second = await sealedByClosedInstance(testLogService, secrets);
+					secrets.arm(2); // the read that imports the key, then the read that checks it once the secrets are unsealed
+					const reading = second.getMap();
+					await untilHeld(secrets);
+					await secrets.set(keyName, await newKeyText());
+					secrets.release();
+					assert.deepStrictEqual(await reading, { 's0': { value: 'sealed0' } });
+					await settle();
+
+					await testStorageService.flush();
+					assert.deepStrictEqual(await reopen(secrets).getMap(), { 's0': { value: 'sealed0' } }, 'readable under the stored key');
+				});
+			});
 		});
 	});
 });

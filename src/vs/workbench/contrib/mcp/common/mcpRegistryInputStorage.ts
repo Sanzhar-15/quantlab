@@ -97,6 +97,20 @@ export class McpRegistryInputStorage extends Disposable {
 
 	private _encryptionKey: Promise<IKeyInUse> | undefined;
 
+	/**
+	 * Counts the changes of the stored key announced to this instance. A read of the stored key certifies it only if no
+	 * change was announced while the read was awaited: a read can capture the old value before it awaits (a secret store
+	 * decrypts after reading), so a value that equals the key in use proves nothing once a change overtook the read.
+	 */
+	private _keyGeneration = 0;
+
+	/** The stored key equals `text`, read with no change of it announced meanwhile. */
+	private async _storedKeyIs(text: string): Promise<boolean> {
+		const generation = this._keyGeneration;
+		const stored = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
+		return stored === text && generation === this._keyGeneration;
+	}
+
 	/** Forgets the imported key, so that the next use reads the stored key again. */
 	private _forgetEncryptionKey(): void {
 		this._encryptionKey = undefined;
@@ -207,12 +221,16 @@ export class McpRegistryInputStorage extends Disposable {
 		// imported key stale, so the next use reads it again.
 		this._register(_secretStorageService.onDidChangeSecret(key => {
 			if (key === MCP_ENCRYPTION_KEY_NAME) {
+				this._keyGeneration++;
 				this._forgetEncryptionKey();
 				// Secrets sealed under the key it replaced would be unreadable: they are sealed again under the new one.
-				// An unseal in flight does this itself when it completes (see _unsealRecord).
+				// An unseal in flight is let complete first (it installs the secrets that can be sealed again); a seal in
+				// flight sees the change itself (see _sealUnderStoredKey).
 				const record = this._hydrated;
-				if (record?.sealedWith && !record.unsealing) {
-					this._resealUnderStoredKey(record, 'reseal').then(undefined, error => {
+				if (record?.sealedWith || record?.unsealing) {
+					const reseal = () => this._resealUnderStoredKey(record, 'reseal');
+					// A failed unseal is reported to its own callers; the reseal then finds nothing it can seal again.
+					(record.unsealing ? record.unsealing.then(reseal, reseal) : reseal()).then(undefined, error => {
 						this._logService.error(`The MCP input secrets could not be sealed again under the changed encryption key; they are kept as they were (${error instanceof Error ? error.name : typeof error}).`);
 					});
 				}
@@ -293,7 +311,8 @@ export class McpRegistryInputStorage extends Disposable {
 
 	/**
 	 * Seals the unsealed secrets under the stored key: the key is read again once they are sealed, and they are installed
-	 * only if it is still the key they were sealed with. A key replaced meanwhile (by another window) makes them be sealed
+	 * only if it is still the key they were sealed with and no change of it was announced while it was read
+	 * ({@link _storedKeyIs}). A key replaced meanwhile (by another window) makes them be sealed
 	 * again under the new one; after {@link SEAL_ROUNDS_MAX} changes this rejects with {@link McpInputsKeyChangedError} and
 	 * the record keeps its sealed secrets. Runs in the sealer queue.
 	 */
@@ -319,9 +338,9 @@ export class McpRegistryInputStorage extends Disposable {
 
 			// Not written into a record that was replaced while encrypting.
 			this._assertCurrent(record, operation);
-			const stored = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
+			const current = await this._storedKeyIs(keyInUse.text);
 			this._assertCurrent(record, operation);
-			if (stored === keyInUse.text) {
+			if (current) {
 				const enc = encodeBase64(VSBuffer.wrap(new Uint8Array(encrypted)));
 				record.secrets = { iv: encodeBase64(VSBuffer.wrap(iv)), value: enc };
 				record.sealedWith = keyInUse;
@@ -341,14 +360,14 @@ export class McpRegistryInputStorage extends Disposable {
 	/**
 	 * Seals the secrets of the record again if the stored key is no longer the one they were sealed with, so that they stay
 	 * readable under the stored key. Only secrets this instance unsealed or sealed (and so holds) can be; others are kept.
+	 * A change of the key announced while it is read here seals them again as well ({@link _storedKeyIs}).
 	 */
 	private _resealUnderStoredKey(record: IHydratedData, operation: string): Promise<void> {
 		return this._secretsSealerSequencer.queue(async () => {
 			if (this._hydrated !== record || !record.secrets || !record.sealedWith || !record.unsealedSecrets) {
 				return;
 			}
-			const stored = await this._secretStorageService.get(MCP_ENCRYPTION_KEY_NAME);
-			if (stored === record.sealedWith.text) {
+			if (await this._storedKeyIs(record.sealedWith.text)) {
 				return;
 			}
 			this._logService.info('The MCP encryption key changed; the input secrets are sealed again under the stored key.');
