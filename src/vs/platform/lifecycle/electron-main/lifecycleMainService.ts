@@ -20,6 +20,7 @@ import { ISingleFolderWorkspaceIdentifier, IWorkspaceIdentifier } from '../../wo
 import { IEnvironmentMainService } from '../../environment/electron-main/environmentMainService.js';
 import { IAuxiliaryWindow } from '../../auxiliaryWindow/electron-main/auxiliaryWindow.js';
 import { getAllWindowsExcludingOffscreen } from '../../windows/electron-main/windows.js';
+import { installWillQuitGuard } from './willQuitGuard.js';
 
 export const ILifecycleMainService = createDecorator<ILifecycleMainService>('lifecycleMainService');
 
@@ -313,33 +314,20 @@ export class LifecycleMainService extends Disposable implements ILifecycleMainSe
 
 		// will-quit: an event that is fired after all windows have been
 		// closed, but before actually quitting.
-		electron.app.once('will-quit', e => {
-			this.trace('Lifecycle#app.on(will-quit) - begin');
-
-			// Prevent the quit until the shutdown promise was resolved
-			e.preventDefault();
-
-			// Start shutdown sequence
-			const shutdownPromise = this.fireOnWillShutdown(ShutdownReason.QUIT);
-
-			// Wait until shutdown is signaled to be complete
-			shutdownPromise.finally(() => {
-				this.trace('Lifecycle#app.on(will-quit) - after fireOnWillShutdown');
+		// QuantLab host (review c1 M6): the listener stays installed and prevents every quit until the
+		// shutdown joiners settled (stock used `once`, so a second quit exited under them): willQuitGuard.ts
+		installWillQuitGuard(electron.app, {
+			startShutdown: () => this.fireOnWillShutdown(ShutdownReason.QUIT),
+			beforeFinalQuit: () => {
 
 				// Resolve pending quit promise now without veto
 				this.resolvePendingQuitPromise(false /* no veto */);
 
-				// Quit again, this time do not prevent this, since our
-				// will-quit listener is only installed "once". Also
-				// remove any listener we have that is no longer needed
-
+				// Remove any listener we have that is no longer needed
 				electron.app.removeListener('before-quit', beforeQuitListener);
 				electron.app.removeListener('window-all-closed', windowAllClosedListener);
-
-				this.trace('Lifecycle#app.on(will-quit) - calling app.quit()');
-
-				electron.app.quit();
-			});
+			},
+			trace: message => this.trace(message)
 		});
 	}
 
