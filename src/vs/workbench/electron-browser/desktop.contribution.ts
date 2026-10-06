@@ -28,7 +28,7 @@ import { NativeWindow } from './window.js';
 import { ModifierKeyEmitter } from '../../base/browser/dom.js';
 import { applicationConfigurationNodeBase, securityConfigurationNodeBase } from '../common/configuration.js';
 import { MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL } from '../../platform/window/electron-browser/window.js';
-import { QL_POLICY_CUSTOM_TITLE_BAR_VISIBILITY, QL_POLICY_TITLE_BAR_STYLE } from '../../platform/policy/common/qlChromePolicy.js'; // QuantLab host (U7)
+import { QL_POLICY_CUSTOM_TITLE_BAR_VISIBILITY, QL_POLICY_DIALOG_STYLE, QL_POLICY_TITLE_BAR_STYLE } from '../../platform/policy/common/qlChromePolicy.js'; // QuantLab host (U7, c1 M5)
 
 // Actions
 (function registerActions(): void {
@@ -290,7 +290,8 @@ import { QL_POLICY_CUSTOM_TITLE_BAR_VISIBILITY, QL_POLICY_TITLE_BAR_STYLE } from
 				'enum': ['native', 'custom'],
 				'default': 'native',
 				'scope': ConfigurationScope.APPLICATION,
-				'description': localize('dialogStyle', "Adjust the appearance of dialogs to be native by the OS or custom.")
+				'description': localize('dialogStyle', "Adjust the appearance of dialogs to be native by the OS or custom."),
+				'policy': QL_POLICY_DIALOG_STYLE, // QuantLab host (c1 M5)
 			},
 			'window.nativeTabs': {
 				'type': 'boolean',

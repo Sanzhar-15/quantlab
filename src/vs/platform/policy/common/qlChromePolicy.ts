@@ -60,3 +60,21 @@ export const QL_CHROME_POLICIES: ReadonlyArray<{ readonly settingKey: string; re
 	{ settingKey: 'workbench.activityBar.location', policyName: QL_POLICY_ACTIVITY_BAR_LOCATION.name },
 	{ settingKey: 'workbench.sideBar.location', policyName: QL_POLICY_SIDE_BAR_LOCATION.name }
 ];
+
+// QuantLab host (c1 M5): `window.dialogStyle` is held at 'native'. A custom (DOM) dialog is drawn inside the workbench view, which
+// is hidden while the terminal view is in front, so a save confirmation raised by a quit was invisible and the quit waited on it;
+// a native dialog is shown by the OS on top of the host window. The key is policy-only, NOT a seed key: profiles seeded before it
+// was added would lack it and the seed would report 'differs' on every launch.
+export const QL_POLICY_DIALOG_STYLE: IPolicy = {
+	name: 'QlDialogStyle',
+	category: PolicyCategory.Update,
+	minimumVersion: '1.108',
+	localization: {
+		description: { key: 'qlPolicyDialogStyle', value: localize('qlPolicyDialogStyle', "The dialog style, held by the QuantLab host.") }
+	}
+};
+
+/** The settings held by the chrome policy file that are not in the U6 seed, with the value each is held at. */
+export const QL_POLICY_ONLY_SETTINGS: ReadonlyArray<{ readonly settingKey: string; readonly policyName: PolicyName; readonly value: string }> = [
+	{ settingKey: 'window.dialogStyle', policyName: QL_POLICY_DIALOG_STYLE.name, value: 'native' }
+];

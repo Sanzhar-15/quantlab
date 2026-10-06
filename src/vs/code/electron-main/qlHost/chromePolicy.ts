@@ -26,7 +26,7 @@ import { ConfigurationScope, Extensions as ConfigurationExtensions, IConfigurati
 import { ILogService } from '../../../platform/log/common/log.js';
 import { CombinedPolicyService } from '../../../platform/policy/common/combinedPolicyService.js';
 import { IPolicyService, PolicyValue } from '../../../platform/policy/common/policy.js';
-import { QL_CHROME_POLICIES, QL_POLICY_TITLE_BAR_STYLE } from '../../../platform/policy/common/qlChromePolicy.js';
+import { QL_CHROME_POLICIES, QL_POLICY_ONLY_SETTINGS, QL_POLICY_TITLE_BAR_STYLE } from '../../../platform/policy/common/qlChromePolicy.js';
 import { StaticPolicyService } from '../../../platform/policy/common/staticPolicyService.js';
 import { Registry } from '../../../platform/registry/common/platform.js';
 import { localize } from '../../../nls.js';
@@ -62,7 +62,8 @@ export function registerQlChromePolicyConfiguration(): void {
 
 /**
  * Reads the bundled policy file. Throws, naming the file and the problem, when it is missing, does not parse, is not an object
- * with exactly the four chrome policies, or holds a value that is not the seed's value for that setting. Nothing is defaulted.
+ * with exactly the four chrome policies and the policy-only ones (`QL_POLICY_ONLY_SETTINGS`, c1 M5), or holds a value that is not
+ * the seed's (or, for a policy-only key, the list's) value for that setting. Nothing is defaulted.
  */
 export function readQlChromePolicy(): ReadonlyMap<PolicyName, PolicyValue> {
 	const file = FileAccess.asFileUri(QL_CHROME_POLICY_FILE).fsPath;
@@ -86,7 +87,7 @@ export function readQlChromePolicy(): ReadonlyMap<PolicyName, PolicyValue> {
 	}
 
 	const content = raw as Record<string, unknown>;
-	const expectedNames = new Set(QL_CHROME_POLICIES.map(entry => entry.policyName));
+	const expectedNames = new Set([...QL_CHROME_POLICIES, ...QL_POLICY_ONLY_SETTINGS].map(entry => entry.policyName));
 	const problems: string[] = [];
 	for (const name of Object.keys(content)) {
 		if (!expectedNames.has(name)) {
@@ -105,6 +106,15 @@ export function readQlChromePolicy(): ReadonlyMap<PolicyName, PolicyValue> {
 			problems.push(`${policyName} is ${JSON.stringify(content[policyName])} (expected ${JSON.stringify(seeded[1])}, the chrome seed's value of ${settingKey})`);
 		} else {
 			values.set(policyName, seeded[1]);
+		}
+	}
+	for (const { settingKey, policyName, value } of QL_POLICY_ONLY_SETTINGS) {
+		if (!Object.prototype.hasOwnProperty.call(content, policyName)) {
+			problems.push(`${policyName} is missing (expected ${JSON.stringify(value)})`);
+		} else if (content[policyName] !== value) {
+			problems.push(`${policyName} is ${JSON.stringify(content[policyName])} (expected ${JSON.stringify(value)}, the policy-only value of ${settingKey})`);
+		} else {
+			values.set(policyName, value);
 		}
 	}
 
