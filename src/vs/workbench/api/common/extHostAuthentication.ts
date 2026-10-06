@@ -544,9 +544,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			/** Each refreshed token and the token that replaces it. */
 			const refreshedTokens = new Map<ISessionToken, IAuthorizationToken>();
 			const expiredTokens: ISessionToken[] = [];
-			const tokenMap = new Map<string, ISessionToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
+			// By the session id (its credential's revision): two sessions may hold the same access token.
+			const tokenMap = new Map<string, ISessionToken>(this._tokenStore.tokens.map(token => [token.revision, token]));
 			for (const session of sessions) {
-				const token = tokenMap.get(session.accessToken);
+				const token = tokenMap.get(session.id);
 				if (token && token.expires_in) {
 					const now = Date.now();
 					const expiresInMS = token.expires_in * 1000;
@@ -671,8 +672,14 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		// Store session for later retrieval
-		await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }] });
-		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
+		const [added] = await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }] });
+		// By the session id (its credential's revision): another session may hold the same access token.
+		const session = this._tokenStore.sessions.find(s => s.id === added.revision);
+		if (!session) {
+			// Stored, then removed by another window before this call returned: it is not handed out.
+			this._logger.error('The created session was removed before it could be returned.');
+			throw new OAuthSafeError('The created session was removed before it could be returned');
+		}
 		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for ${scopeCountText(scopes)}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
 	}
@@ -686,7 +693,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.error(`Session with id ${sessionId} not found`);
 			return;
 		}
-		const token = this._tokenStore.tokens.find(token => token.access_token === session.accessToken);
+		// By the session id (its credential's revision): another session may hold the same access token.
+		const token = this._tokenStore.tokens.find(token => token.revision === session.id);
 		if (!token) {
 			this._logger.error(`Failed to retrieve token for removed session: ${session.id}`);
 			return;
@@ -1029,15 +1037,18 @@ type ISessionToken = IAuthorizationToken & {
 };
 
 /**
- * Stored on each token of a saved list (the same on every token of it): the revisions of the stored list that this list
- * includes, newest first, its own first. A window tells from them whether a list it reads was written with its own last
- * save in view, and which earlier list both include.
+ * Stored on each token of a saved list (the same on every token of it): the newest {@link STORED_REVISIONS_MAX} revisions
+ * of the stored lists that this list includes, newest first, its own first. A window tells from them whether a list it
+ * reads was written with its own last save in view, and which earlier list both include. A window keeps every revision
+ * and list it read or saved in memory, for as long as it is open: only the stored copy is cut.
  */
 const STORED_REVISIONS = 'stored_revisions';
 /**
- * Stored on each token of a saved list (the same on every token of it): the ids of sessions recently signed out, newest
- * first. A list that still holds such a session (written without the sign-out in view) is corrected by every window that
- * knows of the sign-out. An empty list cannot carry it: a window that saw the sign-out keeps it in memory as well.
+ * Stored on each token of a saved list (the same on every token of it): the ids of the newest
+ * {@link SIGNED_OUT_SESSIONS_MAX} sessions signed out, newest first. A list that still holds such a session (written
+ * without the sign-out in view) is corrected by every window that knows of the sign-out. A window keeps every sign-out it
+ * made or read in memory, for as long as it is open: only the stored copy is cut. A credential is signed out when its
+ * session id or its revision is in this list (a fork's id is the revision it was forked with, see {@link mergeSessions}).
  */
 const SIGNED_OUT_SESSIONS = 'signed_out_sessions';
 /**
@@ -1048,7 +1059,6 @@ const SIGNED_OUT_SESSIONS = 'signed_out_sessions';
 const SESSION_LIST_RECORD = 'session_list_record';
 const STORED_REVISIONS_MAX = 32;
 const SIGNED_OUT_SESSIONS_MAX = 32;
-const REMEMBERED_LISTS_MAX = 32;
 /** Saves of one operation while the stored sessions keep changing, before it rejects. */
 const SAVE_ROUNDS_MAX = 5;
 
@@ -1087,9 +1097,9 @@ function isStringList(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(item => typeof item === 'string');
 }
 
-/** The first `max` distinct items of the lists, in order. */
-function newestFirst(max: number, ...lists: (readonly string[])[]): string[] {
-	return [...new Set(lists.flat())].slice(0, max);
+/** The distinct items of the lists, in order. */
+function newestFirst(...lists: (readonly string[])[]): string[] {
+	return [...new Set(lists.flat())];
 }
 
 /**
@@ -1148,17 +1158,69 @@ function sameSessions(a: readonly ISessionToken[], b: readonly ISessionToken[]):
 }
 
 /**
+ * Whether a credential is signed out: its session is, or its revision names a signed-out session. A fork's id is the
+ * revision it was forked with ({@link mergeSessions}), so a window that still holds the fork's credential under the session
+ * it was forked from (an older representation of the fork, the same credential) recognizes it as signed out.
+ */
+function isSignedOut(token: ISessionToken, signedOut: ReadonlySet<string>): boolean {
+	return signedOut.has(token.session_id) || signedOut.has(token.revision);
+}
+
+/**
+ * The live credentials of one side of a merge, by session id. A session whose credential on this side is a signed-out
+ * fork's (an older representation of it) is not changed by this side: `stale` lists it, and the caller decides with the
+ * other side's credential.
+ */
+function liveSide(tokens: readonly ISessionToken[], signedOut: ReadonlySet<string>): { live: Map<string, ISessionToken>; stale: Set<string> } {
+	const live = new Map<string, ISessionToken>();
+	const stale = new Set<string>();
+	for (const token of tokens) {
+		if (signedOut.has(token.session_id)) {
+			continue;
+		}
+		if (signedOut.has(token.revision)) {
+			stale.add(token.session_id);
+			continue;
+		}
+		live.set(token.session_id, token);
+	}
+	return { live, stale };
+}
+
+/**
+ * Of two credentials of one session, each made without the other in view: the one that keeps the session id, and the
+ * one that becomes a session of its own (its id: its revision). Decided by revision alone, so every window and every path
+ * (a merge, or a refresh here completing after another window's) decides the same: the smaller revision keeps the id.
+ */
+function splitConcurrent(a: ISessionToken, b: ISessionToken): { kept: ISessionToken; fork: ISessionToken } {
+	const [kept, forked] = a.revision < b.revision ? [a, b] : [b, a];
+	return { kept: { ...kept, session_id: a.session_id }, fork: { ...forked, session_id: forked.revision } };
+}
+
+/**
  * Merges a list stored by another window (`theirs`) with this window's sessions (`ours`), both changed since `base`
- * (a list each of them includes). A signed-out session is dropped from every side. Per logical session, a change on one
- * side only is taken. Changed on both sides: a sign-out wins over a refresh (it is the user's explicit act), and two
- * refreshes are both kept (no credential another window saved is lost, and none made here). Which of the two keeps the
- * session id and which becomes a session of its own (its id: its revision) is decided by revision alone, so every window
- * that merges the same two decides the same. Returns the merged sessions and the ids of the sessions it found signed out.
+ * (a list each of them includes). A signed-out credential ({@link isSignedOut}) is dropped from every side; a side that
+ * holds a signed-out fork's credential under the session it was forked from has not changed that session. Per logical
+ * session, a change on one side only is taken. Changed on both sides: a sign-out wins over a refresh (it is the user's
+ * explicit act), and two refreshes are both kept ({@link splitConcurrent}): no credential another window saved is lost,
+ * and none made here. A fork is made of live credentials only, so its id (its revision) is never a signed-out one.
+ * Returns the merged sessions and the ids of the sessions it found signed out.
  */
 function mergeSessions(base: readonly ISessionToken[], theirs: readonly ISessionToken[], ours: readonly ISessionToken[], signedOut: ReadonlySet<string>, logger: ILogger): { tokens: ISessionToken[]; signedOut: string[] } {
-	const live = (tokens: readonly ISessionToken[]) => new Map(tokens.filter(t => !signedOut.has(t.session_id)).map(t => [t.session_id, t]));
-	const b = live(base), t = live(theirs), o = live(ours);
-	if (ours.some(token => signedOut.has(token.session_id))) {
+	const b = liveSide(base, signedOut).live;
+	/** A side that holds only a signed-out fork's credential of a session holds the ancestor's (it did not change it). */
+	const side = (tokens: readonly ISessionToken[]) => {
+		const { live, stale } = liveSide(tokens, signedOut);
+		for (const id of stale) {
+			const ancestor = b.get(id);
+			if (ancestor && !live.has(id)) {
+				live.set(id, ancestor);
+			}
+		}
+		return live;
+	};
+	const t = side(theirs), o = side(ours);
+	if (ours.some(token => isSignedOut(token, signedOut))) {
 		logger.warn('A session held here was signed out in another window; it stays signed out.');
 	}
 	const merged = new Map<string, ISessionToken>();
@@ -1176,9 +1238,9 @@ function mergeSessions(base: readonly ISessionToken[], theirs: readonly ISession
 				? 'A session signed out here was refreshed in another window; it stays signed out.'
 				: 'A session refreshed here was signed out in another window; it stays signed out and the refreshed credential is not kept.');
 		} else {
-			const [winner, forked] = other.revision < mine.revision ? [other, mine] : [mine, other];
-			kept = winner;
-			forks.push({ ...forked, session_id: forked.revision });
+			const split = splitConcurrent(other, mine);
+			kept = split.kept;
+			forks.push(split.fork);
 			logger.warn('A session was refreshed both here and in another window; both credentials are kept, as two sessions.');
 		}
 		if (kept) {
@@ -1197,16 +1259,64 @@ function mergeSessions(base: readonly ISessionToken[], theirs: readonly ISession
 }
 
 /**
+ * Merges a list stored by another window (`theirs`) that shares no known list with the sessions here (`ours`): the
+ * stored list was written by a window that had not seen any list this window knows, within the revisions it carries.
+ * Without a common list a session missing from it cannot be told signed out (its sign-out record forgotten) from never
+ * seen, and a credential replaced in it cannot be told refreshed from overwritten; so nothing that was stored before is
+ * restored. Taken: every live session of the stored list; a session it holds only as a signed-out fork's credential keeps
+ * the credential here. Kept from here: only what was never stored (`unsaved`: a sign-in made here, whose session id and
+ * revision are both unsaved, and a refresh made here, which is kept beside the stored credential of its session). Every
+ * other session here that the stored list lacks or replaced is not restored: `unreconciled` counts them, and the caller
+ * reports them.
+ */
+function mergeWithoutBase(theirs: readonly ISessionToken[], ours: readonly ISessionToken[], signedOut: ReadonlySet<string>, unsaved: ReadonlySet<string>): { tokens: ISessionToken[]; unreconciled: number } {
+	const t = liveSide(theirs, signedOut), o = liveSide(ours, signedOut);
+	const merged = new Map(t.live);
+	const forks: ISessionToken[] = [];
+	let unreconciled = 0;
+	for (const [id, mine] of o.live) {
+		const other = t.live.get(id);
+		if (other?.revision === mine.revision) {
+			continue;
+		}
+		if (!other && t.stale.has(id)) {
+			// The other window holds this session, at a credential that was forked off and signed out.
+			merged.set(id, mine);
+		} else if (!other) {
+			if (unsaved.has(id) && unsaved.has(mine.revision)) {
+				merged.set(id, mine);
+			} else {
+				unreconciled++;
+			}
+		} else if (unsaved.has(mine.revision)) {
+			const split = splitConcurrent(other, mine);
+			merged.set(id, split.kept);
+			forks.push(split.fork);
+		} else {
+			unreconciled++;
+		}
+	}
+	for (const fork of forks) {
+		if (!merged.has(fork.session_id)) {
+			merged.set(fork.session_id, fork);
+		}
+	}
+	return { tokens: [...merged.values()], unreconciled };
+}
+
+/**
  * The sessions of one dynamic provider and client, shared with every other window through secret storage. Each window
  * keeps the sessions it uses ({@link tokens}): the stored ones merged with every change it saw or made. A save writes
  * them with the revisions of the stored lists they include and the sessions recently signed out; a list another window
  * stores is merged against the last list both include ({@link mergeSessions}), so a save that lands over another
  * window's never decides the outcome: a window whose change is missing from a stored list saves the merged sessions again.
  *
- * Every saved list carries this bookkeeping, an empty one included ({@link SESSION_LIST_RECORD}). A list that shares
- * no remembered revision with the sessions here (an unversioned list of an earlier version that this window did not
- * start from, or one whose common revisions were forgotten) is merged against no common list: nothing here is dropped
- * by it, only a sign-out it records removes a session, and two credentials of one session are both kept.
+ * Every saved list carries this bookkeeping, an empty one included ({@link SESSION_LIST_RECORD}). A window keeps every
+ * list, revision and sign-out it read or made in memory while it is open; a stored list carries only the newest of them.
+ * A stored list that shares no list known here (an unversioned list of an earlier version that this window did not start
+ * from, or one written by a window that saved more than {@link STORED_REVISIONS_MAX} times since this window last read)
+ * lacks the history to tell a sign-out from a lost save: it is merged by {@link mergeWithoutBase}, which restores
+ * nothing that was stored before, and every session here it does not restore is reported in one error line.
  *
  * Residual (R-104, named; a later fold adds a main-process store with a conditional write): there is no compare-and-set
  * at the storage boundary. Each renderer writes its own cached copy of application storage and flushes it to the main
@@ -1218,14 +1328,19 @@ function mergeSessions(base: readonly ISessionToken[], theirs: readonly ISession
 class TokenStore implements Disposable {
 	/** The sessions this window uses. They may hold a change that is not saved yet. */
 	private _tokens: ISessionToken[];
-	/** The stored revisions whose lists {@link _tokens} includes, newest first. */
+	/** Every stored revision whose list {@link _tokens} includes, newest first (a save stores the newest of them). */
 	private _revisions: string[];
-	/** The ids of sessions signed out (here, or seen signed out), newest first. */
+	/** The ids of every session signed out here or seen signed out, newest first (a save stores the newest of them). */
 	private _signedOut: string[];
 	/** The last list known to be stored: read from storage, or saved here with nothing read meanwhile. */
 	private _stored: ISessionList;
-	/** Lists by stored revision, read or saved here: the merge base for a list another window stores. */
+	/** Every list read or saved here, by stored revision: the merge base for a list another window stores. */
 	private readonly _lists = new Map<string, readonly ISessionToken[]>();
+	/**
+	 * The session ids and revisions made here (a sign-in's session id and revision, a refresh's revision) that no list
+	 * read or saved here has held yet: credentials that were never stored, which no other window can have signed out.
+	 */
+	private readonly _unsaved = new Set<string>();
 	/** Counts the lists read from storage, so that a save tells whether one was read while it ran. */
 	private _reads = 0;
 	private _saving = false;
@@ -1253,7 +1368,8 @@ class TokenStore implements Disposable {
 		this._remember(initial);
 		this._tokensObservable = observableValue<readonly ISessionToken[]>('tokens', initial.tokens);
 		this._sessionsObservable = derivedOpts(
-			{ equalsFn: (a, b) => arraysEqual(a, b, (a, b) => a.accessToken === b.accessToken) },
+			// A session is its credential's revision: two sessions may hold the same access token (and a refresh may keep it).
+			{ equalsFn: (a, b) => arraysEqual(a, b, (a, b) => a.id === b.id) },
 			(reader) => this._tokensObservable.read(reader).map(t => this._getSessionFromToken(t))
 		);
 		this._disposable.add(this._registerChangeEventAutorun());
@@ -1287,11 +1403,23 @@ class TokenStore implements Disposable {
 		}
 		this._reads++;
 		const signedOut = new Set([...this._signedOut, ...list.signedOut]);
-		const merged = mergeSessions(this._mergeBase(list), list.tokens, this._tokens, signedOut, this._logger);
-		this._tokens = merged.tokens;
-		this._signedOut = newestFirst(SIGNED_OUT_SESSIONS_MAX, merged.signedOut, list.signedOut, this._signedOut);
-		this._revisions = newestFirst(STORED_REVISIONS_MAX, list.revisions, this._revisions);
+		const base = this._mergeBase(list);
+		if (base) {
+			const merged = mergeSessions(base, list.tokens, this._tokens, signedOut, this._logger);
+			this._tokens = merged.tokens;
+			this._signedOut = newestFirst(merged.signedOut, list.signedOut, this._signedOut);
+		} else {
+			const merged = mergeWithoutBase(list.tokens, this._tokens, signedOut, this._unsaved);
+			this._tokens = merged.tokens;
+			this._signedOut = newestFirst(list.signedOut, this._signedOut);
+			if (merged.unreconciled) {
+				// Not restored and not recorded as signed out: this window cannot tell which they were.
+				this._logger.error(`The stored sessions share no list known here, so a session missing from them cannot be told signed out from never saved: ${merged.unreconciled} session(s) held here are not restored. Sign in again where one is still needed.`);
+			}
+		}
+		this._revisions = newestFirst(list.revisions, this._revisions);
 		this._remember(list);
+		this._markStored(list.tokens);
 		this._stored = list;
 		this._tokensObservable.set(list.tokens, undefined);
 		if (!this._saving && !sameSessions(this._tokens, list.tokens)) {
@@ -1303,67 +1431,81 @@ class TokenStore implements Disposable {
 		}
 	}
 
-	/** The last list that both a stored list and the sessions here include. */
-	private _mergeBase(list: ISessionList): readonly ISessionToken[] {
+	/** The last list that both a stored list and the sessions here include; undefined when there is none. */
+	private _mergeBase(list: ISessionList): readonly ISessionToken[] | undefined {
 		for (const revision of list.revisions) {
-			const known = this._revisions.includes(revision) ? this._lists.get(revision) : undefined;
+			const known = this._lists.get(revision);
 			if (known) {
 				return known;
 			}
 		}
-		// No list known to both: nothing here is taken as removed by it (see the class comment).
-		this._logger.warn('The stored sessions share no known list with the sessions here; they are merged without dropping any session.');
-		return [];
+		this._logger.warn('The stored sessions share no list known here; nothing stored before is restored from this window.');
+		return undefined;
 	}
 
+	/** Every list read or saved here is kept while the window is open (see {@link _lists}). */
 	private _remember(list: ISessionList): void {
 		this._lists.set(list.revisions[0], list.tokens);
-		for (const revision of this._lists.keys()) {
-			if (this._lists.size <= REMEMBERED_LISTS_MAX) {
-				break;
-			}
-			this._lists.delete(revision);
+	}
+
+	/** The credentials of a list read from storage, or of a save that completed, are stored: none is unsaved any more. */
+	private _markStored(tokens: readonly ISessionToken[]): void {
+		for (const token of tokens) {
+			this._unsaved.delete(token.session_id);
+			this._unsaved.delete(token.revision);
 		}
 	}
 
 	/**
 	 * Applies the change here and saves it. When it cannot be saved this rejects with {@link DynamicAuthSessionPersistError}
 	 * (after one error line) and the change stays pending: {@link savePending} saves it before a later operation succeeds.
-	 * A refresh replaces the credential of its session only if it is still the one refreshed: a session another window
-	 * refreshed meanwhile keeps that credential and the new one becomes a session of its own; a session signed out
-	 * meanwhile stays signed out.
+	 * A refresh replaces the credential of its session only if it is still the one refreshed: when another window
+	 * refreshed the session meanwhile, both credentials are kept as two sessions by the rule a merge uses
+	 * ({@link splitConcurrent}: the smaller revision keeps the session id); a session signed out meanwhile, or a credential
+	 * that another window forked off its session and signed out, stays signed out. Resolves to the sessions added, as kept.
 	 */
 	async update({ added = [], refreshed = [], removed = [] }: {
 		added?: readonly IAuthorizationToken[];
 		refreshed?: readonly { previous: ISessionToken; token: IAuthorizationToken }[];
 		removed?: readonly ISessionToken[];
-	}): Promise<void> {
+	}): Promise<ISessionToken[]> {
 		this._logger.trace(`Updating tokens: added ${added.length + refreshed.length}, removed ${refreshed.length + removed.length}`);
+		const signedOut = new Set(this._signedOut);
 		let tokens = [...this._tokens];
 		for (const { previous, token } of refreshed) {
 			const index = tokens.findIndex(t => t.session_id === previous.session_id);
-			if (index === -1) {
+			if (index === -1 || signedOut.has(previous.revision)) {
 				this._logger.warn('A session refreshed here was signed out meanwhile; it stays signed out and the refreshed credential is not kept.');
-			} else if (tokens[index].revision !== previous.revision) {
-				// The other window's credential is stored already: it keeps the session id, and this one is a session of its own.
+				continue;
+			}
+			const revision = newRevision();
+			this._unsaved.add(revision);
+			const refreshedHere: ISessionToken = { ...token, session_id: previous.session_id, revision };
+			if (tokens[index].revision !== previous.revision) {
 				this._logger.warn('A session was refreshed both here and in another window; both credentials are kept, as two sessions.');
-				const revision = newRevision();
-				tokens.push({ ...token, session_id: revision, revision });
+				const split = splitConcurrent(tokens[index], refreshedHere);
+				tokens[index] = split.kept;
+				tokens.push(split.fork);
 			} else {
-				tokens[index] = { ...token, session_id: previous.session_id, revision: newRevision() };
+				tokens[index] = refreshedHere;
 			}
 		}
-		for (const token of added) {
-			tokens.push({ ...token, session_id: newRevision(), revision: newRevision() });
-		}
+		const addedTokens = added.map((token): ISessionToken => {
+			const sessionId = newRevision(), revision = newRevision();
+			this._unsaved.add(sessionId);
+			this._unsaved.add(revision);
+			return { ...token, session_id: sessionId, revision };
+		});
+		tokens.push(...addedTokens);
 		if (removed.length) {
 			const ids = removed.map(token => token.session_id);
 			tokens = tokens.filter(t => !ids.includes(t.session_id));
-			this._signedOut = newestFirst(SIGNED_OUT_SESSIONS_MAX, ids, this._signedOut);
+			this._signedOut = newestFirst(ids, this._signedOut);
 		}
 		this._tokens = tokens;
 		await this.savePending();
 		this._logger.trace(`Tokens updated: ${tokens.length} tokens stored.`);
+		return addedTokens;
 	}
 
 	/**
@@ -1395,9 +1537,9 @@ class TokenStore implements Disposable {
 
 	private async _saveOnce(): Promise<void> {
 		const tokens = this._tokens;
-		const revisions = newestFirst(STORED_REVISIONS_MAX, [newRevision()], this._revisions);
-		const signedOut = this._signedOut;
-		this._revisions = revisions;
+		this._revisions = newestFirst([newRevision()], this._revisions);
+		const revisions = this._revisions.slice(0, STORED_REVISIONS_MAX);
+		const signedOut = this._signedOut.slice(0, SIGNED_OUT_SESSIONS_MAX);
 		const list: ISessionList = { tokens, revisions, signedOut };
 		this._remember(list);
 		const reads = this._reads;
@@ -1414,6 +1556,7 @@ class TokenStore implements Disposable {
 			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${failure}`);
 			throw new DynamicAuthSessionPersistError(tokens.length, failure);
 		}
+		this._markStored(tokens);
 		if (this._reads === reads) {
 			// Nothing was read while saving: the saved list is the stored one. Otherwise the last list read is the one
 			// compared with, and the merged sessions are saved again if they differ.
@@ -1451,7 +1594,7 @@ class TokenStore implements Disposable {
 
 			// Find added sessions
 			for (const current of currentSessions) {
-				const exists = previousSessions.some(prev => prev.accessToken === current.accessToken);
+				const exists = previousSessions.some(prev => prev.id === current.id);
 				if (!exists) {
 					added.push(current);
 				}
@@ -1459,7 +1602,7 @@ class TokenStore implements Disposable {
 
 			// Find removed sessions
 			for (const prev of previousSessions) {
-				const exists = currentSessions.some(current => current.accessToken === prev.accessToken);
+				const exists = currentSessions.some(current => current.id === prev.id);
 				if (!exists) {
 					removed.push(prev);
 				}

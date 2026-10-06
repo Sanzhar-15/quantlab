@@ -30,6 +30,8 @@ const TOKEN_ENDPOINT = `${AUTH_SERVER}/token`;
 const CLIENT_ID = 'client-1';
 
 type StoredToken = IAuthorizationTokenResponse & { created_at: number };
+/** A stored token as this version saves it, without the bookkeeping of its list. */
+type SessionRecord = StoredToken & { session_id: string; revision: string };
 type TokensChange = { authProviderId: string; clientId: string; tokens: StoredToken[] };
 
 class TestDynamicAuthProvider extends DynamicAuthProvider {
@@ -58,6 +60,8 @@ class SharedSessionStorage {
 	private readonly _windows: { emitter: Emitter<TokensChange>; providerId: () => string; delayed: boolean; missed: boolean }[] = [];
 	private _pendingReads = 0;
 	private _pendingSaves = 0;
+	/** Every value saved, in order (JSON). */
+	readonly saved: string[] = [];
 
 	constructor(initial: StoredToken[]) {
 		this._value = JSON.stringify(initial);
@@ -93,6 +97,7 @@ class SharedSessionStorage {
 
 	async save(tokens: unknown[]): Promise<void> {
 		this._value = JSON.stringify(tokens);
+		this.saved.push(this._value);
 		this._pendingReads++;
 		setTimeout(() => {
 			this._pendingReads--;
@@ -139,15 +144,27 @@ suite('ExtHostAuthentication - dynamic auth sessions across windows', () => {
 	let fetchStub: sinon.SinonStub;
 	/** The token responses of the next refreshes, in order. */
 	let refreshResponses: IAuthorizationTokenResponse[];
+	/** The refresh token each refresh request sent, in order. */
+	let refreshRequests: string[];
+	/** When set, the next refresh response waits for it (its response is taken when the request is made). */
+	let refreshHold: DeferredPromise<void> | undefined;
 	setup(() => {
 		refreshResponses = [];
+		refreshRequests = [];
+		refreshHold = undefined;
 		fetchStub = sinon.stub(globalThis, 'fetch');
-		fetchStub.callsFake(async (input: string | URL | Request) => {
+		fetchStub.callsFake(async (input: string | URL | Request, init?: RequestInit) => {
 			if (String(input) !== TOKEN_ENDPOINT) {
 				return new Response('', { status: 404 });
 			}
+			refreshRequests.push(String(new URLSearchParams(String(init?.body)).get('refresh_token')));
 			const response = refreshResponses.shift();
 			assert.ok(response, 'a refresh is expected');
+			const hold = refreshHold;
+			refreshHold = undefined;
+			if (hold) {
+				await hold.p;
+			}
 			return new Response(JSON.stringify(response), { status: 200 });
 		});
 	});
@@ -429,6 +446,216 @@ suite('ExtHostAuthentication - dynamic auth sessions across windows', () => {
 
 			assert.deepStrictEqual(credentials(storage.stored), [['at-other', '']], 'the session saved here is not lost, and the sign-out stands');
 			await assertAgree(storage, ['at-other'], here, there);
+		});
+	});
+
+	/** Polls until `condition` holds; a condition that never holds fails the test. */
+	async function waitUntil(condition: () => boolean, what: string): Promise<void> {
+		for (let i = 0; i < 200 && !condition(); i++) {
+			await new Promise(resolve => setTimeout(resolve, 0));
+		}
+		assert.ok(condition(), what);
+	}
+
+	/** A stored list as this version saves it: each token with its session id, revision and the list's bookkeeping. */
+	function sessionList(tokens: SessionRecord[]): StoredToken[] {
+		return tokens.map(t => ({ ...t, stored_revisions: ['list-0'], signed_out_sessions: [] }));
+	}
+
+	function signedOutRecord(storage: SharedSessionStorage): string[] {
+		return (storage.raw[0] as unknown as { signed_out_sessions: string[] }).signed_out_sessions;
+	}
+
+	// F-SECRETS-6 review c1 (M1): a stored list carries only its newest revisions and sign-outs. A window that read none of
+	// them cannot tell a session missing from the list signed out from never saved: it restores none, and says so; a
+	// window that saw the sign-outs keeps them while it is open, however many there were.
+	suite('sign-outs beyond what a stored list carries', () => {
+		const COUNT = 33;
+		function manySessions(): StoredToken[] {
+			const now = Date.now();
+			return Array.from({ length: COUNT }, (_, i) => ({ access_token: `access-${i}`, refresh_token: `refresh-${i}`, token_type: 'Bearer', scope: `s${i}`, expires_in: 3600, created_at: now }));
+		}
+
+		async function signOutAll(win: IWindow): Promise<void> {
+			for (const session of await win.provider.getSessions(undefined, {})) {
+				await win.provider.removeSession(session.id);
+			}
+		}
+
+		test('33 sign-outs while another window reads nothing: once it reads, none of them comes back', async () => {
+			const storage = new SharedSessionStorage(manySessions());
+			const here = openWindow(storage), there = openWindow(storage);
+			storage.delayReads(there.index);
+			await signOutAll(here);
+			await storage.readsDelivered();
+			assert.deepStrictEqual(storage.stored, []);
+
+			storage.deliverDelayed(there.index);
+			await storage.settled();
+			await assertAgree(storage, [], here, there);
+			// The list carries the newest 32 sign-outs: the one before them cannot be told from a lost save, and is reported.
+			assert.ok(there.logger.lines.some(line => line.includes(': 1 session(s) held here are not restored')), 'the window that cannot reconcile says so');
+			assertNoTokenInLogs([here, there], manySessions().flatMap(t => [t.access_token, t.refresh_token!]));
+		});
+
+		test('33 sign-outs, then a save of a window that read none of them: the window that signed out removes them again', async () => {
+			const storage = new SharedSessionStorage(manySessions());
+			const here = openWindow(storage), there = openWindow(storage);
+			storage.delayReads(there.index);
+			await signOutAll(here);
+			await storage.readsDelivered();
+
+			// The other window read none of the sign-outs: its sign-in saves every session it holds.
+			there.provider.useTokenFlow({ access_token: 'at-new', token_type: 'Bearer', scope: 'new' });
+			await there.provider.createSession(['new'], {});
+			await storage.readsDelivered();
+			storage.deliverDelayed(there.index);
+			await storage.settled();
+			await assertAgree(storage, ['at-new'], here, there);
+		});
+	});
+
+	// F-SECRETS-6 review c1 (M2): a fork's id is the revision it was forked with, so its sign-out also signs out that
+	// credential where a window still holds it under the session it was forked from.
+	suite('a signed-out fork', () => {
+
+		test('two refreshes kept as two sessions, the fork signed out, then 32 other saves: the window still holding the fork\'s credential drops it', async () => {
+			let found: { storage: SharedSessionStorage; here: IWindow; there: IWindow; fork: SessionRecord } | undefined;
+			// Which credential becomes the fork is decided by revision (random): the case under test is the one where the
+			// window that reads nothing more holds it.
+			for (let attempt = 0; attempt < 20 && !found; attempt++) {
+				const storage = new SharedSessionStorage([expiring]);
+				const here = openWindow(storage), there = openWindow(storage);
+				refreshResponses.push(refreshedHere, refreshedThere);
+				here.failSaves = true;
+				await assert.rejects(here.provider.getSessions(['read'], {}));
+				here.failSaves = false;
+				storage.delayReads(there.index);
+				await there.provider.getSessions(['read'], {});
+				await storage.readsDelivered();
+				await storage.settled();
+				const raw = storage.raw as SessionRecord[];
+				const forks = raw.filter(t => t.session_id === t.revision);
+				assert.deepStrictEqual([raw.length, forks.length], [2, 1], 'the two refreshes are kept as two sessions, one of them a fork');
+				if (forks[0].access_token === 'at-there') {
+					found = { storage, here, there, fork: forks[0] };
+				}
+			}
+			assert.ok(found, 'within 20 attempts the window that reads nothing more holds the fork');
+			const { storage, here, there, fork } = found;
+
+			await here.provider.removeSession(fork.revision);
+			for (let i = 0; i < 32; i++) {
+				here.provider.useTokenFlow({ access_token: `at-u${i}`, token_type: 'Bearer', scope: `u${i}` });
+				await here.provider.createSession([`u${i}`], {});
+			}
+			await storage.readsDelivered();
+			assert.ok(signedOutRecord(storage).includes(fork.revision), 'the sign-out of the fork is recorded');
+
+			const savesBefore = storage.saved.length;
+			storage.deliverDelayed(there.index);
+			await storage.settled();
+			assert.ok(signedOutRecord(storage).includes(fork.revision), 'the sign-out of the fork is still recorded');
+			assert.ok(storage.saved.slice(savesBefore).every(value => !value.includes('rt-there')), 'no save writes the fork\'s credential again, not even until a repair');
+			const expected = ['at-here', ...Array.from({ length: 32 }, (_, i) => `at-u${i}`)].sort();
+			await assertAgree(storage, expected, here, there);
+			assert.ok(!JSON.stringify(storage.raw).includes('rt-there'), 'the fork\'s refresh token is not stored');
+		});
+	});
+
+	// F-SECRETS-6 review c1 (M4): a caller names a credential by its session id, never by its access token: two sessions
+	// may hold the same access token with different refresh tokens.
+	suite('sessions that share an access token', () => {
+
+		function twoSessions(createdAt: number): StoredToken[] {
+			return sessionList([
+				{ access_token: 'same-access', refresh_token: 'refresh-A', token_type: 'Bearer', scope: 'read', expires_in: 3600, created_at: createdAt, session_id: 'session-A', revision: 'rev-A' },
+				{ access_token: 'same-access', refresh_token: 'refresh-B', token_type: 'Bearer', scope: 'read', expires_in: 3600, created_at: createdAt, session_id: 'session-B', revision: 'rev-B' },
+			]);
+		}
+
+		for (const [removedId, kept] of [['rev-A', 'refresh-B'], ['rev-B', 'refresh-A']]) {
+			test(`signing out of one removes that one only (${removedId})`, async () => {
+				const storage = new SharedSessionStorage(twoSessions(Date.now()));
+				const win = openWindow(storage);
+				assert.deepStrictEqual((await win.provider.getSessions(undefined, {})).map(s => s.id).sort(), ['rev-A', 'rev-B']);
+				await win.provider.removeSession(removedId);
+				await storage.settled();
+				assert.deepStrictEqual(credentials(storage.stored), [['same-access', kept]]);
+				assert.deepStrictEqual((await openWindow(storage).provider.getSessions(undefined, {})).map(s => s.id), [removedId === 'rev-A' ? 'rev-B' : 'rev-A'], 'after a restart');
+			});
+		}
+
+		test('refreshing both sends each one\'s refresh token and keeps both rotations', async () => {
+			const storage = new SharedSessionStorage(twoSessions(1));
+			const win = openWindow(storage);
+			refreshResponses.push(
+				{ access_token: 'new-access-1', refresh_token: 'rotated-1', token_type: 'Bearer', scope: 'read', expires_in: 3600 },
+				{ access_token: 'new-access-2', refresh_token: 'rotated-2', token_type: 'Bearer', scope: 'read', expires_in: 3600 },
+			);
+			await win.provider.getSessions(['read'], {});
+			await storage.settled();
+			assert.deepStrictEqual([...refreshRequests].sort(), ['refresh-A', 'refresh-B'], 'each session is refreshed with its own refresh token');
+			assert.deepStrictEqual(credentials(storage.stored), [['new-access-1', 'rotated-1'], ['new-access-2', 'rotated-2']], 'both rotations are kept');
+		});
+
+		test('a new session with the same access token is returned as itself', async () => {
+			const storage = new SharedSessionStorage(twoSessions(Date.now()));
+			const win = openWindow(storage);
+			win.provider.useTokenFlow({ access_token: 'same-access', refresh_token: 'refresh-C', token_type: 'Bearer', scope: 'read' });
+			const created = await win.provider.createSession(['read'], {});
+			await storage.settled();
+			assert.ok(!['rev-A', 'rev-B'].includes(created.id), 'not another session');
+			assert.strictEqual((storage.raw as SessionRecord[]).find(t => t.revision === created.id)?.refresh_token, 'refresh-C');
+			assert.deepStrictEqual(credentials(storage.stored), [['same-access', 'refresh-A'], ['same-access', 'refresh-B'], ['same-access', 'refresh-C']]);
+		});
+
+		test('a refresh that keeps the access token and replaces the refresh token is reported as the new session it is', async () => {
+			const storage = new SharedSessionStorage(sessionList([
+				{ access_token: 'same-access', refresh_token: 'refresh-A', token_type: 'Bearer', scope: 'read', expires_in: 3600, created_at: 1, session_id: 'session-A', revision: 'rev-A' },
+			]));
+			const win = openWindow(storage);
+			const events: { added: string[] | undefined; removed: string[] | undefined; changed: string[] | undefined }[] = [];
+			store.add(win.provider.onDidChangeSessions(e => events.push({ added: e.added?.map(s => s.id), removed: e.removed?.map(s => s.id), changed: e.changed?.map(s => s.id) })));
+			refreshResponses.push({ access_token: 'same-access', refresh_token: 'rotated-A', token_type: 'Bearer', scope: 'read', expires_in: 3600 });
+			const [session] = await win.provider.getSessions(['read'], {});
+			await storage.settled();
+			assert.notStrictEqual(session.id, 'rev-A', 'the new credential is a new revision');
+			assert.deepStrictEqual(events, [{ added: [session.id], removed: ['rev-A'], changed: [] }]);
+			assert.deepStrictEqual(credentials(storage.stored), [['same-access', 'rotated-A']]);
+		});
+	});
+
+	// F-SECRETS-6 review c1 (O6): two credentials of one session, each made without the other in view, are split by one
+	// rule on every path: the smaller revision keeps the session id, the other becomes a session whose id is its revision.
+	suite('one rule for two concurrent refreshes', () => {
+
+		test('a refresh here that completes after another window\'s refresh was read: the smaller revision keeps the session id', async () => {
+			// Revisions are random: eight rounds, so that both orders are met.
+			for (let round = 0; round < 8; round++) {
+				const storage = new SharedSessionStorage([expiring]);
+				const here = openWindow(storage), there = openWindow(storage);
+				refreshResponses.push(refreshedHere, refreshedThere);
+				refreshRequests.length = 0;
+				refreshHold = new DeferredPromise<void>();
+				const hold = refreshHold;
+				const refreshing = here.provider.getSessions(['read'], {});
+				await waitUntil(() => refreshRequests.length === 1, 'the refresh here is requested');
+				await there.provider.getSessions(['read'], {});
+				await storage.readsDelivered(); // this window reads the other window's refresh before its own response arrives
+				hold.complete();
+				await refreshing;
+				await storage.settled();
+
+				const raw = storage.raw as SessionRecord[];
+				assert.deepStrictEqual(credentials(raw), [['at-here', 'rt-here'], ['at-there', 'rt-there']], 'both credentials are kept');
+				const forks = raw.filter(t => t.session_id === t.revision);
+				const keepers = raw.filter(t => t.session_id !== t.revision);
+				assert.deepStrictEqual([forks.length, keepers.length], [1, 1]);
+				assert.ok(keepers[0].session_id.startsWith('legacy-'), 'the session keeps its id');
+				assert.ok(keepers[0].revision < forks[0].revision, `round ${round}: the smaller revision keeps the session id`);
+				await assertAgree(storage, ['at-here', 'at-there'], here, there);
+			}
 		});
 	});
 });
