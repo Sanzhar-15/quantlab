@@ -34,7 +34,8 @@ export async function getCurrentAuthenticationSessionInfo(
 ): Promise<AuthenticationSessionInfo | undefined> {
 	const key = `${productService.urlProtocol}.loginAccount`;
 	const authenticationSessionValue = await secretStorageService.get(key);
-	if (authenticationSessionValue) {
+	// Only undefined is absence: a stored empty string is a present value that is not a session.
+	if (authenticationSessionValue !== undefined) {
 		let authenticationSessionInfo: AuthenticationSessionInfo;
 		try {
 			authenticationSessionInfo = JSON.parse(authenticationSessionValue);
@@ -42,10 +43,12 @@ export async function getCurrentAuthenticationSessionInfo(
 			// The parse error quotes the stored text (an access token), so it is not carried.
 			throw new InvalidStoredSecretError(key, 'is not valid JSON');
 		}
-		if (authenticationSessionInfo
+		if (typeof authenticationSessionInfo === 'object'
+			&& authenticationSessionInfo !== null
 			&& isString(authenticationSessionInfo.id)
 			&& isString(authenticationSessionInfo.accessToken)
 			&& isString(authenticationSessionInfo.providerId)
+			&& (authenticationSessionInfo.canSignOut === undefined || typeof authenticationSessionInfo.canSignOut === 'boolean')
 		) {
 			return authenticationSessionInfo;
 		}
