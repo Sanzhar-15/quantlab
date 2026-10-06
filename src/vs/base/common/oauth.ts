@@ -830,35 +830,75 @@ export function isAuthorizationRegistrationErrorResponse(obj: unknown): obj is I
 //#endregion
 
 //#region safe error reporting
-// A token, registration or device-code response holds credentials (client secret, access, refresh and id tokens, device
-// code). None of it may reach a log argument or an Error message or cause: the helpers below describe a failure by HTTP
-// status and by an OAuth `error` code that passes SAFE_OAUTH_ERROR_CODE, never by any other part of the body. A parse
-// failure is reported with a NEW error and no cause, because V8 SyntaxError messages quote the text they failed on.
+// A token, registration, device-code or metadata response holds credentials (client secret, access, refresh and id tokens,
+// device code), and so can a status line, a URL or a transport error. None of it may reach a log argument or an Error
+// message or cause. The helpers below describe a failure ONLY by the numeric HTTP status, by an OAuth `error` code that is
+// on the allowlist below, and by fixed outcome names; operation labels are static strings chosen by the caller. A parse,
+// read or transport failure is reported with a NEW error and no cause, because parser messages quote the text they failed
+// on and transport messages quote the URL.
 
-const SAFE_OAUTH_ERROR_CODE = /^[A-Za-z0-9_.-]{1,64}$/;
+/**
+ * The OAuth error codes that may be reported: RFC 6749 (sections 4.1.2.1 and 5.2), RFC 8628 (3.5), RFC 7591 (3.2.2) and
+ * RFC 6750 (3.1). Any other value, even a short token-like one, may be a credential and is never reported.
+ */
+const ALLOWED_OAUTH_ERROR_CODES: ReadonlySet<string> = new Set<string>([
+	AuthorizationErrorType.InvalidRequest,
+	AuthorizationErrorType.InvalidClient,
+	AuthorizationErrorType.InvalidGrant,
+	AuthorizationErrorType.UnauthorizedClient,
+	AuthorizationErrorType.UnsupportedGrantType,
+	AuthorizationErrorType.InvalidScope,
+	AuthorizationDeviceCodeErrorType.AuthorizationPending,
+	AuthorizationDeviceCodeErrorType.SlowDown,
+	AuthorizationDeviceCodeErrorType.AccessDenied,
+	AuthorizationDeviceCodeErrorType.ExpiredToken,
+	AuthorizationRegistrationErrorType.InvalidRedirectUri,
+	AuthorizationRegistrationErrorType.InvalidClientMetadata,
+	AuthorizationRegistrationErrorType.InvalidSoftwareStatement,
+	AuthorizationRegistrationErrorType.UnapprovedSoftwareStatement,
+	'unsupported_response_type',
+	'server_error',
+	'temporarily_unavailable',
+	'invalid_token',
+	'insufficient_scope'
+]);
 
 /**
  * The subset of a fetch Response the safe error helpers read.
  */
 export interface IOAuthTextResponse {
 	readonly status: number;
-	readonly statusText: string;
 	text(): Promise<string>;
 }
 
 /**
- * Returns the OAuth `error` code of a parsed response body only when it is a short token-like string, otherwise undefined.
+ * Returns the OAuth `error` code of a parsed response body only when it is on the allowlist, otherwise undefined.
  */
 export function getSafeOAuthErrorCode(body: unknown): string | undefined {
 	if (typeof body !== 'object' || body === null) {
 		return undefined;
 	}
 	const errorCode = (body as { error?: unknown }).error;
-	return typeof errorCode === 'string' && SAFE_OAUTH_ERROR_CODE.test(errorCode) ? errorCode : undefined;
+	return typeof errorCode === 'string' && ALLOWED_OAUTH_ERROR_CODES.has(errorCode) ? errorCode : undefined;
 }
 
-function describeOAuthHttpStatus(response: Pick<IOAuthTextResponse, 'status' | 'statusText'>): string {
-	return [response.status, response.statusText].filter(part => part !== undefined && part !== '').join(' ');
+/**
+ * Describes a parsed body for a message: an allowlisted error code, or a fixed outcome that never repeats the value.
+ */
+function describeOAuthBody(body: unknown): string {
+	const errorCode = getSafeOAuthErrorCode(body);
+	if (errorCode) {
+		return errorCode;
+	}
+	const hasError = typeof body === 'object' && body !== null && (body as { error?: unknown }).error !== undefined;
+	return hasError ? 'unrecognised error code' : 'no error code in body';
+}
+
+/**
+ * The numeric HTTP status. The reason phrase is server supplied text and is never used.
+ */
+function describeOAuthHttpStatus(response: Pick<IOAuthTextResponse, 'status'>): string {
+	return typeof response.status === 'number' && Number.isInteger(response.status) ? String(response.status) : 'unknown status';
 }
 
 /**
@@ -871,13 +911,13 @@ export type OAuthBodyOutcome =
 	| { readonly kind: 'unreadable' };
 
 /**
- * Builds the message of an HTTP failure from the status and the outcome of reading the body: a vetted OAuth error code, or
- * the name of what went wrong. No body text is included.
+ * Builds the message of an HTTP failure from a static operation label, the numeric status and the outcome of reading the
+ * body: an allowlisted OAuth error code, or the name of what went wrong. No body text and no URL is included.
  */
-export function formatOAuthHttpFailure(operation: string, response: Pick<IOAuthTextResponse, 'status' | 'statusText'>, outcome: OAuthBodyOutcome): string {
+export function formatOAuthHttpFailure(operation: string, response: Pick<IOAuthTextResponse, 'status'>, outcome: OAuthBodyOutcome): string {
 	let detail: string;
 	switch (outcome.kind) {
-		case 'json': detail = getSafeOAuthErrorCode(outcome.body) ?? 'no safe error code in body'; break;
+		case 'json': detail = describeOAuthBody(outcome.body); break;
 		case 'not-json': detail = 'body not JSON'; break;
 		case 'unreadable': detail = 'body unreadable'; break;
 	}
@@ -885,8 +925,16 @@ export function formatOAuthHttpFailure(operation: string, response: Pick<IOAuthT
 }
 
 /**
+ * Creates the error for a request that did not complete (a rejected fetch). Whatever the transport said is dropped: its
+ * message can quote the URL, which can hold credentials. No cause is kept.
+ */
+export function createOAuthTransportError(operation: string): Error {
+	return new Error(`${operation} failed: the request could not be completed`);
+}
+
+/**
  * Reads a response body as text and parses it as JSON. When the body cannot be read or parsed this throws a new error that
- * names the operation and the HTTP status only: it carries no cause and no parser message.
+ * names the operation, the numeric status and which of the two went wrong: it carries no cause and no parser message.
  */
 export async function readOAuthJsonResponse(response: IOAuthTextResponse, operation: string): Promise<unknown> {
 	let text: string;
@@ -922,19 +970,32 @@ export async function readOAuthErrorBody(response: IOAuthTextResponse): Promise<
 }
 
 /**
- * Creates the error for a non-ok response: HTTP status plus the OAuth error code when it is safe to show, or the named
- * outcome of reading the body.
+ * Creates the error for a non-ok response: numeric status plus the allowlisted OAuth error code, or the named outcome of
+ * reading the body.
  */
 export async function createOAuthHttpError(operation: string, response: IOAuthTextResponse): Promise<Error> {
 	return new Error(formatOAuthHttpFailure(operation, response, await readOAuthErrorBody(response)));
 }
 
 /**
- * Creates the error for a response that parsed but does not have the expected shape. Only a safe error code is named.
+ * Creates the error for a response that parsed but does not have the expected shape: static description, numeric status and
+ * an allowlisted error code or fixed outcome.
  */
-export function createOAuthInvalidResponseError(description: string, body: unknown): Error {
-	const errorCode = getSafeOAuthErrorCode(body);
-	return new Error(`Invalid ${description} response${errorCode ? ` (${errorCode})` : ''}`);
+export function createOAuthInvalidResponseError(description: string, response: Pick<IOAuthTextResponse, 'status'>, body: unknown): Error {
+	return new Error(`Invalid ${description} response: ${describeOAuthHttpStatus(response)} (${describeOAuthBody(body)})`);
+}
+
+/**
+ * Describes a URL for a diagnostic as origin and path only. User info, query and fragment can hold credentials and are
+ * dropped. A value that is not a URL is reported as such, never echoed.
+ */
+export function describeUrlForDiagnostics(url: string): string {
+	try {
+		const parsed = new URL(url);
+		return `${parsed.origin}${parsed.pathname}`;
+	} catch {
+		return '<not a valid URL>';
+	}
 }
 
 //#endregion
@@ -991,29 +1052,29 @@ export async function fetchDynamicRegistration(serverMetadata: IAuthorizationSer
 		application_type: 'native'
 	};
 
-	const response = await fetch(serverMetadata.registration_endpoint, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify(requestBody)
-	});
+	let response: Response;
+	try {
+		response = await fetch(serverMetadata.registration_endpoint, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify(requestBody)
+		});
+	} catch {
+		// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
+		throw createOAuthTransportError('Dynamic client registration');
+	}
 
 	if (!response.ok) {
-		throw await createOAuthHttpError(`Registration to ${serverMetadata.registration_endpoint}`, response);
+		throw await createOAuthHttpError('Dynamic client registration', response);
 	}
 
-	let registration: unknown;
-	try {
-		registration = await response.json();
-	} catch {
-		// The parser message quotes the body, which holds the client secret: report a new error without it
-		throw new Error(`Registration to ${serverMetadata.registration_endpoint} failed: the response body is not valid JSON`);
-	}
+	const registration = await readOAuthJsonResponse(response, 'Dynamic client registration');
 	if (isAuthorizationDynamicClientRegistrationResponse(registration)) {
 		return registration;
 	}
-	throw createOAuthInvalidResponseError('authorization dynamic client registration', registration);
+	throw createOAuthInvalidResponseError('dynamic client registration', response, registration);
 }
 
 export interface IAuthenticationChallenge {
@@ -1127,24 +1188,28 @@ export function getClaimsFromJWT(token: string): IAuthorizationJWTClaims {
 
 	const [header, payload, _signature] = parts;
 
+	// Parser messages quote the text they fail on (a token fragment), so every failure here is a fixed message with no cause
+	let decodedHeader: unknown;
 	try {
-		const decodedHeader = JSON.parse(decodeBase64(header).toString());
-		if (typeof decodedHeader !== 'object') {
-			throw new Error('Invalid JWT token format: header is not a JSON object');
-		}
-
-		const decodedPayload = JSON.parse(decodeBase64(payload).toString());
-		if (typeof decodedPayload !== 'object') {
-			throw new Error('Invalid JWT token format: payload is not a JSON object');
-		}
-
-		return decodedPayload;
-	} catch (e) {
-		if (e instanceof Error) {
-			throw new Error(`Failed to parse JWT token: ${e.message}`);
-		}
-		throw new Error('Failed to parse JWT token');
+		decodedHeader = JSON.parse(decodeBase64(header).toString());
+	} catch {
+		throw new Error('Failed to parse JWT token: the header is not valid base64 JSON');
 	}
+	if (typeof decodedHeader !== 'object') {
+		throw new Error('Failed to parse JWT token: Invalid JWT token format: header is not a JSON object');
+	}
+
+	let decodedPayload: unknown;
+	try {
+		decodedPayload = JSON.parse(decodeBase64(payload).toString());
+	} catch {
+		throw new Error('Failed to parse JWT token: the payload is not valid base64 JSON');
+	}
+	if (typeof decodedPayload !== 'object') {
+		throw new Error('Failed to parse JWT token: Invalid JWT token format: payload is not a JSON object');
+	}
+
+	return decodedPayload as IAuthorizationJWTClaims;
 }
 
 /**
@@ -1230,7 +1295,13 @@ export async function fetchResourceMetadata(
 			'Accept': 'application/json'
 		};
 
-		const resourceMetadataUrlObj = new URL(prmUrl);
+		let resourceMetadataUrlObj: URL;
+		try {
+			resourceMetadataUrlObj = new URL(prmUrl);
+		} catch {
+			// The URL error carries the rejected input: report a new error without it
+			throw new Error('Failed to fetch resource metadata: the resource metadata URL is not a valid URL');
+		}
 		if (resourceMetadataUrlObj.origin === targetResourceUrlObj.origin) {
 			headers = {
 				...headers,
@@ -1238,29 +1309,45 @@ export async function fetchResourceMetadata(
 			};
 		}
 
-		const response = await fetchImpl(prmUrl, { method: 'GET', headers });
+		// Metadata errors reach logs and can follow a request that carried same-origin credentials: they name the URL without
+		// user info or query, the numeric status, and never the response body, the reason phrase or a transport message
+		const prmUrlForDiagnostics = describeUrlForDiagnostics(prmUrl);
+		let response: CommonResponse;
+		try {
+			response = await fetchImpl(prmUrl, { method: 'GET', headers });
+		} catch {
+			// The transport error quotes the URL, which can hold credentials: report a new error without it
+			throw new Error(`Failed to fetch resource metadata from ${prmUrlForDiagnostics}: the request could not be completed`);
+		}
 		if (response.status !== 200) {
-			let errorText: string;
-			try {
-				errorText = await response.text();
-			} catch {
-				errorText = response.statusText;
-			}
-			throw new Error(`Failed to fetch resource metadata from ${prmUrl}: ${response.status} ${errorText}`);
+			throw new Error(`Failed to fetch resource metadata from ${prmUrlForDiagnostics}: ${response.status}`);
 		}
 
-		const body = await response.json();
+		let body: unknown;
+		try {
+			body = await response.json();
+		} catch {
+			// The parser message quotes the body: report a new error without it
+			throw new Error(`Failed to fetch resource metadata from ${prmUrlForDiagnostics}: the response body is not valid JSON`);
+		}
 		if (isAuthorizationProtectedResourceMetadata(body)) {
 			// Validate that the resource matches the target resource
 			// Use URL constructor for normalization - it handles hostname case and trailing slashes
-			const prmValue = new URL(body.resource).toString();
+			let prmValue: string;
+			try {
+				prmValue = new URL(body.resource).toString();
+			} catch {
+				// The URL error carries the rejected input: report a new error without it
+				throw new Error(`Invalid resource metadata from ${prmUrlForDiagnostics}: the 'resource' property is not a valid URL`);
+			}
 			const expectedResource = new URL(validateUrl).toString();
 			if (prmValue !== expectedResource) {
-				throw new Error(`Protected Resource Metadata 'resource' property value "${prmValue}" does not match expected value "${expectedResource}" for URL ${prmUrl}. Per RFC 9728, these MUST match. See https://datatracker.ietf.org/doc/html/rfc9728#PRConfigurationValidation`);
+				// The 'resource' value is server supplied text and is not repeated; the expected value is ours
+				throw new Error(`Protected Resource Metadata 'resource' property value does not match expected value "${describeUrlForDiagnostics(expectedResource)}" for URL ${prmUrlForDiagnostics}. Per RFC 9728, these MUST match. See https://datatracker.ietf.org/doc/html/rfc9728#PRConfigurationValidation`);
 			}
 			return body;
 		} else {
-			throw new Error(`Invalid resource metadata from ${prmUrl}. Expected to follow shape of https://datatracker.ietf.org/doc/html/rfc9728#name-protected-resource-metadata (Hints: is scopes_supported an array? Is resource a string?). Current payload: ${JSON.stringify(body)}`);
+			throw new Error(`Invalid resource metadata from ${prmUrlForDiagnostics}. Expected to follow shape of https://datatracker.ietf.org/doc/html/rfc9728#name-protected-resource-metadata (Hints: is scopes_supported an array? Is resource a string?).`);
 		}
 	};
 
@@ -1270,7 +1357,8 @@ export async function fetchResourceMetadata(
 			const metadata = await fetchPrm(resourceMetadataUrl, targetResource);
 			return { metadata, errors };
 		} catch (e) {
-			errors.push(e instanceof Error ? e : new Error(String(e)));
+			// safe-error: fetchPrm throws only fixed-message errors (static text, numeric status, the URL as origin and path)
+			errors.push(e instanceof Error ? e : new Error('Resource metadata request failed with a value that is not an Error'));
 		}
 	}
 
@@ -1284,7 +1372,8 @@ export async function fetchResourceMetadata(
 			const metadata = await fetchPrm(pathAppendedUrl, targetResource);
 			return { metadata, errors };
 		} catch (e) {
-			errors.push(e instanceof Error ? e : new Error(String(e)));
+			// safe-error: fetchPrm throws only fixed-message errors (static text, numeric status, the URL as origin and path)
+			errors.push(e instanceof Error ? e : new Error('Resource metadata request failed with a value that is not an Error'));
 		}
 	}
 
@@ -1293,7 +1382,8 @@ export async function fetchResourceMetadata(
 		const metadata = await fetchPrm(rootUrl, targetResourceUrlObj.origin);
 		return { metadata, errors };
 	} catch (e) {
-		errors.push(e instanceof Error ? e : new Error(String(e)));
+		// safe-error: fetchPrm throws only fixed-message errors (static text, numeric status, the URL as origin and path)
+		errors.push(e instanceof Error ? e : new Error('Resource metadata request failed with a value that is not an Error'));
 	}
 
 	// If we've tried all methods and none worked, throw the error(s)
@@ -1329,15 +1419,6 @@ async function tryParseAuthServerMetadata(response: CommonResponse): Promise<IAu
 		// Failed to parse as JSON or not valid metadata
 	}
 	return undefined;
-}
-
-/** Helper to get error text from response */
-async function getErrText(res: CommonResponse): Promise<string> {
-	try {
-		return await res.text();
-	} catch {
-		return res.statusText;
-	}
 }
 
 /**
@@ -1390,11 +1471,11 @@ export async function fetchAuthorizationServerMetadata(
 				return metadata;
 			}
 			// No metadata found, collect error from response
-			errors.push(new Error(`Failed to fetch authorization server metadata from ${url}: ${rawResponse.status} ${await getErrText(rawResponse)}`));
+			errors.push(new Error(`Failed to fetch authorization server metadata from ${describeUrlForDiagnostics(url)}: ${rawResponse.status}`));
 			return undefined;
-		} catch (e) {
-			// Collect error from fetch failure
-			errors.push(e instanceof Error ? e : new Error(String(e)));
+		} catch {
+			// Collect the fetch failure. The transport error quotes the URL, which can hold credentials: it is replaced
+			errors.push(new Error(`Failed to fetch authorization server metadata from ${describeUrlForDiagnostics(url)}: the request could not be completed`));
 			return undefined;
 		}
 	};

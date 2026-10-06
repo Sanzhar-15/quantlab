@@ -6,7 +6,7 @@ import { randomBytes } from 'crypto';
 import * as http from 'http';
 import { URL } from 'url';
 import { DeferredPromise } from '../../../base/common/async.js';
-import { DEFAULT_AUTH_FLOW_PORT } from '../../../base/common/oauth.js';
+import { DEFAULT_AUTH_FLOW_PORT, getSafeOAuthErrorCode } from '../../../base/common/oauth.js';
 import { URI } from '../../../base/common/uri.js';
 import { ILogger } from '../../../platform/log/common/log.js';
 
@@ -66,7 +66,9 @@ export class LoopbackAuthServer implements ILoopbackServer {
 					if (error) {
 						res.writeHead(302, { location: `/done?error=${reqUrl.searchParams.get('error_description') || error}` });
 						res.end();
-						deferredPromise.error(new Error(error));
+						// The error value comes from the redirect URL and is untrusted: only an allowlisted OAuth error code is reported
+						const errorCode = getSafeOAuthErrorCode({ error });
+						deferredPromise.error(new Error(`Authorization failed (${errorCode ?? 'unrecognised error code'})`));
 						break;
 					}
 					if (!code || !state) {
@@ -143,6 +145,7 @@ export class LoopbackAuthServer implements ILoopbackServer {
 				return;
 			}
 			clearTimeout(portTimeout);
+			// safe-error: a listen error from the operating system, it carries no request data
 			deferredPromise.error(new Error(`Error listening to server: ${err}`));
 		});
 		this._server.on('close', () => {

@@ -13,7 +13,7 @@ import { INTERNAL_AUTH_PROVIDER_PREFIX, isAuthenticationWwwAuthenticateRequest }
 import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
-import { AuthorizationErrorType, createOAuthHttpError, createOAuthInvalidResponseError, fetchDynamicRegistration, formatOAuthHttpFailure, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse, OAuthBodyOutcome, readOAuthErrorBody, readOAuthJsonResponse } from '../../../base/common/oauth.js';
+import { AuthorizationErrorType, createOAuthHttpError, createOAuthInvalidResponseError, createOAuthTransportError, fetchDynamicRegistration, formatOAuthHttpFailure, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isAuthorizationErrorResponse, isAuthorizationTokenResponse, OAuthBodyOutcome, readOAuthErrorBody, readOAuthJsonResponse } from '../../../base/common/oauth.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ILogger, ILoggerService, ILogService } from '../../../platform/log/common/log.js';
@@ -268,6 +268,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					clientId = registration.client_id;
 					clientSecret = registration.client_secret;
 				} catch (err) {
+					// safe-error: fetchDynamicRegistration throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
 					this._logService.warn(`Dynamic registration failed for ${authorizationServer.toString()}: ${err.message}. Prompting user for client ID and client secret...`);
 				}
 			}
@@ -479,6 +480,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 							this._logger.info(`Successfully created a new token for scopes ${session.scopes.join(' ')}.`);
 							newTokens.push(newToken);
 						} catch (err) {
+							// safe-error: exchangeRefreshTokenForToken throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
 							this._logger.error(`Failed to refresh token: ${err}`);
 						}
 
@@ -500,6 +502,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	async createSession(scopes: string[], _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
 		this._logger.info(`Creating session for scopes: ${scopes.join(' ')}`);
 		let token: IAuthorizationTokenResponse | undefined;
+		let lastFlowError: unknown;
 		for (let i = 0; i < this._createFlows.length; i++) {
 			const { handler } = this._createFlows[i];
 			try {
@@ -515,6 +518,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					break;
 				}
 			} catch (err) {
+				lastFlowError = err;
 				const nextMode = this._createFlows[i + 1]?.label;
 				if (!nextMode) {
 					break; // No more flows to try
@@ -527,10 +531,16 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				if (!result) {
 					throw new CancellationError();
 				}
-				this._logger.error(`Failed to create token via flow '${nextMode}': ${err}`);
+				// safe-error: every create flow throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
+				this._logger.error(`Failed to create token via flow '${this._createFlows[i].label}': ${err}`);
 			}
 		}
 		if (!token) {
+			if (lastFlowError instanceof Error && !isCancellationError(lastFlowError)) {
+				// Every flow error is a fixed, credential-free message (see the OAuth safe error helpers): keep the last one
+				// safe-error: the last flow error is a fixed-message error, see the log line above
+				throw new Error(`Failed to create authentication token: ${lastFlowError.message}`);
+			}
 			throw new Error('Failed to create authentication token');
 		}
 		if (token.scope !== scopes.join(' ')) {
@@ -583,8 +593,9 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		let state: URI;
 		try {
 			state = await this._extHostUrls.createAppUri(callbackUri);
-		} catch (error) {
-			throw new Error(`Failed to create external URI: ${error}`);
+		} catch {
+			// The error comes from another process: report a new error without its text
+			throw new Error('Failed to create external URI');
 		}
 
 		// Prepare the authorization request URL
@@ -612,7 +623,6 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 		// Open the browser for user authorization
 		this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
-		this._logger.trace(`Authorization URL: ${authorizationUrl.toString()}`);
 		const opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
 		if (!opened) {
 			throw new CancellationError();
@@ -631,6 +641,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				this._logger.info('Authorization code request was cancelled by the user.');
 				throw err;
 			}
+			// safe-error: waitForAuthorizationCode and the loopback server throw only fixed-message errors
 			this._logger.error(`Failed to receive authorization code: ${err}`);
 			throw new Error(`Failed to receive authorization code: ${err}`);
 		}
@@ -663,7 +674,16 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	}
 
 	private async waitForAuthorizationCode(expectedState: URI): Promise<{ code: string }> {
-		const result = await this._proxy.$waitForUriHandler(expectedState);
+		let result: UriComponents;
+		try {
+			result = await this._proxy.$waitForUriHandler(expectedState);
+		} catch (err) {
+			if (isCancellationError(err)) {
+				throw err;
+			}
+			// The error comes from another process and its text is not trusted: report a new error
+			throw new Error('Failed to wait for the authorization redirect');
+		}
 		// Extract the code parameter directly from the query string. NOTE, URLSearchParams does not work here because
 		// it will decode the query string and we need to keep it encoded.
 		const codeMatch = /[?&]code=([^&]+)/.exec(result.query || '');
@@ -697,7 +717,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		this._logger.info('Exchanging authorization code for token...');
-		this._logger.trace(`Url: ${this._serverMetadata.token_endpoint}`);
+		this._logger.trace('Posting the token request to the token endpoint');
 		let response: Response;
 		try {
 			response = await fetch(this._serverMetadata.token_endpoint, {
@@ -708,9 +728,12 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 				},
 				body: tokenRequest.toString()
 			});
-		} catch (err) {
-			this._logger.error(`Failed to exchange authorization code for token: ${err}`);
-			throw new Error(`Failed to exchange authorization code for token: ${err}`);
+		} catch {
+			// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
+			const error = createOAuthTransportError('Token exchange');
+			// safe-error: built by createOAuthTransportError from a static label
+			this._logger.error(error.message);
+			throw error;
 		}
 
 		if (!response.ok) {
@@ -727,7 +750,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			await this._generateNewClientId();
 			throw new Error(`Client ID was invalid, generated a new one. Please try again.`);
 		}
-		throw createOAuthInvalidResponseError('authorization token', result);
+		throw createOAuthInvalidResponseError('authorization token', response, result);
 	}
 
 	protected async exchangeRefreshTokenForToken(refreshToken: string): Promise<IAuthorizationToken> {
@@ -750,14 +773,20 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			tokenRequest.append('client_secret', this._clientSecret);
 		}
 
-		const response = await fetch(this._serverMetadata.token_endpoint, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/x-www-form-urlencoded',
-				'Accept': 'application/json'
-			},
-			body: tokenRequest.toString()
-		});
+		let response: Response;
+		try {
+			response = await fetch(this._serverMetadata.token_endpoint, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					'Accept': 'application/json'
+				},
+				body: tokenRequest.toString()
+			});
+		} catch {
+			// The transport error quotes the endpoint URL, which can hold credentials: report a new error without it
+			throw createOAuthTransportError('Token refresh');
+		}
 
 		let result: unknown;
 		let failure: OAuthBodyOutcome | undefined;
@@ -785,7 +814,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		if (failure) {
 			throw new Error(formatOAuthHttpFailure('Token refresh', response, failure));
 		}
-		throw createOAuthInvalidResponseError('authorization token', result);
+		throw createOAuthInvalidResponseError('authorization token', response, result);
 	}
 
 	protected async _generateNewClientId(): Promise<void> {
@@ -796,6 +825,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._onDidChangeClientId.fire();
 		} catch (err) {
 			// When DCR fails, try to prompt the user for a client ID and client secret
+			// safe-error: fetchDynamicRegistration throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
 			this._logger.info(`Dynamic registration failed for ${this.authorizationServer.toString()}: ${err}. Prompting user for client ID and client secret.`);
 
 			try {
@@ -814,6 +844,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 				this._onDidChangeClientId.fire();
 			} catch (promptErr) {
+				// safe-error: fetchDynamicRegistration throws only fixed-message errors (static text, numeric status, allowlisted OAuth error code)
 				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${err}`);
 				throw new Error(`Failed to fetch new client ID and user did not provide one: ${err}`);
 			}
