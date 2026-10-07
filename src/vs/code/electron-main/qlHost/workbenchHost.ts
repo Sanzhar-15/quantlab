@@ -23,6 +23,7 @@ import { IAdoptedWorkbench } from './adopt.js';
 import { QlDialogMainService } from './dialogs.js';
 import { IQlWorkbenchListener, QlWindowsGate } from './gate.js';
 import { secureWorkbenchContents } from './security.js';
+import type { IQlVisibleTarget } from './standIn.js';
 import { createToggleSequencer, type ToggleView } from './toggleSequencer.js';
 
 /** The ONE key that toggles between the terminal and the workbench, while either has focus. Modifiers `CmdOrCtrl`, `Alt`, `Shift`, then one letter. */
@@ -386,6 +387,18 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 	//#endregion
 
 	//#region IQlWorkbenchListener (called by the gate)
+
+	visibleTarget(): IQlVisibleTarget {
+		const terminalHost = this.requireTerminalHost();
+
+		return {
+			window: terminalHost.window,
+			focusWorkbench: () => {
+				terminalHost.window.focus();
+				this.surface('focus');
+			}
+		};
+	}
 
 	adopted(workbench: IAdoptedWorkbench): void {
 		const terminalHost = this.requireTerminalHost();

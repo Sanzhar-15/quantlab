@@ -21,6 +21,7 @@ import { ICodeWindow, WindowMode } from '../../../platform/window/electron-main/
 import { getFocusedWindowIncludingAdopted, IOpenConfiguration, IOpenEmptyConfiguration, IWindowsCountChangedEvent, IWindowsMainService, OpenContext, setQlHostWindowSeam } from '../../../platform/windows/electron-main/windows.js';
 import { WindowsMainService } from '../../../platform/windows/electron-main/windowsMainService.js';
 import { adoptCodeWindow, IAdoptedWorkbench } from './adopt.js';
+import type { IQlVisibleTarget } from './standIn.js';
 
 export type QlGateState = 'idle' | 'opening' | 'open';
 
@@ -29,6 +30,9 @@ export interface IQlWorkbenchListener {
 
 	/** Synchronous, inside `onDidOpenWindow`: the CodeWindow has not loaded anything yet. A throw makes the gate discard the window. */
 	adopted(workbench: IAdoptedWorkbench): void;
+
+	/** Synchronous, inside `onDidOpenWindow`, before `adopted`: the host's visible window and its focus (review c1 M4, standIn.ts). */
+	visibleTarget(): IQlVisibleTarget;
 
 	/** The workbench's CodeWindow closed or was destroyed; the gate is `idle` again. */
 	gone(workbench: IAdoptedWorkbench): void;
@@ -258,7 +262,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		if (refusal === undefined && listener) {
 			let workbench: IAdoptedWorkbench | undefined;
 			try {
-				const adopted = adoptCodeWindow(codeWindow, captured[0]);
+				const adopted = adoptCodeWindow(codeWindow, captured[0], listener.visibleTarget());
 				workbench = adopted;
 				this.current = adopted;
 				adopted.onDidGone(() => this.onWorkbenchGone(adopted));
