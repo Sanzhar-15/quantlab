@@ -9,8 +9,8 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-/** The five closing checks, in the plan's order, then the extension-pack row (W-ORCH, 2026-10-05). */
-export const CHECK_IDS = ['backtest-bundled-engine', 'python-intelligence', 'notebook-cell', 'pinned-dependency-removed', 'import', 'extension-pack-quiet'];
+/** The five closing checks, in the plan's order, the extension-pack row, then the Quantbook MCP row (W-ORCH, 2026-10-05). */
+export const CHECK_IDS = ['backtest-bundled-engine', 'python-intelligence', 'notebook-cell', 'pinned-dependency-removed', 'import', 'extension-pack-quiet', 'quantbook-mcp-absent'];
 
 /** The rows a run judges: every one with the network off; with it on, only the extension-pack row. */
 export function checkIdsFor(network) {
@@ -22,6 +22,13 @@ export function checkIdsFor(network) {
 	}
 	throw new Error(`[network_mode_invalid] the network mode is ${JSON.stringify(network)} (expected off or on)`);
 }
+
+/**
+ * Every app launch runs on a scratch HOME (the import row seeds another editor's files there), where the
+ * Security framework finds no keychain: without this flag it raises "Keychain Not Found" and can hang the
+ * main process (R-24). So every launch carries it.
+ */
+export const MOCK_KEYCHAIN = '--use-mock-keychain';
 
 /** The built-in extensions whose extensionPack members the app must never install. */
 export const PACK_OWNERS = ['ms-python.python', 'ms-toolsai.jupyter'];
@@ -111,6 +118,32 @@ export function findBuiltInExtensionDir(extensionsDir, id) {
 		throw new Error(`[builtin_not_found] ${found.length} directories under ${extensionsDir} hold ${id} (expected 1)`);
 	}
 	return found[0];
+}
+
+/**
+ * Release 1 ships no Quantbook MCP server (W-ORCH, 2026-10-05). The packaged quantlab extension under
+ * `extensionsDir` must carry neither the server's compiled module nor the MCP SDK, and its manifest no MCP
+ * command or setting. The extension and its compiled Quantbook tree must exist, so absence is never
+ * judged on a missing tree.
+ */
+export function judgeQuantbookMcpAbsent(extensionsDir) {
+	let ext;
+	try {
+		ext = findBuiltInExtensionDir(extensionsDir, 'quantlab.quantlab');
+	} catch (err) {
+		return { status: 'FAIL', detail: `[quantlab_extension_not_found] ${err.message}` };
+	}
+	const compiled = path.join(ext, 'out', 'src', 'quantbook');
+	if (!fs.existsSync(path.join(compiled, 'mcp', 'mcpToolLogic.js'))) {
+		return { status: 'FAIL', detail: `[quantbook_tree_not_found] ${path.join(compiled, 'mcp', 'mcpToolLogic.js')} is absent: the packaged layout is not the one this row judges` };
+	}
+	const found = [path.join(compiled, 'mcp', 'mcpServer.js'), path.join(ext, 'node_modules', '@modelcontextprotocol')].filter(p => fs.existsSync(p));
+	const pkg = JSON.parse(fs.readFileSync(path.join(ext, 'package.json'), 'utf8'));
+	const ids = [...pkg.contributes.commands.map(c => c.command), ...Object.keys(pkg.contributes.configuration.properties)].filter(id => /Mcp/.test(id));
+	if (found.length > 0 || ids.length > 0) {
+		return { status: 'FAIL', detail: `[quantbook_mcp_shipped] files: ${JSON.stringify(found)}; manifest ids: ${JSON.stringify(ids)}` };
+	}
+	return { status: 'PASS', detail: `${ext}: no mcpServer.js, no @modelcontextprotocol, no MCP command or setting` };
 }
 
 /**

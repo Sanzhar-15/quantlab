@@ -6,7 +6,7 @@
 import type { ToolDefinition } from './types.js';
 
 /**
- * Canonical tool registry — all 23 tools per QIC Spec v6.3 Appendix A.
+ * Canonical tool registry -- all 23 tools per QIC Spec v6.3 Appendix A.
  *
  * BYOK Optimization: Tool descriptions include usage guidance to help models
  * use tools efficiently without over-investigation.
@@ -25,7 +25,7 @@ Usage tips:
 - For large data files (CSV, JSON): Use startLine/endLine to sample rather than reading everything
 - To check date ranges in data: Read first 5 lines and last 5 lines
 - For code files: Read specific sections if you know what you're looking for
-- Large source files (>500 lines) show first 100 + last 50 lines — use startLine/endLine for specific sections
+- Large source files (>500 lines) show first 100 + last 50 lines -- use startLine/endLine for specific sections
 - The tool will return file metadata (size, detected format) for data files`,
 		parameters: {
 			type: 'object',
@@ -48,7 +48,7 @@ Use this for:
 - Creating NEW files
 - Full file rewrites (replacing all content)
 
-For targeted edits to existing files, use edit_file instead — it's faster and safer.`,
+For targeted edits to existing files, use edit_file instead -- it's faster and safer.`,
 		parameters: {
 			type: 'object',
 			properties: {
@@ -67,7 +67,7 @@ For targeted edits to existing files, use edit_file instead — it's faster and 
 
 IMPORTANT:
 - old_string must match EXACTLY (including whitespace and indentation)
-- old_string must be UNIQUE in the file — include enough surrounding lines for uniqueness
+- old_string must be UNIQUE in the file -- include enough surrounding lines for uniqueness
 - To create a new file, use write_file instead
 - To delete content, set new_string to empty string
 
@@ -87,7 +87,7 @@ Workflow: read_file first to see content with line numbers, then edit_file with 
 
 	'delete_file': {
 		name: 'delete_file',
-		description: 'Delete a file. Use with caution — this is irreversible.',
+		description: 'Delete a file. Use with caution -- this is irreversible.',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -186,9 +186,9 @@ Tips:
 		description: `Search for files by name or glob pattern. Use this to find files when you know part of the filename.
 
 Examples:
-- "*.csv" — find all CSV files
-- "*config*" — find files with "config" in the name
-- "**/*test*.py" — find Python test files anywhere`,
+- "*.csv" -- find all CSV files
+- "*config*" -- find files with "config" in the name
+- "**/*test*.py" -- find Python test files anywhere`,
 		parameters: {
 			type: 'object',
 			properties: {
@@ -244,7 +244,7 @@ Use for:
 - Long-running processes
 - Interactive commands
 
-Do NOT use if you need to see the output — use run_command instead.`,
+Do NOT use if you need to see the output -- use run_command instead.`,
 		parameters: {
 			type: 'object',
 			properties: {
@@ -279,52 +279,6 @@ Keep commands simple. For complex operations, write a script and run that.`,
 		},
 		hasSideEffects: true,
 		permission: { required: true, level: 'once' },
-	},
-
-	// === Network (13-14) ===
-
-	'web_fetch': {
-		name: 'web_fetch',
-		description: `Fetch content from a URL. Returns the response body.
-
-Blocked:
-- Internal/private IPs (10.x, 192.168.x, 127.x, etc.)
-- Localhost
-- Cloud metadata endpoints
-
-Use for fetching public documentation, APIs, or web content.`,
-		parameters: {
-			type: 'object',
-			properties: {
-				url: { type: 'string', description: 'URL to fetch (must be public, external)' },
-			},
-			required: ['url'],
-		},
-		hasSideEffects: false,
-		permission: { required: true, level: 'once' },
-	},
-
-	'web_search': {
-		name: 'web_search',
-		description: `Search the web for information. Returns search results with titles, URLs, and snippets.
-
-Use for:
-- Finding documentation
-- Researching libraries or APIs
-- Looking up error messages
-
-Rate limited to prevent abuse.`,
-		parameters: {
-			type: 'object',
-			properties: {
-				query: { type: 'string', description: 'Search query' },
-				maxResults: { type: 'number', description: 'Maximum results (default: 10)' },
-			},
-			required: ['query'],
-		},
-		hasSideEffects: false,
-		permission: { required: false },
-		status: 'active',
 	},
 
 	// === Package (15) ===
@@ -406,7 +360,7 @@ Runs in the workspace environment.`,
 		name: 'inspect_notebook',
 		description: `Inspect a Jupyter notebook (.ipynb). Returns cell contents, outputs, and metadata.
 
-More efficient than read_file for notebooks — parses the JSON structure and presents it cleanly.`,
+More efficient than read_file for notebooks -- parses the JSON structure and presents it cleanly.`,
 		parameters: {
 			type: 'object',
 			properties: {
@@ -427,7 +381,7 @@ Source can be:
 - A variable name (if Python kernel is running)
 - A file path (CSV, Parquet, etc.)
 
-More informative than reading raw file — includes data analysis.`,
+More informative than reading raw file -- includes data analysis.`,
 		parameters: {
 			type: 'object',
 			properties: {
@@ -508,7 +462,7 @@ Use staged=true to see what's staged for commit. Use path to limit diff to a spe
 		name: 'create_checkpoint',
 		description: `Create a checkpoint of the current workspace state. Use before making significant changes so you can restore if needed.
 
-Checkpoints are lightweight — they track changed files, not full copies.`,
+Checkpoints are lightweight -- they track changed files, not full copies.`,
 		parameters: {
 			type: 'object',
 			properties: {

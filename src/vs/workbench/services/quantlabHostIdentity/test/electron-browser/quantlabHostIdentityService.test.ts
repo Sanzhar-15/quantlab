@@ -9,6 +9,8 @@ import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { Event } from '../../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
+import { IConfirmation, IConfirmationResult } from '../../../../../platform/dialogs/common/dialogs.js';
+import { TestDialogService } from '../../../../../platform/dialogs/test/common/testDialogService.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { INotification, INotificationHandle } from '../../../../../platform/notification/common/notification.js';
 import { TestNotificationService } from '../../../../../platform/notification/test/common/testNotificationService.js';
@@ -59,6 +61,14 @@ class RecordingSecretStorageService extends Disposable implements ISecretStorage
 	}
 }
 
+class RecordingDialogService extends TestDialogService {
+	readonly confirmations: IConfirmation[] = [];
+	override confirm(confirmation: IConfirmation): Promise<IConfirmationResult> {
+		this.confirmations.push(confirmation);
+		return super.confirm(confirmation);
+	}
+}
+
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
 suite('QuantlabHostIdentityService', () => {
@@ -75,6 +85,7 @@ suite('QuantlabHostIdentityService', () => {
 		protected override listenChanged(listener: (payload: unknown) => void): void { tickListener = listener; }
 		protected override invokeData(): Promise<unknown> { throw new Error('the identity suite makes no data call'); }
 		protected override listenFrames(): void { /* the identity suite sends no frame */ }
+		protected override invokeSignOut(): Promise<unknown> { throw new Error('the identity suite makes no sign-out call'); }
 		whenPurged(): Promise<void> { return this.legacyKeyPurge; }
 	}
 
@@ -83,10 +94,10 @@ suite('QuantlabHostIdentityService', () => {
 	let secrets: RecordingSecretStorageService;
 
 	function createService(): TestService {
-		return disposables.add(new TestService(log, notifications, secrets));
+		return disposables.add(new TestService(log, notifications, secrets, new RecordingDialogService()));
 	}
 
-	const signedIn: QuantlabIdentity = { epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } };
+	const signedIn: QuantlabIdentity = { epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } };
 
 	setup(() => {
 		invokeImpl = async () => ({ epoch: 1, signedIn: false });
@@ -98,7 +109,7 @@ suite('QuantlabHostIdentityService', () => {
 	});
 
 	test('getIdentity returns the parsed answer of the host', async () => {
-		invokeImpl = async () => ({ epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } });
+		invokeImpl = async () => ({ epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } });
 		const service = createService();
 		await service.whenPurged();
 
@@ -239,13 +250,14 @@ suite('QuantlabHostIdentityService - data', () => {
 			return dataImpl(call);
 		}
 		protected override listenFrames(listener: (payload: unknown) => void): void { frameListener = listener; }
+		protected override invokeSignOut(): Promise<unknown> { throw new Error('the data suite makes no sign-out call'); }
 		whenPurged(): Promise<void> { return this.legacyKeyPurge; }
 	}
 
 	let log: RecordingLogService;
 
 	async function createService(): Promise<TestService> {
-		const service = disposables.add(new TestService(log, new RecordingNotificationService(), disposables.add(new RecordingSecretStorageService())));
+		const service = disposables.add(new TestService(log, new RecordingNotificationService(), disposables.add(new RecordingSecretStorageService()), new RecordingDialogService()));
 		await service.whenPurged();
 		return service;
 	}
@@ -524,5 +536,99 @@ suite('QuantlabHostIdentityService - data', () => {
 		assert.deepStrictEqual(frames, []);
 		assert.strictEqual(log.errors.length, 2);
 		assert.ok(!log.errors.join('\n').includes('SENTINEL-NOT-A-REAL-TOKEN'));
+	});
+});
+
+suite('QuantlabHostIdentityService - sign-out', () => {
+
+	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	let signOutImpl: () => Promise<unknown>;
+	let signOutCount: number;
+
+	// every transport seam is overridden so no ipcRenderer is touched
+	class TestService extends QuantlabHostIdentityService {
+		protected override invokeGet(): Promise<unknown> { throw new Error('the sign-out suite makes no identity call'); }
+		protected override listenChanged(): void { /* the sign-out suite sends no tick */ }
+		protected override invokeData(): Promise<unknown> { throw new Error('the sign-out suite makes no data call'); }
+		protected override listenFrames(): void { /* the sign-out suite sends no frame */ }
+		protected override invokeSignOut(): Promise<unknown> { signOutCount++; return signOutImpl(); }
+		whenPurged(): Promise<void> { return this.legacyKeyPurge; }
+	}
+
+	let log: RecordingLogService;
+	let dialogs: RecordingDialogService;
+
+	async function createService(): Promise<TestService> {
+		const service = disposables.add(new TestService(log, new RecordingNotificationService(), disposables.add(new RecordingSecretStorageService()), dialogs));
+		await service.whenPurged();
+		return service;
+	}
+
+	setup(() => {
+		signOutImpl = async () => { throw new Error('no sign-out answer was planted for this test'); };
+		signOutCount = 0;
+		log = new RecordingLogService();
+		dialogs = new RecordingDialogService();
+	});
+
+	test('the user\'s yes invokes the host sign-out once and resolves true', async () => {
+		signOutImpl = async () => ({ ok: true, data: null });
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		assert.strictEqual(await service.signOut(), true);
+		assert.strictEqual(dialogs.confirmations.length, 1);
+		assert.ok(dialogs.confirmations[0].message.includes('Delta Plus'));
+		assert.strictEqual(signOutCount, 1);
+		assert.deepStrictEqual(log.errors, []);
+	});
+
+	// Security-relevant: sign-out ends the user's session in every view, so it happens only on the user's yes.
+	// Planted negative control: invoke before checking `confirmed` in signOut() and signOutCount is 1.
+	test('a cancelled confirm sends nothing and resolves false', async () => {
+		signOutImpl = async () => ({ ok: true, data: null });
+		dialogs.setConfirmResult({ confirmed: false });
+		const service = await createService();
+
+		assert.strictEqual(await service.signOut(), false);
+		assert.strictEqual(dialogs.confirmations.length, 1);
+		assert.strictEqual(signOutCount, 0);
+		assert.deepStrictEqual(log.errors, []);
+	});
+
+	// Planted negative control: make signOut() return true for an ok:false answer and assert.rejects fails.
+	test('a refusal rejects with its code, never resolves', async () => {
+		signOutImpl = async () => ({ ok: false, code: 'server', message: 'logout failed', status: 502 });
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		await assert.rejects(service.signOut(), (error: Error) => {
+			assert.ok(error instanceof QuantlabHostError);
+			assert.strictEqual(error.code, 'server');
+			assert.strictEqual(error.status, 502);
+			return true;
+		});
+		assert.strictEqual(signOutCount, 1);
+	});
+
+	test('a rejected invoke is rethrown and logged', async () => {
+		const failure = new Error('no handler for the channel');
+		signOutImpl = async () => { throw failure; };
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		await assert.rejects(service.signOut(), (error: Error) => error === failure);
+		assert.strictEqual(log.errors.length, 1);
+		assert.ok(log.errors[0].includes('no handler for the channel'));
+	});
+
+	test('an ok answer that carries data rejects visibly and is logged', async () => {
+		signOutImpl = async () => ({ ok: true, data: { signedOut: true } });
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		await assert.rejects(service.signOut(), /the contract says null/);
+		assert.strictEqual(log.errors.length, 1);
 	});
 });

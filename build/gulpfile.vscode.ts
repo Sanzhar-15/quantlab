@@ -39,6 +39,9 @@ gulp.task(bundleQuantlabEngineTask);
 import { quantbookEngineStream, stageQuantbookEngineTask } from './quantbook/bundle.ts';
 gulp.task(stageQuantbookEngineTask);
 // --- end quantlab engine packaging ---
+// --- quantlab built-in extension module type (F-PACK-14) ---
+import { findEsmMainsWithoutModuleType } from './lib/extensionModuleType.ts';
+// --- end quantlab built-in extension module type ---
 
 
 const glob = promisify(globCallback);
@@ -516,6 +519,15 @@ function patchWin32DependenciesTask(destinationFolderName: string) {
 
 const buildRoot = path.dirname(root);
 
+// --- quantlab built-in extension module type (F-PACK-14) ---
+const checkBuiltinExtensionModuleTypeTask = task.define('check-builtin-extension-module-type', async () => {
+	const problems = findEsmMainsWithoutModuleType(path.join(root, '.build', 'extensions'));
+	if (problems.length > 0) {
+		throw new Error(`Built-in extensions the extension host cannot load:\n${problems.join('\n')}`);
+	}
+});
+// --- end quantlab built-in extension module type ---
+
 const BUILD_TARGETS = [
 	{ platform: 'win32', arch: 'x64' },
 	{ platform: 'win32', arch: 'arm64' },
@@ -537,6 +549,7 @@ BUILD_TARGETS.forEach(buildTarget => {
 
 		const tasks = [
 			compileNativeExtensionsBuildTask,
+			checkBuiltinExtensionModuleTypeTask, // quantlab (F-PACK-14)
 			util.rimraf(path.join(buildRoot, destinationFolderName)),
 			packageTask(platform, arch, sourceFolderName, destinationFolderName, opts)
 		];

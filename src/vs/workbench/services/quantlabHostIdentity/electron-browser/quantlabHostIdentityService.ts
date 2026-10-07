@@ -9,6 +9,7 @@ import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { localize } from '../../../../nls.js';
+import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
@@ -23,6 +24,8 @@ import {
 	QUANTLAB_HOST_IDENTITY_CHANGED_CHANNEL,
 	QUANTLAB_HOST_IDENTITY_GET_CHANNEL,
 	QUANTLAB_HOST_IDENTITY_GET_REQUEST,
+	QUANTLAB_HOST_IDENTITY_SIGN_OUT_CHANNEL,
+	QUANTLAB_HOST_IDENTITY_SIGN_OUT_REQUEST,
 	QUANTLAB_LEGACY_LOGIN_SECRET_KEYS,
 	QuantlabHostError,
 	type QuantlabDataFrame,
@@ -55,6 +58,9 @@ const LOG_PREFIX = '[quantlab-host-identity]';
  * - Data (IPC-DATA): `request`, `subscribe` and `unsubscribe` invoke the data module's channels with
  *   the envelope `{ v: 1, input }`. An `ok: false` answer REJECTS with a {@link QuantlabHostError}
  *   carrying its code; a malformed answer rejects with a plain Error. Both are logged.
+ * - Sign-out (IPC-DATA amendment): `signOut()` asks a workbench modal confirm and invokes the host's
+ *   sign-out only on the user's yes. The host then moves the epoch and ticks `changed`; every store
+ *   empties on that tick. The extension reaches this only through `vscode.quantlabHost.signOut()`.
  */
 export class QuantlabHostIdentityService extends Disposable implements IQuantlabHostIdentityService {
 
@@ -78,7 +84,8 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 	constructor(
 		@ILogService private readonly logService: ILogService,
 		@INotificationService private readonly notificationService: INotificationService,
-		@ISecretStorageService private readonly secretStorageService: ISecretStorageService
+		@ISecretStorageService private readonly secretStorageService: ISecretStorageService,
+		@IDialogService private readonly dialogService: IDialogService
 	) {
 		super();
 
@@ -94,6 +101,39 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 			this.logService.error(`${LOG_PREFIX} getIdentity failed: ${toErrorMessage(error)}`);
 			throw error;
 		}
+	}
+
+	async signOut(): Promise<boolean> {
+		const { confirmed } = await this.dialogService.confirm({
+			message: localize('quantlabHostIdentity.signOut.confirm', "Sign out of Delta Plus in both views, the terminal and the workbench?"),
+			primaryButton: localize({ key: 'quantlabHostIdentity.signOut.primary', comment: ['&& denotes a mnemonic'] }, "&&Sign Out"),
+		});
+		if (!confirmed) {
+			this.logService.info(`${LOG_PREFIX} sign-out cancelled by the user; nothing sent to the host`);
+			return false;
+		}
+
+		const what = 'sign-out';
+		let raw: unknown;
+		try {
+			raw = await this.invokeSignOut();
+		} catch (error) {
+			this.logService.error(`${LOG_PREFIX} ${what} failed: ${toErrorMessage(error)}`);
+			throw error;
+		}
+		const data = this.unwrapAnswer(raw, what);
+		if (data !== null) {
+			const error = new Error(`QuantLab host data: the ${what} answer carries data; the contract says null`);
+			this.logService.error(`${LOG_PREFIX} ${error.message}`);
+			throw error;
+		}
+		this.logService.info(`${LOG_PREFIX} signed out by the host`);
+		return true;
+	}
+
+	/** Transport seam (overridden by the unit test): the sign-out `ipcRenderer.invoke`. */
+	protected invokeSignOut(): Promise<unknown> {
+		return ipcRenderer.invoke(QUANTLAB_HOST_IDENTITY_SIGN_OUT_CHANNEL, QUANTLAB_HOST_IDENTITY_SIGN_OUT_REQUEST);
 	}
 
 	/** Transport seam (overridden by the unit test): the one `ipcRenderer.invoke` of the contract. */

@@ -106,17 +106,20 @@ suite('DeltaPlusAuthProvider reads the identity through vscode.quantlabHost', ()
 
 	test('the start-up pull applies the identity from vscode.quantlabHost.getIdentity()', async () => {
 		const { result: pending } = await startInitialize(createProvider());
-		host.pulls[0].resolve({ epoch: 3, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada Lovelace' } });
+		host.pulls[0].resolve({ epoch: 3, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada Lovelace', tier: 'pro' } });
 
 		assert.strictEqual(await pending, true);
 		assert.deepStrictEqual(client.applied, [{ id: 'u1', email: 'a@example.com', name: 'Ada Lovelace' }]);
+		// AUTH-TIER display gate (PLAN-FINAL §3.2 item 1): the host user carries tier 'pro', the ServerUser every display reads has no tier key.
+		// Planted negative control: copy `user.tier` into the ServerUser in _toServerUser and this assertion fails.
+		assert.ok(!Object.prototype.hasOwnProperty.call(client.applied[0], 'tier'), 'no tier may reach a display before E2');
 		assert.strictEqual(signIns, 1);
 		assert.deepStrictEqual(_errorMessagesSnapshot(), []);
 	});
 
 	test('a nameless user is accepted and no name is invented', async () => {
 		const { result: pending } = await startInitialize(createProvider());
-		host.pulls[0].resolve({ epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com' } });
+		host.pulls[0].resolve({ epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', tier: 'pro' } });
 
 		assert.strictEqual(await pending, true);
 		assert.deepStrictEqual(client.applied, [{ id: 'u1', email: 'a@example.com' }]);
@@ -129,7 +132,7 @@ suite('DeltaPlusAuthProvider reads the identity through vscode.quantlabHost', ()
 		host.pulls[0].resolve({ epoch: 1, signedIn: false });
 		assert.strictEqual(await pending, false);
 
-		host.fire({ epoch: 2, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo' } });
+		host.fire({ epoch: 2, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo', tier: 'pro' } });
 		assert.deepStrictEqual(client.applied[client.applied.length - 1], { id: 'u2', email: 'b@example.com', name: 'Bo' });
 		assert.strictEqual(signIns, 1);
 
@@ -147,7 +150,7 @@ suite('DeltaPlusAuthProvider reads the identity through vscode.quantlabHost', ()
 	test('a change event outranks the start-up pull still in flight', async () => {
 		const { result: pending } = await startInitialize(createProvider());
 
-		host.fire({ epoch: 5, signedIn: true, user: { id: 'u5', email: 'e@example.com' } });
+		host.fire({ epoch: 5, signedIn: true, user: { id: 'u5', email: 'e@example.com', tier: 'pro' } });
 		host.pulls[0].resolve({ epoch: 4, signedIn: false });
 
 		assert.strictEqual(await pending, true);
@@ -170,11 +173,11 @@ suite('DeltaPlusAuthProvider reads the identity through vscode.quantlabHost', ()
 	// gains the forged user.
 	test('a malformed change event is shown and logged, and the held state is kept', async () => {
 		const { result: pending } = await startInitialize(createProvider());
-		host.pulls[0].resolve({ epoch: 1, signedIn: true, user: { id: 'u1', email: 'a@example.com' } });
+		host.pulls[0].resolve({ epoch: 1, signedIn: true, user: { id: 'u1', email: 'a@example.com', tier: 'pro' } });
 		await pending;
 
 		const secret = 'SENTINEL-NOT-A-REAL-TOKEN';
-		host.fire({ epoch: 2, signedIn: true, user: { id: 'u9', email: 'x@example.com', accessToken: secret } });
+		host.fire({ epoch: 2, signedIn: true, user: { id: 'u9', email: 'x@example.com', tier: 'pro', accessToken: secret } });
 		host.fire({ epoch: 0, signedIn: false });
 
 		assert.deepStrictEqual(client.applied, [{ id: 'u1', email: 'a@example.com' }]);
@@ -184,12 +187,38 @@ suite('DeltaPlusAuthProvider reads the identity through vscode.quantlabHost', ()
 		assert.ok(!errors.join('\n').includes(secret), 'the shown error must not echo a smuggled value');
 	});
 
+	// AUTH-TIER (PLAN-FINAL §3.2 item 1): Go's tier is required; an absent, empty or non-string tier is refused, never defaulted.
+	// Planted negative control: drop the user.tier check in parseHostIdentity and `applied` gains the tierless users.
+	test('a change event whose user has an absent, empty or non-string tier is shown and logged, and the held state is kept', async () => {
+		const { result: pending } = await startInitialize(createProvider());
+		host.pulls[0].resolve({ epoch: 1, signedIn: true, user: { id: 'u1', email: 'a@example.com', tier: 'pro' } });
+		await pending;
+
+		host.fire({ epoch: 2, signedIn: true, user: { id: 'u2', email: 'b@example.com' } });
+		host.fire({ epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', tier: '' } });
+		host.fire({ epoch: 4, signedIn: true, user: { id: 'u2', email: 'b@example.com', tier: 5 } });
+		host.fire({ epoch: 5, signedIn: true, user: { id: 'u2', email: 'b@example.com', tier: null } });
+
+		assert.deepStrictEqual(client.applied, [{ id: 'u1', email: 'a@example.com' }]);
+		const errors = _errorMessagesSnapshot();
+		assert.strictEqual(errors.length, 4);
+		assert.ok(errors.every(message => message.includes('Host identity user.tier is not a non-empty string.')));
+	});
+
+	test('the start-up pull rejects a user without a tier, and nothing is applied', async () => {
+		const { result: pending } = await startInitialize(createProvider());
+		host.pulls[0].resolve({ epoch: 1, signedIn: true, user: { id: 'u1', email: 'a@example.com' } });
+
+		await assert.rejects(pending, /user\.tier is not a non-empty string/);
+		assert.deepStrictEqual(client.applied, []);
+	});
+
 	test('dispose ends the onDidChangeIdentity subscription', async () => {
 		const target = createProvider();
 
 		target.dispose();
 		provider = undefined;
-		host.fire({ epoch: 2, signedIn: true, user: { id: 'u2', email: 'b@example.com' } });
+		host.fire({ epoch: 2, signedIn: true, user: { id: 'u2', email: 'b@example.com', tier: 'pro' } });
 		assert.deepStrictEqual(client.applied, []);
 	});
 });

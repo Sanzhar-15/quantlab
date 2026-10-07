@@ -3,16 +3,14 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import * as nls from '../../../../nls.js';
-import { Disposable, IDisposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
-import { Extensions, IViewContainersRegistry, IViewsRegistry, ViewContainer, ViewContainerLocation } from '../../../common/views.js';
-import { IRemoteExplorerService, PORT_AUTO_FALLBACK_SETTING, PORT_AUTO_FORWARD_SETTING, PORT_AUTO_SOURCE_SETTING, PORT_AUTO_SOURCE_SETTING_HYBRID, PORT_AUTO_SOURCE_SETTING_OUTPUT, PORT_AUTO_SOURCE_SETTING_PROCESS, PortsEnablement, TUNNEL_VIEW_CONTAINER_ID, TUNNEL_VIEW_ID } from '../../../services/remote/common/remoteExplorerService.js';
-import { Attributes, AutoTunnelSource, forwardedPortsFeaturesEnabled, forwardedPortsViewEnabled, makeAddress, mapHasAddressLocalhostOrAllInterfaces, OnPortForward, Tunnel, TunnelCloseReason, TunnelSource } from '../../../services/remote/common/tunnelModel.js';
+import { IRemoteExplorerService, PORT_AUTO_FALLBACK_SETTING, PORT_AUTO_FORWARD_SETTING, PORT_AUTO_SOURCE_SETTING, PORT_AUTO_SOURCE_SETTING_HYBRID, PORT_AUTO_SOURCE_SETTING_OUTPUT, PORT_AUTO_SOURCE_SETTING_PROCESS, PortsEnablement } from '../../../services/remote/common/remoteExplorerService.js';
+import { Attributes, AutoTunnelSource, makeAddress, mapHasAddressLocalhostOrAllInterfaces, OnPortForward, Tunnel, TunnelCloseReason, TunnelSource } from '../../../services/remote/common/tunnelModel.js';
 import { OpenPortInBrowserAction, TunnelPanel, OpenPortInPreviewAction, openPreviewEnabledContext } from './tunnelView.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
-import { IStatusbarEntry, IStatusbarEntryAccessor, IStatusbarService } from '../../../services/statusbar/browser/statusbar.js';
 import { UrlFinder } from './urlFinder.js';
 import Severity from '../../../../base/common/severity.js';
 import { ConfigurationTarget, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
@@ -23,10 +21,6 @@ import { IDebugService } from '../../debug/common/debug.js';
 import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
 import { isWeb, OperatingSystem } from '../../../../base/common/platform.js';
 import { ITunnelService, RemoteTunnel, TunnelPrivacyId } from '../../../../platform/tunnel/common/tunnel.js';
-import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
-import { ViewPaneContainer } from '../../../browser/parts/views/viewPaneContainer.js';
-import { IActivityService, NumberBadge } from '../../../services/activity/common/activity.js';
-import { portsViewIcon } from './remoteIcons.js';
 import { Event } from '../../../../base/common/event.js';
 import { IExternalUriOpenerService } from '../../externalUriOpener/common/externalUriOpenerService.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -39,129 +33,6 @@ import { IPreferencesService } from '../../../services/preferences/common/prefer
 import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
 
 export const VIEWLET_ID = 'workbench.view.remote';
-
-export class ForwardedPortsView extends Disposable implements IWorkbenchContribution {
-	private readonly contextKeyListener = this._register(new MutableDisposable<IDisposable>());
-	private readonly activityBadge = this._register(new MutableDisposable<IDisposable>());
-	private entryAccessor: IStatusbarEntryAccessor | undefined;
-	private hasPortsInSession: boolean = false;
-
-	constructor(
-		@IContextKeyService private readonly contextKeyService: IContextKeyService,
-		@IWorkbenchEnvironmentService private readonly environmentService: IWorkbenchEnvironmentService,
-		@IRemoteExplorerService private readonly remoteExplorerService: IRemoteExplorerService,
-		@ITunnelService private readonly tunnelService: ITunnelService,
-		@IActivityService private readonly activityService: IActivityService,
-		@IStatusbarService statusbarService: IStatusbarService,
-	) {
-		super();
-		this.enableBadgeAndStatusBar();
-		this.enableForwardedPortsFeatures();
-		if (!this.environmentService.remoteAuthority) {
-			this._register(Event.once(this.tunnelService.onTunnelOpened)(() => {
-				this.hasPortsInSession = true;
-			}));
-		}
-	}
-
-	private async getViewContainer(): Promise<ViewContainer | null> {
-		return Registry.as<IViewContainersRegistry>(Extensions.ViewContainersRegistry).registerViewContainer({
-			id: TUNNEL_VIEW_CONTAINER_ID,
-			title: nls.localize2('ports', "Ports"),
-			icon: portsViewIcon,
-			ctorDescriptor: new SyncDescriptor(ViewPaneContainer, [TUNNEL_VIEW_CONTAINER_ID, { mergeViewWithContainerWhenSingleView: true }]),
-			storageId: TUNNEL_VIEW_CONTAINER_ID,
-			hideIfEmpty: true,
-			order: 5
-		}, ViewContainerLocation.Panel);
-	}
-
-	private async enableForwardedPortsFeatures() {
-		this.contextKeyListener.clear();
-
-		const featuresEnabled: boolean = !!forwardedPortsFeaturesEnabled.getValue(this.contextKeyService);
-		const viewEnabled: boolean = !!forwardedPortsViewEnabled.getValue(this.contextKeyService);
-
-		if (featuresEnabled || viewEnabled) {
-			// Also enable the view if it isn't already.
-			if (!viewEnabled) {
-				this.contextKeyService.createKey(forwardedPortsViewEnabled.key, true);
-			}
-			const viewContainer = await this.getViewContainer();
-			if (viewContainer) {
-				this.remoteExplorerService.enablePortsFeatures(!featuresEnabled);
-			}
-		} else {
-			this.contextKeyListener.value = this.contextKeyService.onDidChangeContext(e => {
-				if (e.affectsSome(new Set([...forwardedPortsFeaturesEnabled.keys(), ...forwardedPortsViewEnabled.keys()]))) {
-					this.enableForwardedPortsFeatures();
-				}
-			});
-		}
-	}
-
-	private enableBadgeAndStatusBar() {
-		const disposable = Registry.as<IViewsRegistry>(Extensions.ViewsRegistry).onViewsRegistered(e => {
-			if (e.find(view => view.views.find(viewDescriptor => viewDescriptor.id === TUNNEL_VIEW_ID))) {
-				this._register(Event.debounce(this.remoteExplorerService.tunnelModel.onForwardPort, (_last, e) => e, 50)(() => {
-					this.updateActivityBadge();
-					this.updateStatusBar();
-				}));
-				this._register(Event.debounce(this.remoteExplorerService.tunnelModel.onClosePort, (_last, e) => e, 50)(() => {
-					this.updateActivityBadge();
-					this.updateStatusBar();
-				}));
-
-				this.updateActivityBadge();
-				this.updateStatusBar();
-				disposable.dispose();
-			}
-		});
-	}
-
-	private async updateActivityBadge() {
-		if (this.remoteExplorerService.tunnelModel.forwarded.size > 0) {
-			this.activityBadge.value = this.activityService.showViewActivity(TUNNEL_VIEW_ID, {
-				badge: new NumberBadge(this.remoteExplorerService.tunnelModel.forwarded.size, n => n === 1 ? nls.localize('1forwardedPort', "1 forwarded port") : nls.localize('nForwardedPorts', "{0} forwarded ports", n))
-			});
-		} else {
-			this.activityBadge.clear();
-		}
-	}
-
-	private updateStatusBar() {
-		if (!this.environmentService.remoteAuthority && !this.hasPortsInSession) {
-			// We only want to show the ports status bar entry when the user has taken an action that indicates that they might care about it.
-			return;
-		}
-
-		if (!this.entryAccessor) {
-		} else {
-			this.entryAccessor.update(this.entry);
-		}
-	}
-
-	private get entry(): IStatusbarEntry {
-		let tooltip: string;
-		const count = this.remoteExplorerService.tunnelModel.forwarded.size + this.remoteExplorerService.tunnelModel.detected.size;
-		const text = `${count}`;
-		if (count === 0) {
-			tooltip = nls.localize('remote.forwardedPorts.statusbarTextNone', "No Ports Forwarded");
-		} else {
-			const allTunnels = Array.from(this.remoteExplorerService.tunnelModel.forwarded.values());
-			allTunnels.push(...Array.from(this.remoteExplorerService.tunnelModel.detected.values()));
-			tooltip = nls.localize('remote.forwardedPorts.statusbarTooltip', "Forwarded Ports: {0}",
-				allTunnels.map(forwarded => forwarded.remotePort).join(', '));
-		}
-		return {
-			name: nls.localize('status.forwardedPorts', "Forwarded Ports"),
-			text: `$(radio-tower) ${text}`,
-			ariaLabel: tooltip,
-			tooltip,
-			command: `${TUNNEL_VIEW_ID}.focus`
-		};
-	}
-}
 
 export class PortRestore implements IWorkbenchContribution {
 	constructor(

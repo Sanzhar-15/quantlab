@@ -28,8 +28,8 @@ export function toQuantlabIdentityDto(identity: QuantlabIdentity): QuantlabIdent
 	if (!identity.signedIn) {
 		return { epoch: identity.epoch, signedIn: false };
 	}
-	const { id, email, name } = identity.user;
-	return { epoch: identity.epoch, signedIn: true, user: name === undefined ? { id, email } : { id, email, name } };
+	const { id, email, name, tier } = identity.user;
+	return { epoch: identity.epoch, signedIn: true, user: name === undefined ? { id, email, tier } : { id, email, name, tier } };
 }
 
 /** A host refusal as the protocol's answer envelope; `status` only when the host gave one. */
@@ -66,6 +66,17 @@ export class MainThreadQuantlabHost extends Disposable implements MainThreadQuan
 
 	async $getIdentity(): Promise<QuantlabIdentityDto> {
 		return toQuantlabIdentityDto(await this._hostService.getIdentity());
+	}
+
+	async $signOut(): Promise<QuantlabHostAnswerDto> {
+		// The service asks the user (workbench modal) before it invokes the host; a cancel resolves false.
+		let signedOut: boolean;
+		try {
+			signedOut = await this._hostService.signOut();
+		} catch (error) {
+			return this._refusalOrThrow(error, 'sign-out');
+		}
+		return { ok: true, data: signedOut };
 	}
 
 	async $request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<QuantlabHostAnswerDto> {

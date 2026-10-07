@@ -6,12 +6,53 @@
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderInfo, DynamicAuthenticationProviderTokensChangeEvent } from '../common/dynamicAuthenticationProviderStorage.js';
-import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
+import { InvalidStoredSecretError, ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Queue } from '../../../../base/common/async.js';
+import { runAtBoundary } from '../common/storedSecretBoundary.js';
+
+function isOptionalString(value: unknown): boolean {
+	return value === undefined || typeof value === 'string';
+}
+
+/** Total check of a stored client registration: no property is read before the value is known to be an object. */
+function isStoredClientRegistration(value: unknown): value is { clientId: string; clientSecret?: string } {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return false;
+	}
+	const registration = value as { clientId?: unknown; clientSecret?: unknown };
+	return typeof registration.clientId === 'string' && registration.clientId.length > 0 && isOptionalString(registration.clientSecret);
+}
+
+/** Total check of one stored session: no property is read before the value is known to be an object. */
+function isStoredSession(value: unknown): value is IAuthorizationTokenResponse & { created_at: number } {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return false;
+	}
+	const session = value as Record<string, unknown>;
+	return typeof session.created_at === 'number'
+		&& isAuthorizationTokenResponse(session)
+		&& typeof session.access_token === 'string'
+		&& typeof session.token_type === 'string'
+		&& (session.expires_in === undefined || typeof session.expires_in === 'number')
+		&& isOptionalString(session.refresh_token)
+		&& isOptionalString(session.scope)
+		&& isOptionalString(session.id_token);
+}
+
+/**
+ * The stored dynamic authentication provider list is present but unreadable. Carries the storage key and a
+ * reason; never the stored text.
+ */
+export class InvalidStoredProviderListError extends Error {
+	constructor(readonly storageKey: string, readonly reason: string) {
+		super(`Stored dynamic authentication provider list '${storageKey}' is invalid: ${reason}. It was left unchanged.`);
+		this.name = 'InvalidStoredProviderListError';
+	}
+}
 
 export class DynamicAuthenticationProviderStorageService extends Disposable implements IDynamicAuthenticationProviderStorageService {
 	declare readonly _serviceBrand: undefined;
@@ -29,7 +70,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		super();
 
 		// Listen for secret storage changes and emit events for dynamic auth provider token changes
-		const queue = new Queue<void>();
+		const queue = new Queue<boolean>();
 		this._register(this.secretStorageService.onDidChangeSecret(async (key: string) => {
 			let payload: { isDynamicAuthProvider: boolean; authProviderId: string; clientId: string } | undefined;
 			try {
@@ -38,14 +79,15 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 				// Ignore errors... must not be a dynamic auth provider
 			}
 			if (payload?.isDynamicAuthProvider) {
-				void queue.queue(async () => {
+				// A stored-read failure is logged and no event fires for it; the queue stays usable for the next change.
+				void queue.queue(() => runAtBoundary(async () => {
 					const tokens = await this.getSessionsForDynamicAuthProvider(payload.authProviderId, payload.clientId);
 					this._onDidChangeTokens.fire({
 						authProviderId: payload.authProviderId,
 						clientId: payload.clientId,
 						tokens
 					});
-				});
+				}, error => this.logService.error(`Could not read the stored sessions of ${payload.authProviderId} (${payload.clientId}) after a change; they are kept.`, error)));
 			}
 		}));
 	}
@@ -54,15 +96,19 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		// First try new combined SecretStorage format
 		const key = `dynamicAuthProvider:clientRegistration:${providerId}`;
 		const credentialsValue = await this.secretStorageService.get(key);
-		if (credentialsValue) {
+		// Only undefined is absence: a stored empty string is a present value that is not a registration.
+		if (credentialsValue !== undefined) {
+			let credentials: unknown;
 			try {
-				const credentials = JSON.parse(credentialsValue);
-				if (credentials && (credentials.clientId || credentials.clientSecret)) {
-					return credentials;
-				}
+				credentials = JSON.parse(credentialsValue);
 			} catch {
-				await this.secretStorageService.delete(key);
+				// The parse error quotes the stored text, so it is not carried.
+				throw new InvalidStoredSecretError(key, 'is not valid JSON');
 			}
+			if (!isStoredClientRegistration(credentials)) {
+				throw new InvalidStoredSecretError(key, 'is not a client registration with a client id and an optional client secret');
+			}
+			return credentials;
 		}
 
 		// Just grab the client id from the provider
@@ -117,20 +163,54 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		}
 	}
 
+	/**
+	 * Reads the stored provider list. An absent key is a real empty list. A present value that is not
+	 * JSON, not an array, or holds an entry that is not an object with a string `providerId` is logged
+	 * (key and reason only, never the stored text) and thrown as {@link InvalidStoredProviderListError},
+	 * so no caller can write a replacement list over it.
+	 */
 	private _getStoredProviders(): DynamicAuthenticationProviderInfo[] {
-		const stored = this.storageService.get(DynamicAuthenticationProviderStorageService.PROVIDERS_STORAGE_KEY, StorageScope.APPLICATION, '[]');
-		try {
-			const providerInfos = JSON.parse(stored);
-			// MIGRATION: remove after an iteration or 2
-			for (const providerInfo of providerInfos) {
-				if (!providerInfo.authorizationServer) {
-					providerInfo.authorizationServer = providerInfo.issuer;
-				}
-			}
-			return providerInfos;
-		} catch {
+		const storageKey = DynamicAuthenticationProviderStorageService.PROVIDERS_STORAGE_KEY;
+		const stored = this.storageService.get(storageKey, StorageScope.APPLICATION);
+		if (stored === undefined) {
 			return [];
 		}
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(stored);
+		} catch (error) {
+			// The parse message quotes its input, so only the error class is carried.
+			const errorClass = error instanceof Error ? error.name : typeof error;
+			throw this._invalidStoredProviders(storageKey, `not valid JSON (${errorClass})`);
+		}
+
+		if (!Array.isArray(parsed)) {
+			throw this._invalidStoredProviders(storageKey, `not an array (${parsed === null ? 'null' : typeof parsed})`);
+		}
+
+		const providerInfos: { providerId: string; authorizationServer?: unknown; issuer?: unknown }[] = [];
+		for (let index = 0; index < parsed.length; index++) {
+			const entry: unknown = parsed[index];
+			if (typeof entry !== 'object' || entry === null || Array.isArray(entry) || typeof (entry as { providerId?: unknown }).providerId !== 'string') {
+				throw this._invalidStoredProviders(storageKey, `entry ${index} is not an object with a string providerId`);
+			}
+			providerInfos.push(entry as { providerId: string; authorizationServer?: unknown; issuer?: unknown });
+		}
+
+		// MIGRATION: remove after an iteration or 2
+		for (const providerInfo of providerInfos) {
+			if (!providerInfo.authorizationServer) {
+				providerInfo.authorizationServer = providerInfo.issuer;
+			}
+		}
+		return providerInfos as DynamicAuthenticationProviderInfo[];
+	}
+
+	private _invalidStoredProviders(storageKey: string, reason: string): InvalidStoredProviderListError {
+		const error = new InvalidStoredProviderListError(storageKey, reason);
+		this.logService.error(error.message);
+		return error;
 	}
 
 	private _storeProviders(providers: DynamicAuthenticationProviderInfo[]): void {
@@ -169,12 +249,17 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 	async getSessionsForDynamicAuthProvider(authProviderId: string, clientId: string): Promise<(IAuthorizationTokenResponse & { created_at: number })[] | undefined> {
 		const key = JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 		const value = await this.secretStorageService.get(key);
-		if (value) {
-			const parsed = JSON.parse(value);
-			if (!Array.isArray(parsed) || !parsed.every((t) => typeof t.created_at === 'number' && isAuthorizationTokenResponse(t))) {
-				this.logService.error(`Invalid session data for ${authProviderId} (${clientId}) in secret storage:`, parsed);
-				await this.secretStorageService.delete(key);
-				return undefined;
+		// Only undefined is absence: a stored empty string is a present value that is not a session list.
+		if (value !== undefined) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(value);
+			} catch {
+				// The parse error quotes the stored text, so it is not carried.
+				throw new InvalidStoredSecretError(key, 'is not valid JSON');
+			}
+			if (!Array.isArray(parsed) || !parsed.every(isStoredSession)) {
+				throw new InvalidStoredSecretError(key, `is not a list of token responses for ${authProviderId} (${clientId})`);
 			}
 			return parsed;
 		}
@@ -185,7 +270,8 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		const key = JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 		const value = JSON.stringify(sessions);
 		await this.secretStorageService.set(key, value);
-		this.logService.trace(`Set session data for ${authProviderId} (${clientId}) in secret storage:`, sessions);
+		// The token responses are credentials: only their count is logged.
+		this.logService.trace(`Set ${sessions.length} session(s) for ${authProviderId} (${clientId}) in secret storage`);
 	}
 }
 

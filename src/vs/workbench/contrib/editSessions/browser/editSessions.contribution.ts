@@ -69,6 +69,7 @@ import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uri
 import { IWorkspaceIdentityService } from '../../../services/workspaces/common/workspaceIdentityService.js';
 import { hashAsync } from '../../../../base/common/hash.js';
 import { ResourceSet } from '../../../../base/common/map.js';
+import { runAtBoundary } from '../../../services/authentication/common/storedSecretBoundary.js';
 
 registerSingleton(IEditSessionsLogService, EditSessionsLogService, InstantiationType.Delayed);
 registerSingleton(IEditSessionsStorageService, EditSessionsWorkbenchService, InstantiationType.Delayed);
@@ -173,7 +174,8 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 		this.editSessionsStorageService.storeClient = this.editSessionsStorageClient;
 		this.workspaceStateSynchronizer = new WorkspaceStateSynchroniser(this.userDataProfilesService.defaultProfile, undefined, this.editSessionsStorageClient, this.logService, this.fileService, this.environmentService, this.telemetryService, this.configurationService, this.storageService, this.uriIdentityService, this.workspaceIdentityService, this.editSessionsStorageService);
 
-		this.autoResumeEditSession();
+		// Nobody awaits the start-up resume: a failure (for example a stored session that cannot be read) is shown, not dropped.
+		void runAtBoundary(() => this.autoResumeEditSession(), error => this.reportResumeFailure(error));
 
 		this.registerActions();
 		this.registerViews();
@@ -206,7 +208,7 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 			const hasApplicationLaunchedFromContinueOnFlow = this.storageService.getBoolean(EditSessionsContribution.APPLICATION_LAUNCHED_VIA_CONTINUE_ON_STORAGE_KEY, StorageScope.APPLICATION, false);
 			this.logService.info(`Prompting to enable cloud changes, has application previously launched from Continue On flow: ${hasApplicationLaunchedFromContinueOnFlow}`);
 
-			const handlePendingEditSessions = () => {
+			const handlePendingEditSessions = (): void => {
 				// display a badge in the accounts menu but do not prompt the user to sign in again
 				this.logService.info('Showing badge to enable cloud changes in accounts menu...');
 				this.updateAccountsMenuBadge();
@@ -215,9 +217,17 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 				const disposable = this.editSessionsStorageService.onDidSignIn(async () => {
 					disposable.dispose();
 					this.logService.info('Showing badge to enable cloud changes in accounts menu succeeded, resuming cloud changes...');
-					await this.progressService.withProgress(resumeProgressOptions, async (progress) => await this.resumeEditSession(undefined, true, undefined, undefined, progress));
-					this.storageService.remove(EditSessionsContribution.APPLICATION_LAUNCHED_VIA_CONTINUE_ON_STORAGE_KEY, StorageScope.APPLICATION);
-					this.environmentService.continueOn = undefined;
+					const resumed = await runAtBoundary(
+						() => this.progressService.withProgress(resumeProgressOptions, async (progress) => await this.resumeEditSession(undefined, true, undefined, undefined, progress)),
+						error => this.reportResumeFailure(error)
+					);
+					if (resumed) {
+						this.storageService.remove(EditSessionsContribution.APPLICATION_LAUNCHED_VIA_CONTINUE_ON_STORAGE_KEY, StorageScope.APPLICATION);
+						this.environmentService.continueOn = undefined;
+					} else {
+						// The resume failed and is kept pending: the next sign-in is processed again.
+						handlePendingEditSessions();
+					}
 				});
 			};
 
@@ -245,6 +255,11 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 		} else {
 			this.logService.debug('Auto resuming cloud changes disabled.');
 		}
+	}
+
+	private reportResumeFailure(error: unknown): void {
+		this.logService.error('Failed to resume cloud changes, reason: ', error);
+		this.notificationService.error(localize('resume failed', "Failed to resume your working changes from the cloud."));
 	}
 
 	private updateAccountsMenuBadge() {

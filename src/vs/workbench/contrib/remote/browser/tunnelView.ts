@@ -43,7 +43,7 @@ import { forwardedPortWithoutProcessIcon, forwardedPortWithProcessIcon, portsVie
 import { IExternalUriOpenerService } from '../../externalUriOpener/common/externalUriOpenerService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { isMacintosh } from '../../../../base/common/platform.js';
-import { ITableColumn, ITableContextMenuEvent, ITableEvent, ITableMouseEvent, ITableRenderer, ITableVirtualDelegate } from '../../../../base/browser/ui/table/table.js';
+import { ITableColumn, ITableContextMenuEvent, ITableEvent, ITableRenderer, ITableVirtualDelegate } from '../../../../base/browser/ui/table/table.js';
 import { WorkbenchTable } from '../../../../platform/list/browser/listService.js';
 import { Button } from '../../../../base/browser/ui/button/button.js';
 import { registerColor } from '../../../../platform/theme/common/colorRegistry.js';
@@ -51,7 +51,7 @@ import { IMarkdownString, MarkdownString } from '../../../../base/common/htmlCon
 import { IHoverDelegate } from '../../../../base/browser/ui/hover/hoverDelegate.js';
 import { STATUS_BAR_REMOTE_ITEM_BACKGROUND } from '../../../common/theme.js';
 import { Codicon } from '../../../../base/common/codicons.js';
-import { defaultButtonStyles, defaultInputBoxStyles } from '../../../../platform/theme/browser/defaultStyles.js';
+import { defaultInputBoxStyles } from '../../../../platform/theme/browser/defaultStyles.js';
 import { CandidatePort, Tunnel, TunnelModel, TunnelSource, makeAddress, mapHasAddressLocalhostOrAllInterfaces, parseAddress } from '../../../services/remote/common/tunnelModel.js';
 import { getDefaultHoverDelegate } from '../../../../base/browser/ui/hover/hoverDelegateFactory.js';
 import { IHoverService } from '../../../../platform/hover/browser/hover.js';
@@ -348,7 +348,6 @@ class ActionBarRenderer extends Disposable implements ITableRenderer<ActionBarCe
 		@IMenuService private readonly menuService: IMenuService,
 		@IContextViewService private readonly contextViewService: IContextViewService,
 		@IRemoteExplorerService private readonly remoteExplorerService: IRemoteExplorerService,
-		@ICommandService private readonly commandService: ICommandService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 	) {
 		super();
@@ -398,23 +397,10 @@ class ActionBarRenderer extends Disposable implements ITableRenderer<ActionBarCe
 			editableData = this.remoteExplorerService.getEditableData(element.tunnel, element.editId);
 			if (editableData) {
 				this.renderInputBox(templateData.container, editableData);
-			} else if ((element.tunnel.tunnelType === TunnelType.Add) && (element.menuId === MenuId.TunnelPortInline)) {
-				this.renderButton(element, templateData);
 			} else {
 				this.renderActionBarItem(element, templateData);
 			}
 		}
-	}
-
-	renderButton(element: ActionBarCell, templateData: IActionBarTemplateData): void {
-		templateData.container.style.paddingLeft = '7px';
-		templateData.container.style.height = '28px';
-		templateData.button = this._register(new Button(templateData.container, defaultButtonStyles));
-		templateData.button.label = element.label;
-		templateData.button.element.title = element.tooltip;
-		this._register(templateData.button.onDidClick(() => {
-			this.commandService.executeCommand(ForwardPortAction.INLINE_ID);
-		}));
 	}
 
 	private tunnelContext(tunnel: ITunnelItem): ITunnelItem {
@@ -851,7 +837,7 @@ export class TunnelPanel extends ViewPane {
 		widgetContainer.classList.add('file-icon-themable-tree', 'show-file-icons');
 
 		const actionBarRenderer = new ActionBarRenderer(this.instantiationService, this.contextKeyService,
-			this.menuService, this.contextViewService, this.remoteExplorerService, this.commandService,
+			this.menuService, this.contextViewService, this.remoteExplorerService,
 			this.configurationService);
 		const columns = [new IconColumn(), new PortColumn(), new LocalAddressColumn(), new RunningProcessColumn()];
 		if (this.tunnelService.canChangePrivacy) {
@@ -891,7 +877,6 @@ export class TunnelPanel extends ViewPane {
 
 		this.tableDisposables.add(this.table);
 		this.tableDisposables.add(this.table.onContextMenu(e => this.onContextMenu(e, actionRunner)));
-		this.tableDisposables.add(this.table.onMouseDblClick(e => this.onMouseDblClick(e)));
 		this.tableDisposables.add(this.table.onDidChangeFocus(e => this.onFocusChanged(e)));
 		this.tableDisposables.add(this.table.onDidChangeSelection(e => this.onSelectionChanged(e)));
 		this.tableDisposables.add(this.table.onDidFocus(() => this.tunnelViewFocusContext.set(true)));
@@ -1063,12 +1048,6 @@ export class TunnelPanel extends ViewPane {
 			getActionsContext: () => node?.strip(),
 			actionRunner
 		});
-	}
-
-	private onMouseDblClick(e: ITableMouseEvent<ITunnelItem>): void {
-		if (!e.element) {
-			this.commandService.executeCommand(ForwardPortAction.INLINE_ID);
-		}
 	}
 
 	private height = 0;

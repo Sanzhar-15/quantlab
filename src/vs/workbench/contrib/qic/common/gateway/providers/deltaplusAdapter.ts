@@ -7,21 +7,20 @@ import { randomUUID } from '../../qicCrypto.js';
 import type { ProviderAdapter, ProviderHealth, StreamChunk, GatewayMetadata } from '../../canonical/interfaces.js';
 import type { LaneName } from '../../canonical/lanes.js';
 import { QicError, type ProviderRequest, type ProviderResponse, type TokenUsage, type ContentBlock } from '../../canonical/types.js';
-import { redactErrorBody } from './errorRedaction.js';
-import type { IRequestService } from '../../../../../../platform/request/common/request.js';
-import type { IRequestContext } from '../../../../../../base/parts/request/common/request.js';
 import { CancellationTokenSource } from '../../../../../../base/common/cancellation.js';
-import { VSBuffer } from '../../../../../../base/common/buffer.js';
-import { consumeStream, listenStream } from '../../../../../../base/common/stream.js';
+import { QuantlabHostError, type IQuantlabHostIdentityService } from '../../../../../services/quantlabHostIdentity/common/quantlabHostIdentity.js';
 
-export interface DeltaPlusConfig {
-	baseUrl: string;
-}
+/** IPC-DATA op: the Delta Plus Server health check, answered by the host. */
+export const QIC_HEALTH_OP = 'qic.health';
+
+/** IPC-DATA op: one QIC request (the QIC protocol body), answered by the host. */
+export const QIC_REQUEST_OP = 'qic.request';
+
+/** The host has no streaming op for QIC; a stream is refused with this message, never replaced by a non-streaming call. */
+export const QIC_STREAMING_UNAVAILABLE = 'QIC streaming is not available through the host';
 
 const REQUEST_TIMEOUT_MS = 60_000;
-const STREAM_TIMEOUT_MS = 5 * 60_000;
-const NETWORK_RETRY_MAX = 2;
-const NETWORK_RETRY_BASE_MS = 500;
+const HEALTH_TIMEOUT_MS = 5_000;
 
 type StopReason = NonNullable<ProviderResponse['stopReason']>;
 const STOP_REASONS: readonly StopReason[] = ['end_turn', 'tool_use', 'max_tokens', 'stop_sequence'];
@@ -51,365 +50,120 @@ function optionalUsageNumber(value: unknown, field: string): number | undefined 
 }
 
 /**
- * Provider adapter for Delta Plus Server LLM proxy.
- * Holds no credential: QIC's login is the host identity (QL-LOGIN), and the host keeps
- * the tokens in its own store. Requests therefore carry no Authorization header until the
- * data path (QL-DATA) routes them through the host; the server's 401 is the visible failure.
- * Uses IRequestService for HTTP to bypass CSP restrictions in the renderer.
+ * Provider adapter for the Delta Plus Server LLM proxy.
+ * It holds no credential, no server address and no HTTP client: every call is an IPC-DATA op
+ * (`qic.health`, `qic.request`) sent through the host's workbench service with the caller's identity
+ * epoch. The host adds the token and owns the one backend origin. A host refusal rejects with its
+ * {@link QuantlabHostError} code (the host answers `no-route` until QIC's server route exists); it is
+ * never mapped to a value.
  */
 export class DeltaPlusAdapter implements ProviderAdapter {
 	readonly id = 'deltaplus';
 	readonly name = 'Delta Plus Server';
 	readonly type = 'llm' as const;
 
-	private readonly config: DeltaPlusConfig;
-	private readonly activeRequests = new Map<string, AbortController>();
-	private readonly requestService?: IRequestService;
+	private readonly activeRequests = new Map<string, CancellationTokenSource>();
 
-	// State tracking for Anthropic-format SSE tool_use events
-	private _streamingToolCallId: string | null = null;
-
-	constructor(config: DeltaPlusConfig, requestService?: IRequestService) {
-		this.requestService = requestService;
-		this.config = config;
-	}
+	constructor(private readonly hostIdentityService: IQuantlabHostIdentityService) { }
 
 	// --- ProviderAdapter implementation ---
 
 	async isAvailable(): Promise<boolean> {
-		try {
-			const health = await this.getHealth();
-			return health.status !== 'unavailable';
-		} catch {
-			return false;
-		}
+		const health = await this.getHealth();
+		return health.status !== 'unavailable';
 	}
 
 	async getHealth(): Promise<ProviderHealth> {
 		const start = Date.now();
-		try {
-			if (this.requestService) {
-				const cts = new CancellationTokenSource();
-				setTimeout(() => cts.cancel(), 5000);
-				const context = await this.requestService.request({
-					url: `${this.config.baseUrl}/health/live`,
-					type: 'GET',
-				}, cts.token);
-				const statusOk = context.res.statusCode !== undefined && context.res.statusCode >= 200 && context.res.statusCode < 300;
-				return {
-					status: statusOk ? 'healthy' : 'degraded',
-					latencyMs: Date.now() - start,
-					errorRate: 0,
-					lastChecked: new Date().toISOString(),
-				};
-			} else {
-				const response = await fetch(`${this.config.baseUrl}/health/live`, {
-					signal: AbortSignal.timeout(5000),
-				});
-				return {
-					status: response.ok ? 'healthy' : 'degraded',
-					latencyMs: Date.now() - start,
-					errorRate: 0,
-					lastChecked: new Date().toISOString(),
-				};
-			}
-		} catch {
-			return {
-				status: 'unavailable',
-				latencyMs: Date.now() - start,
-				errorRate: 1,
-				lastChecked: new Date().toISOString(),
-			};
-		}
+		await this.hostRequest(QIC_HEALTH_OP, null, HEALTH_TIMEOUT_MS, undefined);
+		return {
+			status: 'healthy',
+			latencyMs: Date.now() - start,
+			errorRate: 0,
+			lastChecked: new Date().toISOString(),
+		};
 	}
 
 	async sendRequest(request: ProviderRequest & Partial<GatewayMetadata>): Promise<ProviderResponse> {
-		const requestId = randomUUID();
-		const abortController = new AbortController();
-		this.activeRequests.set(requestId, abortController);
+		const data = await this.hostRequest(QIC_REQUEST_OP, this.buildQicRequest(request, false), REQUEST_TIMEOUT_MS, request.signal);
+		const raw = this.unwrapResponse(data);
 
-		const timeoutId = setTimeout(() => abortController.abort(), REQUEST_TIMEOUT_MS);
-
-		try {
-			const bodyStr = JSON.stringify(this.buildQicRequest(request, false));
-
-			const doRequest = async (): Promise<{ status: number; body: string }> => {
-				if (this.requestService) {
-					const cts = new CancellationTokenSource();
-					if (request.signal) {
-						request.signal.addEventListener('abort', () => cts.cancel());
-					}
-					const context = await this.requestService.request({
-						url: `${this.config.baseUrl}/v1/qic/request`,
-						type: 'POST',
-						headers: this.getHeaders(),
-						data: bodyStr,
-					}, cts.token);
-					const buffer = await consumeStream<VSBuffer>(context.stream, chunks => VSBuffer.concat(chunks));
-					return { status: context.res.statusCode ?? 500, body: buffer.toString() };
-				} else {
-					const response = await fetch(`${this.config.baseUrl}/v1/qic/request`, {
-						method: 'POST',
-						headers: this.getHeaders(),
-						body: bodyStr,
-						signal: abortController.signal,
-					});
-					return { status: response.status, body: await response.text() };
-				}
-			};
-
-			let result: { status: number; body: string } | undefined;
-			let lastNetworkError: unknown;
-
-			// Retry loop for transient network errors (e.g. net::ERR_FAILED)
-			for (let attempt = 0; attempt <= NETWORK_RETRY_MAX; attempt++) {
-				try {
-					result = await doRequest();
-					lastNetworkError = undefined;
-					break;
-				} catch (err) {
-					if (attempt < NETWORK_RETRY_MAX && this.isTransientNetworkError(err)) {
-						lastNetworkError = err;
-						await new Promise(r => setTimeout(r, NETWORK_RETRY_BASE_MS * Math.pow(2, attempt)));
-						continue;
-					}
-					throw err;
-				}
-			}
-			if (!result) {
-				throw lastNetworkError ?? new QicError('QIC-N002', 'Failed to connect to Delta Plus Server after retries');
-			}
-
-			if (result.status < 200 || result.status >= 300) {
-				throw this.normalizeErrorFromStatus(result.status, result.body);
-			}
-
-			const rawOuter: unknown = JSON.parse(result.body);
-			const raw = this.unwrapResponse(rawOuter);
-
-			// Normalize response content
-			const content = this.parseContent(raw.content);
-
-			return {
-				content,
-				usage: this.mapUsage(raw.usage),
-				stopReason: this.parseStopReason(raw.stop_reason ?? raw.stopReason),
-			};
-		} finally {
-			clearTimeout(timeoutId);
-			this.activeRequests.delete(requestId);
-		}
-	}
-
-	async *sendStreaming(request: ProviderRequest & Partial<GatewayMetadata>): AsyncIterable<StreamChunk> {
-		const requestId = randomUUID();
-		const abortController = new AbortController();
-		this.activeRequests.set(requestId, abortController);
-
-		const timeoutId = setTimeout(() => abortController.abort(), STREAM_TIMEOUT_MS);
-
-		try {
-			const bodyStr = JSON.stringify(this.buildQicRequest(request, true));
-
-			if (this.requestService) {
-				yield* this.streamViaRequestService(bodyStr, request.signal, requestId);
-			} else {
-				yield* this.streamViaFetch(bodyStr, abortController, requestId);
-			}
-		} finally {
-			clearTimeout(timeoutId);
-			this.activeRequests.delete(requestId);
-		}
-	}
-
-	private async *streamViaRequestService(bodyStr: string, signal: AbortSignal | undefined, _requestId: string): AsyncIterable<StreamChunk> {
-		const cts = new CancellationTokenSource();
-		if (signal) {
-			signal.addEventListener('abort', () => cts.cancel());
-		}
-
-		let context: IRequestContext | undefined;
-		for (let attempt = 0; attempt <= NETWORK_RETRY_MAX; attempt++) {
-			try {
-				context = await this.requestService!.request({
-					url: `${this.config.baseUrl}/v1/qic/stream`,
-					type: 'POST',
-					headers: this.getHeaders(),
-					data: bodyStr,
-				}, cts.token);
-				break;
-			} catch (reqErr) {
-				if (attempt < NETWORK_RETRY_MAX && this.isTransientNetworkError(reqErr)) {
-					await new Promise(r => setTimeout(r, NETWORK_RETRY_BASE_MS * Math.pow(2, attempt)));
-					continue;
-				}
-				const message = reqErr instanceof Error ? reqErr.message : String(reqErr);
-				throw new QicError('QIC-N002', `Failed to connect to Delta Plus Server: ${message}`);
-			}
-		}
-		if (!context) {
-			throw new QicError('QIC-N002', 'Failed to connect to Delta Plus Server after retries');
-		}
-
-		if (!context.res.statusCode || context.res.statusCode < 200 || context.res.statusCode >= 300) {
-			const buffer = await consumeStream<VSBuffer>(context.stream, chunks => VSBuffer.concat(chunks));
-			throw this.normalizeErrorFromStatus(context.res.statusCode ?? 500, buffer.toString());
-		}
-
-		// Convert VSBufferReadableStream to async iterable of lines
-		const queue: string[] = [];
-		let streamDone = false;
-		let resolver: (() => void) | null = null;
-		let lineBuffer = '';
-
-		listenStream<VSBuffer>(context.stream, {
-			onData: (chunk) => {
-				const text = chunk.toString();
-				lineBuffer += text;
-				const lines = lineBuffer.split('\n');
-				lineBuffer = lines.pop() ?? '';
-				for (const line of lines) {
-					queue.push(line);
-					resolver?.();
-				}
-			},
-			onError: () => { streamDone = true; resolver?.(); },
-			onEnd: () => {
-				if (lineBuffer) { queue.push(lineBuffer); }
-				streamDone = true;
-				resolver?.();
-			},
-		});
-
-		async function* readLines(): AsyncIterable<string> {
-			while (!streamDone || queue.length > 0) {
-				if (queue.length > 0) {
-					yield queue.shift()!;
-				} else if (!streamDone) {
-					await new Promise<void>(resolve => { resolver = resolve; });
-				}
-			}
-		}
-
-		yield* this.parseSSELines(readLines());
-	}
-
-	private async *streamViaFetch(bodyStr: string, abortController: AbortController, _requestId: string): AsyncIterable<StreamChunk> {
-		let response: Response | undefined;
-		// Retry loop for transient network errors
-		for (let attempt = 0; attempt <= NETWORK_RETRY_MAX; attempt++) {
-			try {
-				response = await fetch(`${this.config.baseUrl}/v1/qic/stream`, {
-					method: 'POST',
-					headers: this.getHeaders(),
-					body: bodyStr,
-					signal: abortController.signal,
-				});
-				break;
-			} catch (fetchErr) {
-				if (attempt < NETWORK_RETRY_MAX && this.isTransientNetworkError(fetchErr)) {
-					await new Promise(r => setTimeout(r, NETWORK_RETRY_BASE_MS * Math.pow(2, attempt)));
-					continue;
-				}
-				const message = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-				throw new QicError('QIC-N002', `Failed to connect to Delta Plus Server: ${message}`);
-			}
-		}
-		if (!response) {
-			throw new QicError('QIC-N002', 'Failed to connect to Delta Plus Server after retries');
-		}
-
-		if (!response.ok) {
-			throw this.normalizeErrorFromStatus(response.status, await response.text());
-		}
-
-		if (!response.body) {
-			throw new QicError('QIC-P004', 'Empty response body from Delta Plus Server');
-		}
-
-		const reader = response.body.getReader();
-		const decoder = new TextDecoder();
-		let buffer = '';
-
-		async function* readLines(): AsyncIterable<string> {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) { break; }
-				buffer += decoder.decode(value, { stream: true });
-				const lines = buffer.split('\n');
-				buffer = lines.pop() ?? '';
-				for (const line of lines) {
-					yield line;
-				}
-			}
-			if (buffer) { yield buffer; }
-		}
-
-		yield* this.parseSSELines(readLines());
+		return {
+			content: this.parseContent(raw.content),
+			usage: this.mapUsage(raw.usage),
+			stopReason: this.parseStopReason(raw.stop_reason ?? raw.stopReason),
+		};
 	}
 
 	/**
-	 * Parse SSE lines and yield StreamChunks.
-	 * Handles the Delta Plus server's event format, including
-	 * multi-chunk emission for complete tool_call events.
+	 * The host offers no QIC streaming op: iterating the stream rejects with
+	 * {@link QIC_STREAMING_UNAVAILABLE}. There is no silent switch to {@link sendRequest}.
 	 */
-	private async *parseSSELines(lines: AsyncIterable<string>): AsyncIterable<StreamChunk> {
-		let currentEventType = '';
-		this._streamingToolCallId = null; // Reset state for new stream
-
-		for await (const line of lines) {
-			// Parse event type
-			if (line.startsWith('event: ')) {
-				currentEventType = line.slice(7).trim();
-				continue;
-			}
-
-			// Empty line resets event type
-			if (line.trim() === '') {
-				currentEventType = '';
-				continue;
-			}
-
-			if (!line.startsWith('data: ')) {
-				continue;
-			}
-
-			const data = line.slice(6).trim();
-			if (!data || data === '[DONE]') {
-				continue;
-			}
-
-			let parsed: Record<string, unknown>;
-			try {
-				parsed = JSON.parse(data) as Record<string, unknown>;
-			} catch {
-				continue;
-			}
-
-			// Use event type from SSE if available, otherwise fall back to data.type
-			const eventType = currentEventType || (parsed.type as string) || '';
-
-			const chunks = this.mapServerEvent(eventType, parsed);
-			for (const chunk of chunks) {
-				yield chunk;
-			}
-
-			// Reset event type after processing
-			currentEventType = '';
-		}
+	sendStreaming(_request: ProviderRequest & Partial<GatewayMetadata>): AsyncIterable<StreamChunk> {
+		return {
+			[Symbol.asyncIterator](): AsyncIterator<StreamChunk> {
+				return {
+					next: () => Promise.reject(new Error(QIC_STREAMING_UNAVAILABLE)),
+				};
+			},
+		};
 	}
 
 	cancelRequest(requestId: string): void {
-		this.activeRequests.get(requestId)?.abort();
+		this.activeRequests.get(requestId)?.cancel();
 		this.activeRequests.delete(requestId);
 	}
 
 	// --- Dispose ---
 
 	dispose(): void {
-		for (const [id, controller] of this.activeRequests) {
-			controller.abort();
+		for (const [id, cts] of this.activeRequests) {
+			cts.cancel();
 			this.activeRequests.delete(id);
+		}
+	}
+
+	// --- Host transport ---
+
+	/**
+	 * The epoch of the signed-in identity, read at call time. Signed out is a refusal, never a guess.
+	 * A host that cannot answer rejects (the identity service's rejection propagates).
+	 */
+	private async signedInEpoch(): Promise<number> {
+		const identity = await this.hostIdentityService.getIdentity();
+		if (!identity.signedIn) {
+			throw new QuantlabHostError('not-signed-in', 'QIC needs a signed-in QuantLab user: sign in from the Quantlab terminal view.', undefined);
+		}
+		return identity.epoch;
+	}
+
+	/**
+	 * One IPC-DATA op through the host. The timeout and the caller's abort signal both cancel the
+	 * token; the host then answers `cancelled`, which rejects like every other refusal.
+	 */
+	private async hostRequest(op: string, input: unknown, timeoutMs: number, signal: AbortSignal | undefined): Promise<unknown> {
+		const epoch = await this.signedInEpoch();
+		const requestId = randomUUID();
+		const cts = new CancellationTokenSource();
+		this.activeRequests.set(requestId, cts);
+
+		const timeoutId = setTimeout(() => cts.cancel(), timeoutMs);
+		const onAbort = () => cts.cancel();
+		if (signal) {
+			if (signal.aborted) {
+				cts.cancel();
+			} else {
+				signal.addEventListener('abort', onAbort, { once: true });
+			}
+		}
+
+		try {
+			return await this.hostIdentityService.request(op, input, epoch, cts.token);
+		} finally {
+			clearTimeout(timeoutId);
+			signal?.removeEventListener('abort', onAbort);
+			this.activeRequests.delete(requestId);
+			cts.dispose();
 		}
 	}
 
@@ -515,193 +269,7 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 		return body;
 	}
 
-	// --- SSE event mapping ---
-
-	/**
-	 * Map a server SSE event to one or more canonical StreamChunks.
-	 * Returns an array because a single server `tool_call` event must
-	 * emit tool_call_start + tool_call_delta + tool_call_end.
-	 */
-	private mapServerEvent(eventType: string, data: Record<string, unknown>): StreamChunk[] {
-		switch (eventType) {
-			case 'routing': {
-				// QIC routing event - informational, skip (contains lane/tier info)
-				return [];
-			}
-
-			case 'content_delta':
-			case 'text_delta': {
-				const text = (data.text as string) ?? '';
-				return [{ type: 'text', text }];
-			}
-
-			case 'tool_call_start': {
-				const id = (data.id as string) ?? '';
-				const name = (data.name as string) ?? '';
-				return [{ type: 'tool_call_start', id, name }];
-			}
-
-			case 'tool_call': {
-				// Server sends full tool call in one event - emit all 3 chunks
-				const id = (data.id as string) ?? '';
-				const name = (data.name as string) ?? '';
-				// Handle input as either JSON string or object
-				const rawInput = data.input;
-				const input = typeof rawInput === 'string' ? rawInput : (rawInput ? JSON.stringify(rawInput) : '');
-				const chunks: StreamChunk[] = [
-					{ type: 'tool_call_start', id, name },
-				];
-				if (input) {
-					chunks.push({ type: 'tool_call_delta', id, argumentsDelta: input });
-				}
-				chunks.push({ type: 'tool_call_end', id });
-				return chunks;
-			}
-
-			case 'tool_call_delta': {
-				const id = (data.id as string) ?? '';
-				const rawDelta = data.input ?? data.arguments_delta;
-				const argumentsDelta = typeof rawDelta === 'string' ? rawDelta : (rawDelta ? JSON.stringify(rawDelta) : '');
-				return [{ type: 'tool_call_delta', id, argumentsDelta }];
-			}
-
-			case 'tool_call_end': {
-				const id = (data.id as string) ?? '';
-				return [{ type: 'tool_call_end', id }];
-			}
-
-			case 'stop':
-			case 'done': {
-				const usage = this.mapUsage(data.usage);
-				const stopReason = (data.stop_reason as string) ?? (data.stopReason as string) ?? undefined;
-				return [{ type: 'done', usage, stopReason }];
-			}
-
-			case 'usage': {
-				// Usage-only event - skip (will be included in done)
-				return [];
-			}
-
-			case 'error': {
-				const message = (data.message as string) ?? 'Unknown server error';
-				return [{ type: 'error', error: new QicError('QIC-P004', message) }];
-			}
-
-			// --- Anthropic SSE format compatibility ---
-			// If the Delta Plus server proxies Anthropic events as-is, these
-			// event types appear instead of the QIC protocol types above.
-			case 'content_block_start': {
-				const block = data.content_block as Record<string, unknown> | undefined;
-				if (block?.type === 'tool_use') {
-					const id = (block.id as string) ?? '';
-					const name = (block.name as string) ?? '';
-					this._streamingToolCallId = id;
-					return [{ type: 'tool_call_start', id, name }];
-				}
-				// text block start - no chunk needed, text comes in deltas
-				return [];
-			}
-
-			case 'content_block_delta': {
-				const delta = data.delta as Record<string, unknown> | undefined;
-				if (delta?.type === 'text_delta') {
-					return [{ type: 'text', text: (delta.text as string) ?? '' }];
-				}
-				if (delta?.type === 'input_json_delta' && this._streamingToolCallId) {
-					return [{
-						type: 'tool_call_delta',
-						id: this._streamingToolCallId,
-						argumentsDelta: (delta.partial_json as string) ?? '',
-					}];
-				}
-				return [];
-			}
-
-			case 'content_block_stop': {
-				if (this._streamingToolCallId) {
-					const id = this._streamingToolCallId;
-					this._streamingToolCallId = null;
-					return [{ type: 'tool_call_end', id }];
-				}
-				return [];
-			}
-
-			case 'message_start':
-				return [];
-
-			case 'message_delta': {
-				const deltaObj = data.delta as Record<string, unknown> | undefined;
-				return [{
-					type: 'done',
-					usage: this.mapUsage(data.usage),
-					stopReason: (deltaObj?.stop_reason as string) ?? undefined,
-				}];
-			}
-
-			case 'message_stop':
-				return [{ type: 'done' }];
-
-			case 'ping':
-				return [];
-
-			default: {
-				// Fallback: try to map by data.type field
-				const dataType = data.type as string;
-				if (dataType === 'routing' || dataType === 'ping' || dataType === 'message_start') {
-					return [];
-				}
-				if (dataType === 'text_delta' || dataType === 'content_delta') {
-					return [{ type: 'text', text: (data.text as string) ?? '' }];
-				}
-				if (dataType === 'tool_call') {
-					const id = (data.id as string) ?? '';
-					const name = (data.name as string) ?? '';
-					const rawInput = data.input;
-					const input = typeof rawInput === 'string' ? rawInput : (rawInput ? JSON.stringify(rawInput) : '');
-					const chunks: StreamChunk[] = [{ type: 'tool_call_start', id, name }];
-					if (input) {
-						chunks.push({ type: 'tool_call_delta', id, argumentsDelta: input });
-					}
-					chunks.push({ type: 'tool_call_end', id });
-					return chunks;
-				}
-				// Anthropic format via data.type fallback
-				if (dataType === 'content_block_start') {
-					return this.mapServerEvent('content_block_start', data);
-				}
-				if (dataType === 'content_block_delta') {
-					return this.mapServerEvent('content_block_delta', data);
-				}
-				if (dataType === 'content_block_stop') {
-					return this.mapServerEvent('content_block_stop', data);
-				}
-				if (dataType === 'message_delta') {
-					return this.mapServerEvent('message_delta', data);
-				}
-				if (dataType === 'message_stop') {
-					return [{ type: 'done' }];
-				}
-				if (dataType === 'stop' || dataType === 'done') {
-					return [{ type: 'done', usage: this.mapUsage(data.usage), stopReason: this.parseStopReason(data.stop_reason) }];
-				}
-				if (dataType === 'error') {
-					return [{ type: 'error', error: new QicError('QIC-P004', (data.message as string) ?? 'Unknown error') }];
-				}
-				// Unknown event type - log for diagnostics
-				console.warn(`[DeltaPlusAdapter] Unhandled SSE event: type="${eventType}" data.type="${dataType}"`);
-				return [];
-			}
-		}
-	}
-
 	// --- Helpers ---
-
-	private getHeaders(): Record<string, string> {
-		return {
-			'Content-Type': 'application/json',
-			'X-QIC-Idempotency-Key': randomUUID(),
-		};
-	}
 
 	/**
 	 * Map server usage to TokenUsage. Absent usage (undefined or null) is undefined;
@@ -734,8 +302,8 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 	}
 
 	/**
-	 * Unwrap Delta Plus server response envelope.
-	 * Server wraps responses as { success: true, data: { ... } }; a body without a `data` object throws.
+	 * Unwrap the Delta Plus server response envelope that the host passes through as its data.
+	 * Server wraps responses as { success: true, data: { ... } }; a value without a `data` object throws.
 	 */
 	private unwrapResponse(raw: unknown): Record<string, unknown> {
 		if (!isRecord(raw)) {
@@ -808,36 +376,5 @@ export class DeltaPlusAdapter implements ProviderAdapter {
 			throw malformed(`content[${index}].input is neither an object nor a JSON object string (${input === null ? 'null' : typeof input})`);
 		}
 		return input;
-	}
-
-	/**
-	 * Detect transient network errors (e.g. Chromium net::ERR_FAILED after session instability).
-	 * These are safe to retry since the request never reached the server.
-	 */
-	private isTransientNetworkError(err: unknown): boolean {
-		if (err instanceof Error) {
-			const msg = err.message;
-			return msg.includes('net::ERR_FAILED') ||
-				msg.includes('net::ERR_CONNECTION_RESET') ||
-				msg.includes('net::ERR_CONNECTION_REFUSED') ||
-				msg.includes('net::ERR_NETWORK_CHANGED') ||
-				msg.includes('ECONNRESET') ||
-				msg.includes('ECONNREFUSED') ||
-				msg.includes('fetch failed');
-		}
-		return false;
-	}
-
-	private normalizeErrorFromStatus(status: number, body: string): QicError {
-		const redacted = redactErrorBody(body);
-
-		if (status === 401) {
-			return new QicError('QIC-P006', 'Delta Plus Server rejected the request (401): QIC requests carry no credential until the data path routes them through the host sign-in.', undefined, 401);
-		}
-		if (status === 429) {
-			return new QicError('QIC-P005', `Rate limited. ${redacted}`, undefined, 429);
-		}
-
-		return new QicError('QIC-P004', `Delta Plus Server error ${status}: ${redacted}`, undefined, status);
 	}
 }

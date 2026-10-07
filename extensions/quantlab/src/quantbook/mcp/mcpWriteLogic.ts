@@ -20,6 +20,8 @@
 // The host shell (mcpServer.ts) is the thin adapter: it injects the live Session, runs the trust gate +
 // the modal confirmation + the engine write (batch -> recalc -> refresh), and appends the audit line to
 // the MCP output channel.
+// Release 1 has no MCP host shell: mcpServer.ts was removed on 2026-10-05 (Quantbook is OFF; it opened a
+// loopback server and printed its bearer token). QL-QUANTBOOK restores a shell from git history.
 //
 // No-Fallbacks: every op-building / risk failure throws a loud {@link McpToolError}; a write that needs
 // confirmation but is declined is reported as a declined outcome (the agent SEES it), never silently

@@ -33,7 +33,7 @@ export interface QuantlabHostUser {
 	readonly id: string;
 	readonly email: string;
 	readonly name?: string;
-	readonly tier?: string;
+	readonly tier: string;
 }
 
 export interface QuantlabHostIdentity {
@@ -53,6 +53,8 @@ export interface QuantlabHostStream {
 export interface QuantlabHostApi {
 	getIdentity(): Promise<QuantlabHostIdentity>;
 	readonly onDidChangeIdentity: Event<QuantlabHostIdentity>;
+	/** Sign out of every view after the user's yes in a workbench confirm: true when signed out, false when cancelled. */
+	signOut(): Promise<boolean>;
 	request(op: string, input: unknown, token?: CancellationToken): Promise<unknown>;
 	subscribe(topic: string, params: unknown): QuantlabHostStream;
 }
@@ -103,13 +105,11 @@ function toIdentity(dto: QuantlabIdentityDto): QuantlabHostIdentity {
 	if (dto.user === undefined) {
 		throw new Error(`${LOG_PREFIX} a signed-in identity arrived without a user`);
 	}
+	// `tier` is copied as the main side sent it: never defaulted and never checked here (the workbench parser requires it).
 	const { id, email, name, tier } = dto.user;
-	const user: { id: string; email: string; name?: string; tier?: string } = { id, email };
+	const user: { id: string; email: string; name?: string; tier: string } = { id, email, tier };
 	if (name !== undefined) {
 		user.name = name;
-	}
-	if (tier !== undefined) {
-		user.tier = tier;
 	}
 	return Object.freeze({ epoch: dto.epoch, signedIn: true, user: Object.freeze(user) });
 }
@@ -176,6 +176,7 @@ export class ExtHostQuantlabHost implements ExtHostQuantlabHostShape {
 		return Object.freeze<QuantlabHostApi>({
 			getIdentity: () => this._getIdentity(),
 			onDidChangeIdentity: this._onDidChangeIdentity.event,
+			signOut: () => this._signOut(),
 			request: (op, input, token) => this._request(op, input, token),
 			subscribe: (topic, params) => this._subscribe(topic, params),
 		});
@@ -242,6 +243,17 @@ export class ExtHostQuantlabHost implements ExtHostQuantlabHostShape {
 			return this._identity.epoch;
 		}
 		return (await this._getIdentity()).epoch;
+	}
+
+	private async _signOut(): Promise<boolean> {
+		const answer = await this._proxy.$signOut();
+		if (!answer.ok) {
+			throw toRequestError(answer);
+		}
+		if (typeof answer.data !== 'boolean') {
+			throw new Error(`${LOG_PREFIX} the sign-out answer carries no boolean`);
+		}
+		return answer.data;
 	}
 
 	private async _request(op: string, input: unknown, token: CancellationToken | undefined): Promise<unknown> {

@@ -40,7 +40,7 @@ interface HostUser {
 	readonly id: string;
 	readonly email: string;
 	readonly name?: string;
-	readonly tier?: string;
+	readonly tier: string;
 }
 type HostIdentity =
 	| { readonly epoch: number; readonly signedIn: false }
@@ -81,7 +81,7 @@ function parseHostIdentity(raw: unknown): HostIdentity {
 			throw new Error('Host identity answer for signedIn:true has no user object.');
 		}
 		const u = user as Record<string, unknown>;
-		// `name` and `tier` are optional in the contract: an absent key is the absent member.
+		// Only `name` is optional in the contract: an absent key is the absent member. `tier` is required.
 		const unexpected = Object.keys(u).filter(key => !HOST_USER_KEYS.includes(key)).sort();
 		if (unexpected.length > 0) {
 			throw new Error(`Host identity user has unexpected fields: ${unexpected.join(',')}.`);
@@ -99,15 +99,12 @@ function parseHostIdentity(raw: unknown): HostIdentity {
 		if (name !== undefined && typeof name !== 'string') {
 			throw new Error('Host identity user.name is neither a string nor absent.');
 		}
-		if (tier !== undefined && typeof tier !== 'string') {
-			throw new Error('Host identity user.tier is neither a string nor absent.');
+		if (typeof tier !== 'string' || tier === '') {
+			throw new Error('Host identity user.tier is not a non-empty string.');
 		}
-		const parsedUser: { id: string; email: string; name?: string; tier?: string } = { id, email };
+		const parsedUser: { id: string; email: string; name?: string; tier: string } = { id, email, tier };
 		if (name !== undefined) {
 			parsedUser.name = name;
-		}
-		if (tier !== undefined) {
-			parsedUser.tier = tier;
 		}
 		return { epoch: parseEpoch(record.epoch), signedIn: true, user: parsedUser };
 	}
@@ -240,7 +237,8 @@ export class DeltaPlusAuthProvider implements vscode.Disposable {
 	}
 
 	private _toServerUser(user: HostUser): ServerUser {
-		// AUTH-TIER: the host identity carries no tier yet; the carry AUTH-TIER adds it here.
+		// allow-any-unicode-next-line
+		// AUTH-TIER (PLAN-FINAL §3.2 item 1): the contract carries Go's tier, but no tier text is shown until the server's tier is real on the app's token path (E2); so the tier is not copied into the ServerUser that every display reads.
 		// The name is optional: absent stays absent (no key), never a stand-in.
 		const serverUser: ServerUser = { id: user.id, email: user.email };
 		if (user.name !== undefined) {

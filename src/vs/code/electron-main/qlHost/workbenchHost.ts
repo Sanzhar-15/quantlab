@@ -154,7 +154,8 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 			terminalHost.host.log(`mutant ${PERF_DELAYED_SWITCH_MUTANT} ACTIVE`);
 		}
 		// Review c1 M7: called from the start's onBeforeShow, before the window is shown and the terminal's first document loads,
-		// so no key and no close of the start reaches the host before these watches.
+		// so no key and no close of the start reaches the host before these watches. From this line on the toggle key and the
+		// overlay key are watched; it precedes `show BaseWindow` in the host log, which makes that order readable there.
 		terminalHost.host.log('workbench host attached');
 		this.attached.complete(terminalHost);
 	}
