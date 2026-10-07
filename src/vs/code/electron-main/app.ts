@@ -1577,7 +1577,6 @@ export class CodeApplication extends Disposable {
 		const hasFileURIs = !!args['file-uri'];
 		const noRecentEntry = args['skip-add-to-recently-opened'] === true;
 		const waitMarkerFileURI = args.wait && args.waitMarkerFilePath ? URI.file(args.waitMarkerFilePath) : undefined;
-		const remoteAuthority = args.remote || undefined;
 		const forceProfile = args.profile;
 		const forceTempProfile = args['profile-temp'];
 
@@ -1594,7 +1593,6 @@ export class CodeApplication extends Disposable {
 					noRecentEntry,
 					waitMarkerFileURI,
 					initialStartup: true,
-					remoteAuthority,
 					forceProfile,
 					forceTempProfile
 				});
@@ -1629,7 +1627,6 @@ export class CodeApplication extends Disposable {
 			waitMarkerFileURI,
 			gotoLineMode: args.goto,
 			initialStartup: true,
-			remoteAuthority,
 			forceProfile,
 			forceTempProfile
 		});

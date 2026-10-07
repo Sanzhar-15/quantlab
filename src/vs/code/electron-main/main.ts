@@ -34,6 +34,7 @@ import { DiagnosticsService } from '../../platform/diagnostics/node/diagnosticsS
 import { NativeParsedArgs } from '../../platform/environment/common/argv.js';
 import { EnvironmentMainService, IEnvironmentMainService } from '../../platform/environment/electron-main/environmentMainService.js';
 import { addArg, parseMainProcessArgv } from '../../platform/environment/node/argvHelper.js';
+import { refusedCliOption } from '../../platform/environment/node/argv.js';
 import { createWaitMarkerFileSync } from '../../platform/environment/node/wait.js';
 import { IFileService } from '../../platform/files/common/files.js';
 import { FileService } from '../../platform/files/common/fileService.js';
@@ -537,7 +538,19 @@ class CodeMain {
 	private resolveArgs(): NativeParsedArgs {
 
 		// Parse arguments
-		const args = this.validatePaths(parseMainProcessArgv(process.argv));
+		const parsedArgs = parseMainProcessArgv(process.argv);
+
+		// MCP servers, sync, the telemetry report and remote windows are removed: a launch that asks for them (the app started
+		// directly, not through the CLI that refuses them first) is refused by name before any service is created.
+		const refusedOption = refusedCliOption(parsedArgs);
+		if (refusedOption) {
+			const message = `'${refusedOption}' option not supported in ${product.applicationName}`;
+			console.error(message);
+			app.exit(1);
+			throw new Error(message); // not reached once the exit takes effect; a refused launch never returns its arguments
+		}
+
+		const args = this.validatePaths(parsedArgs);
 
 		if (args.wait && !args.waitMarkerFilePath) {
 			// If we are started with --wait create a random temporary file
@@ -566,10 +579,8 @@ class CodeMain {
 		}
 
 		// Normalize paths and watch out for goto line mode
-		if (!args['remote']) {
-			const paths = this.doValidatePaths(args._, args.goto);
-			args._ = paths;
-		}
+		const paths = this.doValidatePaths(args._, args.goto);
+		args._ = paths;
 
 		return args;
 	}
