@@ -370,6 +370,17 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 	}
 
 	private reportFailure(what: string, error: unknown): void {
+
+		// QuantLab host (review c1 M7, package K2): a quit that arrives while the workbench is still opening closes its window, so
+		// the request that was waiting for it fails ("went away before it was ready"). That failure is the quit's own effect: it is
+		// logged, and no dialog is shown for it. A dialog here kept the app alive: the host window is closing or closed, so the
+		// dialog was app-modal with nobody to answer it (SIGTERM 1.5 s after the attach: alive 60 s, no will-quit).
+		if (this.closing || this.deps.lifecycleMainService.quitRequested) {
+			this.deps.logService.error(`QuantLab host: ${what} failed while the app is quitting; no dialog is shown`, error);
+
+			return;
+		}
+
 		this.showFailure('QuantLab could not show the workbench.', what, error);
 	}
 
@@ -514,7 +525,8 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		this.closing = true;
 		this.settleThenCloseHostWindow().catch(error => {
 			this.closing = false;
-			this.reportFailure('closing the window', error);
+			// not `reportFailure`: a quit that could not be settled leaves the window open, and that is told in a dialog on it
+			this.showFailure('QuantLab could not show the workbench.', 'closing the window', error);
 		});
 	}
 
