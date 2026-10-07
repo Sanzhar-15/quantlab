@@ -41,6 +41,17 @@ export const PINNED_IDS = ['ms-python.python', 'detachhead.basedpyright', 'ms-to
 
 export const STATUSES = ['PASS', 'FAIL', 'NOT RUN'];
 
+/**
+ * The launcher disables Electron's asar fs patch for itself only (launcher.mjs, process.noAsar). ELECTRON_NO_ASAR in
+ * its environment would reach every app launch through the spread of process.env and run the packaged app without
+ * asar, so the launcher refuses to run with it set; it never deletes it quietly.
+ */
+export function assertNoAsarEnvAbsent(env) {
+	if (env.ELECTRON_NO_ASAR !== undefined) {
+		throw new Error(`[asar_env_set] ELECTRON_NO_ASAR is set (${JSON.stringify(env.ELECTRON_NO_ASAR)}) in the launcher's environment; the packaged app would inherit it and run without asar. Unset it and run again`);
+	}
+}
+
 export function sha256File(file) {
 	return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }

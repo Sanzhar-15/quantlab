@@ -11,7 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
-import { assemble, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
+import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
 
@@ -73,6 +73,40 @@ test('treeDigest and findBuiltInExtensionDir on a small tree', () => {
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test('treeDigest hashes a file named node_modules.asar as bytes: one changed byte changes the digest', () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-features-asar-'));
+	try {
+		fs.mkdirSync(path.join(root, 'app', 'node_modules'), { recursive: true });
+		fs.writeFileSync(path.join(root, 'app', 'node_modules', 'x.js'), '1');
+		const asar = path.join(root, 'app', 'node_modules.asar');
+		fs.writeFileSync(asar, Buffer.concat([Buffer.from('{"files":{}}'), Buffer.alloc(16)]));
+		assert.strictEqual(fs.statSync(asar).size, 28);
+		const before = treeDigest(root);
+		assert.strictEqual(before.files, 2);
+		assert.deepStrictEqual(treeDigest(root), before);
+		const bytes = fs.readFileSync(asar);
+		bytes[27] = 1;
+		fs.writeFileSync(asar, bytes);
+		assert.notStrictEqual(treeDigest(root).sha256, before.sha256);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('assertNoAsarEnvAbsent: ELECTRON_NO_ASAR in the environment throws by name, any value; absent passes', () => {
+	assert.doesNotThrow(() => assertNoAsarEnvAbsent({ PATH: '/bin' }));
+	assert.throws(() => assertNoAsarEnvAbsent({ ELECTRON_NO_ASAR: '1' }), /asar_env_set/);
+	assert.throws(() => assertNoAsarEnvAbsent({ ELECTRON_NO_ASAR: '' }), /asar_env_set/);
+});
+
+test('launcher.mjs sets process.noAsar before any fs call and never puts ELECTRON_NO_ASAR in an env it builds', () => {
+	const source = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
+	const set = source.indexOf('process.noAsar = true;');
+	assert.ok(set > 0, 'launcher.mjs does not set process.noAsar = true');
+	assert.ok(set < source.indexOf('fs.'), 'process.noAsar = true comes after the first fs use');
+	assert.ok(!/ELECTRON_NO_ASAR\s*[:=]/.test(source), 'launcher.mjs assigns ELECTRON_NO_ASAR');
 });
 
 test('processesInside: only commands run from inside a launched bundle, never the launcher itself', () => {

@@ -16,8 +16,16 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { connect, waitForEndpoint } from './cdp.mjs';
 import * as net from 'node:net';
-import { assemble, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
+import { assemble, assertNoAsarEnvAbsent, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
 import { backtestForm, importModal, readToasts, waitForWorkbench } from './window.mjs';
+
+// This process only: Electron's asar-patched fs refuses to read a FILE named *.asar as bytes (ENOENT ", not found in
+// .../node_modules.asar"), and the app-tree digest (treeDigest, lib.mjs) hashes every file of the bundle. The digest
+// wants the bytes on disk: an .asar under the bundle is a file to hash here, not an archive to open. Set before any
+// fs call (the imports above only define functions; none touches fs while loading). It is never passed on: the app
+// launches get no ELECTRON_NO_ASAR, and the launcher refuses to run if its own environment has one (below).
+// Under plain node (lib.test.mjs) the property is unused.
+process.noAsar = true;
 
 const { serve } = createRequire(import.meta.url)('./cues.cjs');
 
@@ -261,6 +269,11 @@ async function noProcessLeft(bundles) {
 	return { id: 'no-process-left', status: 'FAIL', detail: `[process_left] still running 15 s after the app exited (killed now): ${left.map(p => `${p.pid} ${p.command}`).join(' | ')}` };
 }
 
+try {
+	assertNoAsarEnvAbsent(process.env);
+} catch (err) {
+	fail(err.message);
+}
 if (app === undefined || evidence === undefined || (network !== 'off' && network !== 'on')) {
 	fail('usage: run.sh <path to the .app bundle> <evidence dir that does not exist yet> <off|on: the guest network>');
 }
