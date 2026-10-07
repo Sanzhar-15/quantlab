@@ -6,7 +6,7 @@
 import * as nls from '../../../nls.js';
 import type * as vscode from 'vscode';
 import { URL } from 'url';
-import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, IExtHostAuthentication, scopeCountText } from '../common/extHostAuthentication.js';
+import { ExtHostAuthentication, DynamicAuthClientRejectedError, DynamicAuthProvider, DynamicAuthProviderTokensChange, IExtHostAuthentication, scopeCountText } from '../common/extHostAuthentication.js';
 import { IExtHostRpcService } from '../common/extHostRpcService.js';
 import { IExtHostInitDataService } from '../common/extHostInitDataService.js';
 import { IExtHostWindow } from '../common/extHostWindow.js';
@@ -36,7 +36,7 @@ export class NodeDynamicAuthProvider extends DynamicAuthProvider {
 		resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined,
 		clientId: string,
 		clientSecret: string | undefined,
-		onDidDynamicAuthProviderTokensChange: Emitter<{ authProviderId: string; clientId: string; tokens: any[] }>,
+		onDidDynamicAuthProviderTokensChange: Emitter<DynamicAuthProviderTokensChange>,
 		initialTokens: any[]
 	) {
 		super(

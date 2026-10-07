@@ -120,7 +120,7 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 			registration_endpoint: REGISTRATION_ENDPOINT,
 		};
 		const logger = new RecordingLogger();
-		const emitter = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: StoredToken[] }>());
+		const emitter = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: StoredToken[] | undefined }>());
 		const provider = new TestDynamicAuthProvider(
 			{} as IExtHostWindow,
 			{} as IExtHostUrlsService,

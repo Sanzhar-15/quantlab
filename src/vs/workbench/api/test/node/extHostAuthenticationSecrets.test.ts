@@ -10,7 +10,7 @@ import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { CancellationError, isCancellationError } from '../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { fetchAuthorizationServerMetadata, fetchDynamicRegistration, fetchResourceMetadata, getClaimsFromJWT, IAuthorizationServerMetadata, isValidAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
+import { fetchAuthorizationServerMetadata, fetchDynamicRegistration, fetchResourceMetadata, getClaimsFromJWT, IAuthorizationServerMetadata, IAuthorizationTokenResponse, isValidAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { ILogger, ILoggerService, ILogService, LogLevel } from '../../../../platform/log/common/log.js';
@@ -269,7 +269,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 				return task({ report: () => undefined }, CancellationToken.None);
 			}
 		} as unknown as IExtHostProgress;
-		const tokenEvents = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: any[] }>());
+		const tokenEvents = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: (IAuthorizationTokenResponse & { created_at: number })[] | undefined }>());
 		const metadata: IAuthorizationServerMetadata = {
 			issuer: AUTH_SERVER,
 			authorization_endpoint: `${AUTH_SERVER}/authorize`,

@@ -8,7 +8,7 @@ import * as http from 'http';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { IAuthorizationServerMetadata } from '../../../../base/common/oauth.js';
+import { IAuthorizationServerMetadata, IAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { ILogger, ILoggerService, LogLevel } from '../../../../platform/log/common/log.js';
@@ -255,7 +255,7 @@ suite('F-SECRETS-5 R-101: no challenge URL or server-derived scope reaches a log
 				proxy as unknown as MainThreadAuthenticationShape,
 				URI.parse(AUTH_SERVER), metadata, undefined,
 				'client-id', undefined,
-				store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: any[] }>()), options.initialTokens ?? []
+				store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: (IAuthorizationTokenResponse & { created_at: number })[] | undefined }>()), options.initialTokens ?? []
 			));
 			return { provider, logger, openedUris };
 		}

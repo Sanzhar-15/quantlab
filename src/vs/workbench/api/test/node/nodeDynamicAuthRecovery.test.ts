@@ -77,7 +77,7 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 			device_authorization_endpoint: DEVICE_ENDPOINT,
 			registration_endpoint: REGISTRATION_ENDPOINT,
 		};
-		const emitter = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: (IAuthorizationTokenResponse & { created_at: number })[] }>());
+		const emitter = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: (IAuthorizationTokenResponse & { created_at: number })[] | undefined }>());
 		const provider = new NodeDynamicAuthProvider(
 			{} as IExtHostWindow,
 			{} as IExtHostUrlsService,
@@ -156,7 +156,7 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 			token_endpoint: TOKEN_ENDPOINT,
 			device_authorization_endpoint: DEVICE_ENDPOINT,
 		};
-		const emitter = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: (IAuthorizationTokenResponse & { created_at: number })[] }>());
+		const emitter = store.add(new Emitter<{ authProviderId: string; clientId: string; tokens: (IAuthorizationTokenResponse & { created_at: number })[] | undefined }>());
 		const provider = new NodeDynamicAuthProvider(
 			{} as IExtHostWindow,
 			{ createAppUri: async () => { throw new Error(`url service said ${M}`); } } as unknown as IExtHostUrlsService,

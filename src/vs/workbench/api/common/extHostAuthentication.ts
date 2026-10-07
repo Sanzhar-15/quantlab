@@ -83,8 +83,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 	private _onDidChangeSessions = new Emitter<vscode.AuthenticationSessionsChangeEvent & { extensionIdFilter?: string[] }>();
 	private _getSessionTaskSingler = new TaskSingler<vscode.AuthenticationSession | undefined>();
 
-	/** `tokens` undefined: the stored sessions were deleted, which only the removal of the provider does (a terminal removal). */
-	private _onDidDynamicAuthProviderTokensChange = new Emitter<{ authProviderId: string; clientId: string; tokens: IAuthorizationToken[] | undefined }>();
+	private _onDidDynamicAuthProviderTokensChange = new Emitter<DynamicAuthProviderTokensChange>();
 
 	constructor(
 		@IExtHostRpcService extHostRpc: IExtHostRpcService,
@@ -517,7 +516,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		protected readonly _resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined,
 		protected _clientId: string,
 		protected _clientSecret: string | undefined,
-		onDidDynamicAuthProviderTokensChange: Emitter<{ authProviderId: string; clientId: string; tokens: IAuthorizationToken[] | undefined }>,
+		onDidDynamicAuthProviderTokensChange: Emitter<DynamicAuthProviderTokensChange>,
 		initialTokens: IAuthorizationToken[],
 	) {
 		const stringifiedServer = authorizationServer.toString(true);
@@ -1035,6 +1034,13 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		throw createOAuthInvalidResponseError('authorization token', response, result);
 	}
 }
+
+/**
+ * A change of the stored sessions of one dynamic provider and client, as the main thread reports it. `tokens` undefined is
+ * not an empty list: the stored sessions were deleted, which only the removal of the provider does (a terminal removal,
+ * see TokenStore). Every provider, its subclasses and the event they listen to take this one type.
+ */
+export type DynamicAuthProviderTokensChange = { authProviderId: string; clientId: string; tokens: IAuthorizationToken[] | undefined };
 
 type IAuthorizationToken = IAuthorizationTokenResponse & {
 	/**
