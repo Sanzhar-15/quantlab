@@ -97,8 +97,12 @@ export function disposeChart(chart: Chart, container?: HTMLElement): void {
 
 /** Build CreateChartOptions from the plan + (optional) theme tokens. */
 function buildCreateChartOptions(plan: TimeseriesPlan): CreateChartOptions {
+	// compileTimeseriesPlan always sets autoSize (src/qviz/render/timeseries.ts); a plan without it breaks that contract.
+	if (plan.chart.autoSize === undefined) {
+		throw new Error('qviz applier: the timeseries plan has no chart.autoSize');
+	}
 	const opts: CreateChartOptions = {
-		autoSize: plan.chart.autoSize ?? true,
+		autoSize: plan.chart.autoSize,
 		seriesRenderer: 'main',
 	};
 	if (plan.chart.width !== undefined) { (opts as { width?: number }).width = plan.chart.width; }

@@ -156,11 +156,19 @@ export class ChartThemeReader {
 	}
 }
 
+/** The host's timeframes (src/types/market.ts `Timeframe`); a message carrying any other value is a named error. */
+const CHART_TIMEFRAMES = ['1m', '5m', '15m', '30m', '1H', '4H', '1D', '1W', '1M'] as const;
+type ChartTimeframe = typeof CHART_TIMEFRAMES[number];
+function isChartTimeframe(value: string): value is ChartTimeframe {
+	return (CHART_TIMEFRAMES as readonly string[]).includes(value);
+}
+
 const ORD_STEP_MS = 86_400_000; // 1 day -- universal step for ordinal spacing
 
 /**
  * Applies an alpha channel to a resolved CSS color (#rgb, #rrggbb, rgb(),
- * rgba()). Unrecognized formats are returned unchanged (full opacity).
+ * rgba()). Its inputs are computed colours (ChartThemeReader, the engine theme built from it); any other format is a
+ * named error, never the colour at full opacity.
  */
 function withAlpha(color: string, alpha: number): string {
 	const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color.trim());
@@ -179,7 +187,7 @@ function withAlpha(color: string, alpha: number): string {
 			return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
 		}
 	}
-	return color;
+	throw new Error(`chart: cannot apply alpha to colour "${color}" (not #rgb, #rrggbb, rgb() or rgba())`);
 }
 
 class OrdinalTimeMap {
@@ -211,9 +219,15 @@ class OrdinalTimeMap {
 		return idx * ORD_STEP_MS;
 	}
 
-	/** Convert fake time back to real time (for display formatting). */
-	toReal(fakeTime: number): number {
-		const idx = Math.max(0, Math.min(Math.round(fakeTime / ORD_STEP_MS), this.realTimes.length - 1));
+	/**
+	 * Convert fake time back to real time (for display formatting): the nearest bar's time (the ordinal axis has no time
+	 * between bars). A position outside the bars has no real time: undefined, never the edge bar's time.
+	 */
+	toReal(fakeTime: number): number | undefined {
+		const idx = Math.round(fakeTime / ORD_STEP_MS);
+		if (idx < 0 || idx >= this.realTimes.length) {
+			return undefined;
+		}
 		return this.realTimes[idx];
 	}
 }
@@ -231,7 +245,8 @@ export class ChartClient {
 	private lastSignals: SignalPoint[] = [];
 	private initPromise: Promise<void> | undefined;
 	private theme: 'light' | 'dark' = 'dark';
-	private timeframe = '1D';
+	// Set by the host (init/setToolbar) before the chart is created; the axis never formats with an assumed timeframe.
+	private timeframe: ChartTimeframe | undefined;
 	// Resolved from the theme tokens when the chart is created and on every theme change (`palette` reads it),
 	// not at construction: a missing token is then reported by the chart's error boundary.
 	private colors: ChartColors | undefined;
@@ -323,6 +338,10 @@ export class ChartClient {
 		// Build ordinal map from real timestamps and remap bars. No bars is a defined empty chart: the state before
 		// the first setData, with no ordinal map (an empty map has no real time to show for an axis position).
 		const realTimes = data.map(bar => bar.t);
+		const badTime = data.findIndex(bar => !Number.isFinite(bar.t));
+		if (badTime !== -1) {
+			throw new Error(`chart: bar ${badTime} has no finite time (t = ${data[badTime].t})`);
+		}
 		this.ordinalMap = data.length > 0 ? new OrdinalTimeMap(realTimes) : null;
 		const remapped = data.map((bar, i) => ({ ...bar, t: i * ORD_STEP_MS }));
 
@@ -380,11 +399,13 @@ export class ChartClient {
 		const up = withAlpha(this.palette.positive, 0.45);
 		const down = withAlpha(this.palette.negative, 0.45);
 		this.volumeSeries.setVisible(true);
-		this.volumeSeries.setData(remappedBars.map(bar => ({
+		// A bar without volume (OhlcvBar.v is optional: a source without a volume column) gets no histogram point, a gap,
+		// never a zero-volume bar.
+		this.volumeSeries.setData(remappedBars.flatMap(bar => bar.v === undefined ? [] : [{
 			t: bar.t,
-			v: bar.v ?? 0,
+			v: bar.v,
 			color: bar.c >= bar.o ? up : down
-		})));
+		}]));
 	}
 
 	async setEquityCurve(data: EquityPoint[]): Promise<void> {
@@ -437,8 +458,8 @@ export class ChartClient {
 
 	setTimeframe(timeframe: string): void {
 		const normalized = timeframe.trim();
-		if (!normalized) {
-			return;
+		if (!isChartTimeframe(normalized)) {
+			throw new Error(`chart: unknown timeframe "${timeframe}" (expected one of ${CHART_TIMEFRAMES.join(', ')})`);
 		}
 		this.timeframe = normalized;
 
@@ -824,7 +845,11 @@ export class ChartClient {
 
 		this.chart.addPlugin<CanvasRenderingContext2D>({
 			onRenderOverlay: (ctx, state) => {
-				const panes = state.layout.panes ?? [];
+				// The engine's render path always lays out the panes (chart-render-canvas2d: layoutState = { ...layout, panes }).
+				const panes = state.layout.panes;
+				if (!panes) {
+					throw new Error('chart: the engine render state has no pane layout');
+				}
 				if (panes.length > 1) {
 					ctx.save();
 					ctx.strokeStyle = this.palette.paneDivider;
@@ -863,11 +888,9 @@ export class ChartClient {
 			return;
 		}
 
-		const start = data[0]?.t ?? 0;
-		const end = data[data.length - 1]?.t ?? 0;
-		if (!Number.isFinite(start) || !Number.isFinite(end)) {
-			return;
-		}
+		// `data` is the remapped series (t = i * ORD_STEP_MS) with at least two bars: both ends exist and are finite.
+		const start = data[0].t;
+		const end = data[data.length - 1].t;
 
 		if (this.fittedBounds && this.fittedBounds.start === start && this.fittedBounds.end === end) {
 			return;
@@ -893,12 +916,19 @@ export class ChartClient {
 			return '';
 		}
 		const realTime = this.ordinalMap ? this.ordinalMap.toReal(time) : time;
+		if (realTime === undefined) {
+			// An axis position outside the bars (elastic pan, padding): no bar, no time, no label.
+			return '';
+		}
 		const kind = this.resolveTimeFormatKind();
 		const formatter = this.getTimeFormatter(kind);
 		return formatter.format(new Date(realTime));
 	}
 
 	private resolveTimeFormatKind(): 'minute' | 'hour' | 'day' | 'month' {
+		if (this.timeframe === undefined) {
+			throw new Error('chart: the time axis was formatted before the host set a timeframe');
+		}
 		switch (this.timeframe) {
 			case '1m':
 			case '5m':
@@ -912,13 +942,15 @@ export class ChartClient {
 				return 'month';
 			case '1W':
 			case '1D':
-			default:
 				return 'day';
 		}
 	}
 
 	private getTimeFormatter(kind: 'minute' | 'hour' | 'day' | 'month'): Intl.DateTimeFormat {
-		const locale = typeof navigator !== 'undefined' ? navigator.language : 'en-US';
+		const locale = navigator.language;
+		if (!locale) {
+			throw new Error('chart: navigator.language is empty; the time axis has no locale');
+		}
 		const key = `${locale}:${kind}`;
 		const cached = this.timeFormatters.get(key);
 		if (cached) {

@@ -237,6 +237,7 @@ suite('chart fallbacks (F-CHARTS-FB)', () => {
 
 	test('setData([]) is a defined empty chart: the time axis formats, and data after it maps again', async () => {
 		const client = new ChartClient(container(600));
+		client.setTimeframe('1D');
 		await client.initialize('dark');
 		const timeFormatter = fake.options?.timeFormatter as (time: number) => string;
 		await client.setData([]);
