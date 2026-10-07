@@ -14,7 +14,7 @@ import * as vscode from 'vscode';
 import { GlobalState } from '../core/state/GlobalState';
 import { ChartViewProvider } from '../views/chart/ChartViewProvider';
 import { openServerSymbol } from '../commands/globalStateCommands';
-import { mintServerSymbolHandle } from '../panels/data/serverSymbolHandles';
+import { etfOrIndexDisplayName, mintServerSymbolHandle } from '../panels/data/serverSymbolHandles';
 
 // HOST review c1 M1: a public command cannot produce an authorised server request from caller-supplied arguments.
 // `quantlab.setServerDataSource` is gone; `quantlab.openServerSymbol` takes only a handle DataTreeProvider minted.
@@ -96,6 +96,14 @@ suite('HOST c1 M1: public QuantLab commands carry no caller-controlled server se
 		assert.deepStrictEqual(globalState.getDataSource(), { kind: 'server', symbol: 'AAPL', displayName: 'Apple Inc.', assetClass: 'equities' });
 		assert.deepStrictEqual({ changes: spy.changes, reloads: spy.reloads }, { changes: 1, reloads: 1 });
 		spy.dispose();
+	});
+
+	test('an ETF or index item without a name (optional in the server contract) is labelled by its ticker', () => {
+		assert.strictEqual(etfOrIndexDisplayName('SPY', undefined), 'SPY');
+	});
+
+	test('an ETF or index item with a name is labelled by its name', () => {
+		assert.strictEqual(etfOrIndexDisplayName('SPY', 'SPDR S&P 500 ETF Trust'), 'SPDR S&P 500 ETF Trust');
 	});
 
 	test('wiring: setServerDataSource is gone; openServerSymbol is registered as the handle-only function; every tree site mints', () => {

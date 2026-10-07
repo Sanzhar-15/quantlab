@@ -14,6 +14,18 @@ import { ServerDataSource } from '../../types/market';
 const sourcesByHandle = new Map<string, ServerDataSource>();
 const handlesByKey = new Map<string, string>();
 
+/**
+ * The display name of an ETF or index item. The server contract has no name for some of them (`EtfItem.name` and
+ * `IndexItem.name` are optional, core/server/ServerApiClient.ts:114 and :123); such an item is labelled by its ticker.
+ */
+export function etfOrIndexDisplayName(ticker: string, name: string | undefined): string {
+	if (name === undefined) {
+		return ticker;
+	}
+
+	return name;
+}
+
 /** Mints (or returns the existing) handle for a server symbol the data tree renders. */
 export function mintServerSymbolHandle(symbol: string, displayName: string, assetClass?: string): string {
 	const key = JSON.stringify([symbol, displayName, assetClass ?? null]);

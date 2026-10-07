@@ -8,7 +8,7 @@ import { GlobalState } from '../../core/state/GlobalState';
 import { ServerApiClient, ServerSymbol, CryptoSymbol, EtfItem, IndexItem } from '../../core/server/ServerApiClient';
 import { WatchlistManager, Watchlist } from './WatchlistManager';
 import { isServerSource } from '../../types/market';
-import { mintServerSymbolHandle } from './serverSymbolHandles';
+import { etfOrIndexDisplayName, mintServerSymbolHandle } from './serverSymbolHandles';
 import { isHostDataError } from '../../core/host/hostDataTransport';
 
 /** A failed server load: the text shown, and whether the host refused it as signed out (by its code). */
@@ -741,7 +741,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			command: {
 				command: 'quantlab.openServerSymbol',
 				title: 'Open',
-				arguments: [mintServerSymbolHandle(etf.ticker, etf.name ?? etf.ticker, 'ETF')]
+				arguments: [mintServerSymbolHandle(etf.ticker, etfOrIndexDisplayName(etf.ticker, etf.name), 'ETF')]
 			},
 		} satisfies InstrumentNode));
 	}
@@ -775,7 +775,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				command: {
 					command: 'quantlab.openServerSymbol',
 					title: 'Open',
-					arguments: [mintServerSymbolHandle(sym, idx.name ?? sym, 'Index')]
+					arguments: [mintServerSymbolHandle(sym, etfOrIndexDisplayName(sym, idx.name), 'Index')]
 				},
 			} satisfies InstrumentNode;
 		});
