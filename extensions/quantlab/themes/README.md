@@ -24,6 +24,14 @@ Plain Node ESM, no dependencies, no network. Every problem is a hard error that 
 - High contrast: `base/hc.json` colours stay as they were (accessibility theme); `mapping.json` `hc` takes only the
   accent/focus keys (`focusBorder`, `list.highlightForeground`, `progressBar.background`) from `--color-brand`.
 
+## Text contrast (WCAG AA, 4.5:1)
+
+Five pairs the token mapping left below 4.5:1 are mapped to other tokens of the same snapshot (the snapshot itself is untouched):
+`input.placeholderForeground` dark `--color-muted` (4.48 -> 5.07 on the input) and light `--color-disabled-text` (4.28 -> 5.46);
+light `textLink.foreground` and `textLink.activeForeground` `--series-6` (3.33 -> 5.18 on the editor); light `list.highlightForeground`
+`--series-6` (2.92 -> 4.54 on the side bar). The placeholders take the closest neutral token that clears 4.5:1 on that background; the light accent text takes the closest orange token (`--down`, red, is nearer but changes the hue). The
+initial-colour maps in `src/vs/workbench/services/themes/common/workbenchThemeService.ts` repeat the placeholder and link values and move with them.
+
 ## Moving to a new token revision
 
 1. Copy the new `variables.css` over `tokens/variables.css.template` (read it from the client repo's git blob, not its checkout).
