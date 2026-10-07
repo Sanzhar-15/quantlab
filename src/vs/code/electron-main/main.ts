@@ -34,7 +34,7 @@ import { DiagnosticsService } from '../../platform/diagnostics/node/diagnosticsS
 import { NativeParsedArgs } from '../../platform/environment/common/argv.js';
 import { EnvironmentMainService, IEnvironmentMainService } from '../../platform/environment/electron-main/environmentMainService.js';
 import { addArg, parseMainProcessArgv } from '../../platform/environment/node/argvHelper.js';
-import { refusedCliOption } from '../../platform/environment/node/argv.js';
+import { refusedCliCommand, refusedCliOption } from '../../platform/environment/node/argv.js';
 import { createWaitMarkerFileSync } from '../../platform/environment/node/wait.js';
 import { IFileService } from '../../platform/files/common/files.js';
 import { FileService } from '../../platform/files/common/fileService.js';
@@ -540,11 +540,12 @@ class CodeMain {
 		// Parse arguments
 		const parsedArgs = parseMainProcessArgv(process.argv);
 
-		// MCP servers, sync, the telemetry report and remote windows are removed: a launch that asks for them (the app started
-		// directly, not through the CLI that refuses them first) is refused by name before any service is created.
+		// Tunnel, serve-web, chat, MCP servers, sync, the telemetry report and remote windows are removed: a launch that asks for
+		// them (the app started directly, not through the CLI that refuses them first) is refused by name before any service is created.
+		const refusedCommand = refusedCliCommand(parsedArgs);
 		const refusedOption = refusedCliOption(parsedArgs);
-		if (refusedOption) {
-			const message = `'${refusedOption}' option not supported in ${product.applicationName}`;
+		if (refusedCommand || refusedOption) {
+			const message = refusedCommand ? `'${refusedCommand}' command not supported in ${product.applicationName}` : `'${refusedOption}' option not supported in ${product.applicationName}`;
 			console.error(message);
 			app.exit(1);
 			throw new Error(message); // not reached once the exit takes effect; a refused launch never returns its arguments
