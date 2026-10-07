@@ -69,11 +69,91 @@ interface ChartColors {
 	warning: string;
 	info: string;
 	neutral: string;
+	paneDivider: string;
 }
 
 interface ChartBounds {
 	start: number;
 	end: number;
+}
+
+/**
+ * Reads the chart's theme from the document's CSS custom properties: `--ql-*` from media/tokens.css and
+ * `--vscode-*` from the webview host. Every token the chart reads must be set and must resolve; a missing or
+ * unresolvable one is a named error (shown by the chart's error boundary), never a substitute value.
+ */
+export class ChartThemeReader {
+	private probe: HTMLSpanElement | undefined;
+
+	/** The token's value; throws when the document does not set it. */
+	token(name: string): string {
+		const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+		if (!value) {
+			throw new Error(`chart theme: token ${name} is not set`);
+		}
+		return value;
+	}
+
+	/** The token as a computed colour, e.g. `rgb(10, 15, 24)`. */
+	color(name: string): string {
+		const value = this.token(name);
+		const probe = this.getProbe();
+		// An invalid value leaves the inline property unchanged, so clear it first: a stale colour must not pass.
+		probe.style.color = '';
+		probe.style.color = value;
+		if (!probe.style.color) {
+			throw new Error(`chart theme: token ${name} is "${value}", not a CSS colour`);
+		}
+		const computed = getComputedStyle(probe).color;
+		if (!computed) {
+			throw new Error(`chart theme: token ${name} ("${value}") has no computed colour`);
+		}
+		return computed;
+	}
+
+	/** The token as a computed font-family list. */
+	fontFamily(name: string): string {
+		const value = this.token(name);
+		const probe = this.getProbe();
+		probe.style.fontFamily = '';
+		probe.style.fontFamily = value;
+		if (!probe.style.fontFamily) {
+			throw new Error(`chart theme: token ${name} is "${value}", not a CSS font family`);
+		}
+		const computed = getComputedStyle(probe).fontFamily;
+		if (!computed) {
+			throw new Error(`chart theme: token ${name} ("${value}") has no computed font family`);
+		}
+		return computed;
+	}
+
+	/** The token as a computed font size in CSS pixels. */
+	fontSizePx(name: string): number {
+		const value = this.token(name);
+		const probe = this.getProbe();
+		probe.style.fontSize = '';
+		probe.style.fontSize = value;
+		if (!probe.style.fontSize) {
+			throw new Error(`chart theme: token ${name} is "${value}", not a CSS font size`);
+		}
+		const computed = getComputedStyle(probe).fontSize;
+		const parsed = Number.parseFloat(computed);
+		if (!Number.isFinite(parsed)) {
+			throw new Error(`chart theme: token ${name} ("${value}") has no computed pixel size (got "${computed}")`);
+		}
+		return parsed;
+	}
+
+	private getProbe(): HTMLSpanElement {
+		if (!this.probe) {
+			this.probe = document.createElement('span');
+			this.probe.style.position = 'absolute';
+			this.probe.style.opacity = '0';
+			this.probe.style.pointerEvents = 'none';
+			document.body.appendChild(this.probe);
+		}
+		return this.probe;
+	}
 }
 
 const ORD_STEP_MS = 86_400_000; // 1 day -- universal step for ordinal spacing
@@ -152,13 +232,13 @@ export class ChartClient {
 	private initPromise: Promise<void> | undefined;
 	private theme: 'light' | 'dark' = 'dark';
 	private timeframe = '1D';
-	private colors = this.resolveColors();
+	// Resolved from the theme tokens when the chart is created and on every theme change (`palette` reads it),
+	// not at construction: a missing token is then reported by the chart's error boundary.
+	private colors: ChartColors | undefined;
+	private readonly themeReader = new ChartThemeReader();
 	private paneMap = new Map<string, string>();
 	private fittedBounds: ChartBounds | undefined;
-	private colorProbe: HTMLSpanElement | undefined;
-	private fontProbe: HTMLSpanElement | undefined;
 	private timeFormatters = new Map<string, Intl.DateTimeFormat>();
-	private paneDividerColor = this.resolveColorVar('--vscode-editorGroup-border', 'rgba(255, 255, 255, 0.2)');
 	private strategyPaneKeys = new Set<string>();
 	private strategyPaneVisible = true;
 	private ordinalMap: OrdinalTimeMap | null = null;
@@ -205,11 +285,16 @@ export class ChartClient {
 			this.chart.setWatermark(null);
 			return;
 		}
-		const width = this.container.clientWidth || 800;
+		const width = this.container.clientWidth;
+		if (width === 0) {
+			// Not laid out (a hidden view): nothing is drawn, and the size is unknown. The container's resize
+			// observer (createChart) applies the watermark when the container gets its width.
+			return;
+		}
 		const fontSizePx = Math.round(Math.min(160, Math.max(48, width / 6)));
 		this.chart.setWatermark({
 			text: this.watermarkText,
-			color: this.resolveColorVar('--ql-fg', '#e7edf8'),
+			color: this.themeReader.color('--ql-fg'),
 			opacity: 0.08,
 			fontSizePx,
 			position: 'center'
@@ -235,9 +320,10 @@ export class ChartClient {
 			return;
 		}
 
-		// Build ordinal map from real timestamps and remap bars
+		// Build ordinal map from real timestamps and remap bars. No bars is a defined empty chart: the state before
+		// the first setData, with no ordinal map (an empty map has no real time to show for an axis position).
 		const realTimes = data.map(bar => bar.t);
-		this.ordinalMap = new OrdinalTimeMap(realTimes);
+		this.ordinalMap = data.length > 0 ? new OrdinalTimeMap(realTimes) : null;
 		const remapped = data.map((bar, i) => ({ ...bar, t: i * ORD_STEP_MS }));
 
 		this.lastBars = data;
@@ -291,8 +377,8 @@ export class ChartClient {
 			this.volumeAxisFormatted = true;
 		}
 
-		const up = withAlpha(this.colors.positive, 0.45);
-		const down = withAlpha(this.colors.negative, 0.45);
+		const up = withAlpha(this.palette.positive, 0.45);
+		const down = withAlpha(this.palette.negative, 0.45);
 		this.volumeSeries.setVisible(true);
 		this.volumeSeries.setData(remappedBars.map(bar => ({
 			t: bar.t,
@@ -318,7 +404,7 @@ export class ChartClient {
 		const paneId = this.ensurePane('equity');
 		if (!this.equitySeries) {
 			this.equitySeries = this.chart.addLineSeries({
-				color: this.colors.warning,
+				color: this.palette.warning,
 				width: 2,
 				paneId,
 				axis: 'right',
@@ -439,7 +525,6 @@ export class ChartClient {
 	setTheme(theme: 'light' | 'dark'): void {
 		this.theme = theme;
 		this.colors = this.resolveColors();
-		this.paneDividerColor = this.resolveColorVar('--vscode-editorGroup-border', 'rgba(255, 255, 255, 0.2)');
 		this.applyThemeTokens();
 		this.rebuildMarkers();
 		// Watermark color is resolved from --ql-fg at apply time -- re-resolve.
@@ -473,8 +558,11 @@ export class ChartClient {
 	}
 
 	private async createChart(): Promise<void> {
+		// Every theme token is read and validated BEFORE the engine exists, inside the cached initialization promise: a
+		// missing token rejects initialize() and every later call that awaits the chart (ensureChart), and no chart is
+		// ever drawn with the engine's default theme. (createChart reads no `theme` option: chart.setTheme applies it.)
 		this.colors = this.resolveColors();
-		// The theme is applied by initialize() through chart.setTheme (createChart reads no `theme` option).
+		const themeTokens = this.buildThemeTokens();
 		this.chart = createChart(this.container, {
 			autoSize: true,
 			timeFormatter: (time: number) => this.formatTime(time),
@@ -489,11 +577,12 @@ export class ChartClient {
 				},
 			},
 		});
+		this.chart.setTheme(themeTokens);
 		this.installPaneDividerPlugin();
 		this.installDrawnSignalPlugin();
 		this.candleSeries = this.chart.addCandlestickSeries({
-			upColor: this.colors.positive,
-			downColor: this.colors.negative,
+			upColor: this.palette.positive,
+			downColor: this.palette.negative,
 			axis: 'right'
 		});
 
@@ -524,7 +613,18 @@ export class ChartClient {
 			this.hoverListener?.(null);
 		});
 
+		// The watermark's size follows the container's width (applyWatermark), including a container that is
+		// first laid out after the chart was created.
+		new ResizeObserver(() => this.applyWatermark()).observe(this.container);
 		this.applyWatermark();
+	}
+
+	/** The theme colours; read only after createChart or setTheme resolved them. */
+	private get palette(): ChartColors {
+		if (!this.colors) {
+			throw new Error('chart theme: colours read before the chart resolved its theme');
+		}
+		return this.colors;
 	}
 
 	private ensurePane(key: string, height?: number): string {
@@ -688,7 +788,7 @@ export class ChartClient {
 				return {
 					time: this.snapTime(signal.t),
 					text: signal.label ?? (isEntry ? 'Entry' : 'Exit'),
-					color: isEntry ? this.colors.positive : this.colors.negative,
+					color: isEntry ? this.palette.positive : this.palette.negative,
 					shape: isEntry ? 'arrowUp' : 'arrowDown',
 					position: isEntry ? 'below' : 'above'
 				};
@@ -727,7 +827,7 @@ export class ChartClient {
 				const panes = state.layout.panes ?? [];
 				if (panes.length > 1) {
 					ctx.save();
-					ctx.strokeStyle = this.paneDividerColor;
+					ctx.strokeStyle = this.palette.paneDivider;
 					ctx.lineWidth = 2;
 					for (let i = 0; i < panes.length - 1; i++) {
 						const pane = panes[i];
@@ -779,11 +879,12 @@ export class ChartClient {
 
 	private resolveColors(): ChartColors {
 		return {
-			positive: this.resolveColorVar('--ql-status-positive', '#059669'),
-			negative: this.resolveColorVar('--ql-status-negative', '#dc2626'),
-			warning: this.resolveColorVar('--ql-status-warning', '#d97706'),
-			info: this.resolveColorVar('--ql-status-info', '#2563eb'),
-			neutral: this.resolveColorVar('--ql-status-neutral', '#6b7280')
+			positive: this.themeReader.color('--ql-status-positive'),
+			negative: this.themeReader.color('--ql-status-negative'),
+			warning: this.themeReader.color('--ql-status-warning'),
+			info: this.themeReader.color('--ql-status-info'),
+			neutral: this.themeReader.color('--ql-status-neutral'),
+			paneDivider: this.themeReader.color('--vscode-editorGroup-border')
 		};
 	}
 
@@ -849,19 +950,18 @@ export class ChartClient {
 	}
 
 	private buildThemeTokens(): ThemeTokensInput {
-		const styles = getComputedStyle(document.documentElement);
-		const read = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
-		const background = this.resolveColor(read('--ql-bg', '#0a0f18'));
-		const axisText = this.resolveColor(read('--ql-fg', '#e7edf8'));
-		const gridMajor = this.resolveColor(read('--vscode-editorGroup-border', 'rgba(255,255,255,0.12)'));
-		const gridMinor = this.resolveColor(read('--vscode-editorWidget-border', 'rgba(255,255,255,0.06)'));
-		const crosshair = this.resolveColor(read('--vscode-focusBorder', this.colors.info));
-		const focusBand = this.resolveColor(read('--vscode-editor-inactiveSelectionBackground', 'rgba(89,145,255,0.12)'));
-		const tooltipBackground = this.resolveColor(read('--vscode-editorHoverWidget-background', background));
-		const tooltipText = this.resolveColor(read('--vscode-editorHoverWidget-foreground', axisText));
-		const tooltipBorder = this.resolveColor(read('--vscode-editorHoverWidget-border', gridMajor));
-		const fontFamily = this.resolveFontFamily(read('--ql-font-family', 'system-ui, sans-serif'));
-		const fontSizePx = this.resolveFontSize(read('--ql-font-size-base', '12px'));
+		const theme = this.themeReader;
+		const background = theme.color('--ql-bg');
+		const axisText = theme.color('--ql-fg');
+		const gridMajor = theme.color('--vscode-editorGroup-border');
+		const gridMinor = theme.color('--vscode-editorWidget-border');
+		const crosshair = theme.color('--vscode-focusBorder');
+		const focusBand = theme.color('--vscode-editor-inactiveSelectionBackground');
+		const tooltipBackground = theme.color('--vscode-editorHoverWidget-background');
+		const tooltipText = theme.color('--vscode-editorHoverWidget-foreground');
+		const tooltipBorder = theme.color('--vscode-editorHoverWidget-border');
+		const fontFamily = theme.fontFamily('--ql-font-family');
+		const fontSizePx = theme.fontSizePx('--ql-font-size-base');
 
 		return {
 			background,
@@ -873,58 +973,14 @@ export class ChartClient {
 			tooltipBackground,
 			tooltipText,
 			tooltipBorder,
-			seriesPrimary: this.colors.info,
-			seriesSecondary: this.colors.negative,
-			seriesTertiary: this.colors.positive,
-			seriesQuaternary: this.colors.warning,
-			seriesQuinary: this.colors.neutral,
+			seriesPrimary: this.palette.info,
+			seriesSecondary: this.palette.negative,
+			seriesTertiary: this.palette.positive,
+			seriesQuaternary: this.palette.warning,
+			seriesQuinary: this.palette.neutral,
 			fontFamily,
 			fontSizePx
 		};
-	}
-
-	private resolveColorVar(name: string, fallback: string): string {
-		const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
-		return this.resolveColor(value);
-	}
-
-	private resolveColor(value: string): string {
-		if (!this.colorProbe) {
-			this.colorProbe = document.createElement('span');
-			this.colorProbe.style.position = 'absolute';
-			this.colorProbe.style.opacity = '0';
-			this.colorProbe.style.pointerEvents = 'none';
-			document.body.appendChild(this.colorProbe);
-		}
-		this.colorProbe.style.color = value;
-		const computed = getComputedStyle(this.colorProbe).color;
-		return computed || value;
-	}
-
-	private resolveFontFamily(value: string): string {
-		if (!this.fontProbe) {
-			this.fontProbe = document.createElement('span');
-			this.fontProbe.style.position = 'absolute';
-			this.fontProbe.style.opacity = '0';
-			this.fontProbe.style.pointerEvents = 'none';
-			document.body.appendChild(this.fontProbe);
-		}
-		this.fontProbe.style.fontFamily = value;
-		return getComputedStyle(this.fontProbe).fontFamily || value;
-	}
-
-	private resolveFontSize(value: string): number {
-		if (!this.fontProbe) {
-			this.fontProbe = document.createElement('span');
-			this.fontProbe.style.position = 'absolute';
-			this.fontProbe.style.opacity = '0';
-			this.fontProbe.style.pointerEvents = 'none';
-			document.body.appendChild(this.fontProbe);
-		}
-		this.fontProbe.style.fontSize = value;
-		const computed = getComputedStyle(this.fontProbe).fontSize;
-		const parsed = Number.parseFloat(computed);
-		return Number.isFinite(parsed) ? parsed : 12;
 	}
 
 	private buildSeriesOptions(options?: Record<string, unknown>, paneId?: string): Record<string, unknown> {

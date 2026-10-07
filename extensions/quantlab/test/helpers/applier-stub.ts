@@ -288,14 +288,8 @@ export interface Chart {
 	onCrosshairMove(cb: (event: CrosshairMoveEvent) => void): () => void;
 	setTheme(theme: ThemeTokensInput): void;
 	setWatermark(options: WatermarkOptions | null): void;
-	// Disposal methods: the real chart-core's API has migrated across
-	// `remove` / `destroy` / `dispose` over versions; `applier.disposeChart`
-	// probes for the first one defined. All three are optional here so
-	// the probe compiles, but at least one MUST exist at runtime
-	// (production charts-plus guarantees this).
-	remove?(): void;
-	destroy?(): void;
-	dispose?(): void;
+	// chart-core `Chart.destroy()`: the engine's one disposal method (`applier.disposeChart` calls it).
+	destroy(): void;
 }
 
 export interface CreateChartOptions {
@@ -308,9 +302,19 @@ export interface CreateChartOptions {
 	readonly [k: string]: unknown;
 }
 
-export function createChart(_container: HTMLElement, _opts?: CreateChartOptions): Chart {
-	throw new Error(
-		'applier-stub.createChart: charts-plus is not installed in the test env. '
-		+ 'Tests must inject a custom `appliers` into RendererHost.',
-	);
+let testChartFactory: ((container: HTMLElement, opts?: CreateChartOptions) => Chart) | undefined;
+
+/** A test that drives a real ChartClient installs its fake chart here, and clears it with `undefined`. */
+export function setTestChartFactory(factory: ((container: HTMLElement, opts?: CreateChartOptions) => Chart) | undefined): void {
+	testChartFactory = factory;
+}
+
+export function createChart(container: HTMLElement, opts?: CreateChartOptions): Chart {
+	if (!testChartFactory) {
+		throw new Error(
+			'applier-stub.createChart: charts-plus is not installed in the test env. '
+			+ 'Tests must inject a custom `appliers` into RendererHost, or a chart factory with setTestChartFactory.',
+		);
+	}
+	return testChartFactory(container, opts);
 }
