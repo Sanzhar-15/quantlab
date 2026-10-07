@@ -20,6 +20,7 @@ import { getUNCHost, addUNCHostToAllowlist } from './vs/base/node/unc.js';
 import { INLSConfiguration } from './vs/nls.js';
 import { NativeParsedArgs } from './vs/platform/environment/common/argv.js';
 import { disableBackgroundNetwork } from './vs/code/electron-main/ql-client/index.js'; // QuantLab host (EGRESS-MAIN)
+import { claimLaunchOrUninstall } from './vs/code/electron-main/ql-client/index.js'; // QuantLab host (F-DESK-UNINSTALL-1)
 
 perf.mark('code/didStartMain');
 
@@ -41,6 +42,24 @@ disableBackgroundNetwork(app);
 const portable = configurePortable(product);
 
 const args = parseCLIArgs();
+// QuantLab host (F-DESK-UNINSTALL-1): the profile's path is resolved here (moved up from "Set userData path" below, unchanged)
+// because the client's first act needs it BEFORE this bootstrap's first write: `configureCommandlineSwitchesSync` on the next
+// lines creates argv.json in the data folder, and VS Code's own refusal of a second instance (`claimInstance`) comes only
+// after the profile has been written. `claimLaunchOrUninstall` announces this launch outside the profile and ends it here
+// (no write, exit 2) when an uninstall of the profile is running; with `--uninstall` it refuses while an instance runs, or
+// removes every data root and both Keychain accounts and exits. It returns only for a launch that may proceed.
+// Row: build/qlhost/check-uninstall-first.mjs.
+const userDataPath = getUserDataPath(args, product.nameShort ?? 'code-oss-dev');
+claimLaunchOrUninstall({
+	argv: process.argv,
+	userData: userDataPath,
+	product: {
+		nameShort: product.nameShort,
+		applicationName: product.applicationName,
+		dataFolderName: product.dataFolderName,
+		darwinBundleIdentifier: product.darwinBundleIdentifier
+	}
+});
 // Configure static command line arguments
 const argvConfig = configureCommandlineSwitchesSync(args);
 // Enable sandbox globally unless
@@ -61,7 +80,6 @@ if (args['sandbox'] &&
 }
 
 // Set userData path before app 'ready' event
-const userDataPath = getUserDataPath(args, product.nameShort ?? 'code-oss-dev');
 if (process.platform === 'win32') {
 	const userDataUNCHost = getUNCHost(userDataPath);
 	if (userDataUNCHost) {
