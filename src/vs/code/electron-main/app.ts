@@ -1446,6 +1446,21 @@ export class CodeApplication extends Disposable {
 					}
 					overlay.setVisible(false);
 					this.logService.info('QuantLab host: test build: the overlay view was hidden by the test driver (O4 negative)');
+				} else if (event.message.startsWith('ql-test:run-action ')) {
+					// Package row A4 (review c2 M5): the driver runs ONE workbench command by id, sent as a menu item's is
+					// (`vscode:runAction`): a new untitled file, then `type`, make an editor dirty without a key reaching the page.
+					// The message is `ql-test:run-action {"id":"...","args":[...]}`. The workbench must exist already.
+					const request: { id?: unknown; args?: unknown } = JSON.parse(event.message.slice('ql-test:run-action '.length));
+					const workbenchView = terminalHost.view('workbench');
+					if (typeof request.id !== 'string' || (request.args !== undefined && !Array.isArray(request.args))) {
+						throw new Error(`QuantLab host (DRIVER): ql-test:run-action: expected {"id": string, "args"?: array}, got ${event.message}`);
+					}
+					if (!workbenchView) {
+						throw new Error(`QuantLab host (DRIVER): ql-test:run-action ${request.id}: there is no workbench view`);
+					}
+					workbenchView.webContents.send('vscode:runAction', { id: request.id, from: 'menu', args: request.args });
+					this.logService.info(`QuantLab host: test build: workbench action ${request.id} sent by the test driver`);
+					terminalHost.host.log(`test driver action sent id=${request.id}`);
 				}
 			});
 			// A console message sent before this line reached no listener (measured: PERF's test-toggle on package 10 was lost when
