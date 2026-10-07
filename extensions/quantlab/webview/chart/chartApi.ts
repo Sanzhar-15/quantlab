@@ -179,8 +179,10 @@ export class ChartClient {
 	}
 
 	/**
-	 * One-shot "first non-empty render" subscription. Fired from the engine's overlay pass (which runs after
-	 * the series are painted) on the first frame that has bars and a non-empty plot, then cleared.
+	 * One-shot "first non-empty render" subscription. Fired from the engine's `onSeriesRendered` (reported only
+	 * after a frame's series pass actually painted; never for a frame whose series pass the budget skipped, nor
+	 * for an overlay-only frame) on the first such paint with bars set and a non-empty plot, then cleared. Bars
+	 * and the series data are set in one synchronous step (`setData`), so a later paint includes them.
 	 */
 	setDrawnListener(listener: (drawn: ChartDrawn) => void): void {
 		this.drawnListener = listener;
@@ -488,6 +490,7 @@ export class ChartClient {
 			},
 		});
 		this.installPaneDividerPlugin();
+		this.installDrawnSignalPlugin();
 		this.candleSeries = this.chart.addCandlestickSeries({
 			upColor: this.colors.positive,
 			downColor: this.colors.negative,
@@ -699,6 +702,21 @@ export class ChartClient {
 		this.chart.setTheme(this.buildThemeTokens());
 	}
 
+	private installDrawnSignalPlugin(): void {
+		if (!this.chart) {
+			return;
+		}
+		this.chart.addPlugin<CanvasRenderingContext2D>({
+			onSeriesRendered: ({ plotRect }) => {
+				if (this.drawnListener && this.lastBars.length > 0 && plotRect.width > 0 && plotRect.height > 0) {
+					const listener = this.drawnListener;
+					this.drawnListener = undefined;
+					listener({ bars: this.lastBars.length, width: plotRect.width, height: plotRect.height });
+				}
+			}
+		});
+	}
+
 	private installPaneDividerPlugin(): void {
 		if (!this.chart) {
 			return;
@@ -706,11 +724,6 @@ export class ChartClient {
 
 		this.chart.addPlugin<CanvasRenderingContext2D>({
 			onRenderOverlay: (ctx, state) => {
-				if (this.drawnListener && this.lastBars.length > 0 && state.plotRect.width > 0 && state.plotRect.height > 0) {
-					const listener = this.drawnListener;
-					this.drawnListener = undefined;
-					listener({ bars: this.lastBars.length, width: state.plotRect.width, height: state.plotRect.height });
-				}
 				const panes = state.layout.panes ?? [];
 				if (panes.length > 1) {
 					ctx.save();

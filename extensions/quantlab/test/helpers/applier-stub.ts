@@ -178,10 +178,16 @@ export type PluginPointerEvent = {
 	inPlot: boolean;
 };
 
+/** Mirrors the engine's `SeriesRenderedInfo` (client packages/chart-core/src/api.ts). */
+export type SeriesRenderedInfo = {
+	readonly plotRect: Readonly<PluginRenderState['plotRect']>;
+};
+
 export type ChartPlugin<Ctx = unknown> = {
 	onInit?: (chart: Chart) => void;
 	onRenderUnderlay?: (ctx: Ctx, state: PluginRenderState) => void;
 	onRenderOverlay?: (ctx: Ctx, state: PluginRenderState) => void;
+	onSeriesRendered?: (info: SeriesRenderedInfo) => void;
 	onPointer?: (event: PluginPointerEvent, state: PluginRenderState) => boolean | void;
 };
 
