@@ -524,14 +524,19 @@ function decodeOhlcvBuffer(buffer: ArrayBuffer, count: number): OhlcvBar[] {
 
 	for (let i = 0; i < count; i++) {
 		const offset = i * stride;
-		bars.push({
+		const bar: OhlcvBar = {
 			t: view[offset],
 			o: view[offset + 1],
 			h: view[offset + 2],
 			l: view[offset + 3],
-			c: view[offset + 4],
-			v: view[offset + 5]
-		});
+			c: view[offset + 4]
+		};
+		// A NaN volume slot is an absent volume (src/utils/binaryTransfer.ts never writes NaN for a present one): no `v` at all.
+		// Any other value, an infinity included, is kept for validateBars to name.
+		if (!Number.isNaN(view[offset + 5])) {
+			bar.v = view[offset + 5];
+		}
+		bars.push(bar);
 	}
 
 	return bars;
