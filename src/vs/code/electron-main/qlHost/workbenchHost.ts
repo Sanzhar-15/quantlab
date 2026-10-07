@@ -428,6 +428,11 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 			workbench.view.setVisible(false);
 			terminalHost.addView('workbench', 'workbench', workbench.view, { ...workbench.webPreferences });
 			terminalHost.setWorkbench(this.workbenchContents(workbench, disposables));
+
+			// QuantLab host (review c2 M5): `close` on the shell is where the lifecycle service starts the workbench's unload
+			// handshake (a quit, an update restart and a close of the workbench window all close it): the workbench is on screen
+			// before its renderer is asked
+			disposables.add(Event.fromNodeEventEmitter(workbench.shell, 'close')(() => this.surfaceForUnload(workbench, 'workbench window close')));
 		} catch (error) {
 			disposables.dispose();
 			if (terminalHost.view('workbench') === workbench.view) {
@@ -509,7 +514,9 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 	// is asked to close, which happens inside `app.quit()`. So the host window is never closed before that handshake ended:
 	// every `close` of it (the user's, or Electron's own while quitting, or an update restart: all end in `app.quit()`) is
 	// held, the quit is run through `lifecycleMainService.quit()`, and the host window is closed once the CodeWindow is
-	// closed. A veto (the user cancelled a save prompt) leaves everything open and shows the workbench. With no workbench
+	// closed. The workbench is put on screen BEFORE the handshake (`surfaceForUnload`, review c2 M5), so what the handshake waits
+	// for can be seen and answered. A veto (the user cancelled a save prompt) leaves everything open and the workbench
+	// shown. With no workbench
 	// there is nothing to settle and the window closes at once (`window-all-closed` then quits, `app.ts`).
 
 	private onHostWindowClose(event: ElectronEvent): void {
@@ -530,10 +537,43 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		});
 	}
 
+	/**
+	 * QuantLab host (review c2 M5): puts the workbench on screen, synchronously, before its renderer is asked to unload. The
+	 * unload handshake can wait for the user in the workbench's own DOM, which a native dialog style does not cover: the
+	 * cancellable progress of a slow backup or save (`workingCopyBackupTracker.ts`, a DOM dialog after 800 ms), and a `custom`
+	 * dialog style. Behind the terminal view or the overlay those controls could not be seen or answered and the quit hung.
+	 * Only a workbench that signalled ready is asked anything (`LifecycleMainService#unload` lets any other window go), so
+	 * only that one is surfaced. The overlay is closed first: it is above every view. Nothing is awaited here.
+	 */
+	private surfaceForUnload(workbench: IAdoptedWorkbench, cause: string): void {
+		if (this.deps.gate.workbench !== workbench || !workbench.codeWindow.isReady) {
+			return;
+		}
+
+		const terminalHost = this.requireTerminalHost();
+		if (terminalHost.window.isDestroyed()) {
+			return;
+		}
+
+		if (terminalHost.overlayOpen()) {
+			terminalHost.closeOverlay();
+		}
+		if (this.shown !== 'workbench') {
+			terminalHost.host.log(`unload surface workbench cause=${cause}`);
+			this.deps.logService.info(`QuantLab host: the workbench is shown before it is asked to unload (${cause})`);
+			terminalHost.show('workbench');
+			this.shown = 'workbench';
+		}
+	}
+
 	private async settleThenCloseHostWindow(): Promise<void> {
 		await this.deps.gate.whenOpeningSettled();
 
 		const workbench = this.deps.gate.workbench;
+		if (workbench) {
+			// before the handshake, not after its veto (review c2 M5): whatever it awaits is then on screen
+			this.surfaceForUnload(workbench, 'quit');
+		}
 		if (workbench && await this.runQuitHandshake(workbench) === 'veto') {
 			this.closing = false;
 			this.deps.logService.info('QuantLab host: the quit was vetoed; the workbench is shown');
