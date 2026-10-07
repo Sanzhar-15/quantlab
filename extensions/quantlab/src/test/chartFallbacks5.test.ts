@@ -316,11 +316,20 @@ suite('ChartViewProvider.reloadData: a bar with a null volume is shown as an err
 
 	interface Posted { type: string; message?: string; detail?: string; buffer?: ArrayBuffer; count?: number }
 
-	function makeFlow(data: OhlcvBar[]): { reload(): Promise<void>; posted: Posted[] } {
+	/** The provider's toolbar timeframe is 1D; `effectiveTimeframe` is what the loaded bars are, and the tab is an active one. */
+	function makeFlow(initial: OhlcvBar[], effectiveTimeframe: string): {
+		reload(): Promise<void>;
+		setBars(bars: OhlcvBar[]): void;
+		posted: Posted[];
+		stateUpdates: Array<[string, unknown]>;
+	} {
 		const posted: Posted[] = [];
+		const stateUpdates: Array<[string, unknown]> = [];
+		let data = initial;
 		let requestId = 0;
 		const session = {
 			key: 'session-1',
+			tabInstanceId: 'tab-1',
 			document: { uri: { scheme: 'file', fsPath: '/ws/data.csv' } },
 			webview: { postMessage: (message: Posted) => { posted.push(message); return true; } }
 		};
@@ -332,22 +341,22 @@ suite('ChartViewProvider.reloadData: a bar with a null volume is shown as an err
 				isDataRequestCurrent: (_key: string, id: number) => id === requestId,
 				setLastDataKey() { }
 			},
-			stateManager: { getChartState: () => undefined, updateChartState() { } },
+			stateManager: { getChartState: () => undefined, updateChartState: (tab: string, update: unknown) => { stateUpdates.push([tab, update]); } },
 			globalState: { getTimeframe: () => undefined },
 			buildToolbarState: () => ({
 				dataSource: { kind: 'localFile', filePath: '/ws/data.csv', displayName: 'data.csv' }, timeframe: '1D',
 				complexity: { level: 'safe', score: 0, reasons: [] }, hasVisualization: false, viewOnly: true, mode: 'data'
 			}),
-			loadBars: async () => ({ data, effectiveTimeframe: '1D', dsKey: 'k' }),
+			loadBars: async () => ({ data, effectiveTimeframe, dsKey: 'k' }),
 			setBanner() { },
 			refreshVisualization: async () => { /* not under test */ }
 		});
 		const reloadData = (provider as unknown as { reloadData(session: unknown): Promise<void> }).reloadData.bind(provider);
-		return { reload: () => reloadData(session), posted };
+		return { reload: () => reloadData(session), setBars: bars => { data = bars; }, posted, stateUpdates };
 	}
 
 	test('bars with an absent and an explicit 0 volume are posted as a binary message that decodes with the absence kept', async () => {
-		const flow = makeFlow(MIXED);
+		const flow = makeFlow(MIXED, '1D');
 		await flow.reload();
 		const bars = flow.posted.filter(message => message.type === 'setDataBinary');
 		assert.strictEqual(bars.length, 1);
@@ -355,11 +364,23 @@ suite('ChartViewProvider.reloadData: a bar with a null volume is shown as an err
 	});
 
 	test('a null volume posts a showError naming the bar and no bars', async () => {
-		const flow = makeFlow([MIXED[0], { ...MIXED[1], v: null as unknown as number }]);
+		const flow = makeFlow([MIXED[0], { ...MIXED[1], v: null as unknown as number }], '1D');
 		await withQuietConsole(() => flow.reload());
 		assert.strictEqual(flow.posted.filter(message => message.type === 'setDataBinary').length, 0, 'no bars were sent');
 		const errors = flow.posted.filter(message => message.type === 'showError');
 		assert.strictEqual(errors.length, 1);
 		assert.ok(errors[0].detail?.includes('binaryTransfer: bar 1 has an invalid volume (v = null;'), `the error carries the named cause (${String(errors[0].detail)})`);
+	});
+
+	test('invalid bars with a changed effective timeframe persist no timeframe, post no toolbar and no bars; the next valid load persists it', async () => {
+		const flow = makeFlow([MIXED[0], { ...MIXED[1], v: null as unknown as number }], '1H');
+		await withQuietConsole(() => flow.reload());
+		assert.deepStrictEqual(flow.posted.map(message => message.type), ['showLoading', 'showError'], 'one named error, no toolbar and no bars');
+		assert.ok(flow.posted[1].detail?.includes('binaryTransfer: bar 1 has an invalid volume (v = null;'), 'the error names the cause');
+		assert.deepStrictEqual(flow.stateUpdates, [], 'the tab\'s timeframe was not persisted');
+		flow.setBars(MIXED);
+		await flow.reload();
+		assert.deepStrictEqual(flow.stateUpdates, [['tab-1', { timeframe: '1H' }]], 'a valid load persists the effective timeframe');
+		assert.deepStrictEqual(flow.posted.slice(-2).map(message => message.type), ['setToolbar', 'setDataBinary']);
 	});
 });

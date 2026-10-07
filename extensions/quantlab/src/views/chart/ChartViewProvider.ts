@@ -735,6 +735,11 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				return;
 			}
 
+			// Encode BEFORE anything this load would change is changed (the persisted timeframe, the toolbar, the bars): bars the
+			// encoder rejects (F-CHARTS-FB3: a null or non-finite volume, a non-finite t/o/h/l/c) end in the catch below and
+			// leave the tab's state as it was.
+			const { buffer, count } = encodeOhlcvBars(data);
+
 			// Update timeframe from inferred/actual value -- ONLY for the
 			// winning request: a slow stale response writing this after a
 			// newer click would silently revert the per-tab timeframe with
@@ -763,8 +768,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			if (!this.isSessionActive(session)) {
 				return;
 			}
-
-			const { buffer, count } = encodeOhlcvBars(data);
 
 			// The toolbar with the timeframe of these bars goes BEFORE the bars: the webview's time axis formats with
 			// it (a local file's timeframe is inferred from the data, so no earlier toolbar has it).
