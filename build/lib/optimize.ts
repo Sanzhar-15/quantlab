@@ -227,14 +227,22 @@ export function bundleTask(opts: IBundleTaskOpts): () => NodeJS.ReadWriteStream 
 	};
 }
 
-export function minifyTask(src: string, sourceMapBaseUrl?: string): (cb: any) => void {
+/**
+ * `copyUnminified` (QuantLab host, F-PACK-15): globs relative to `src` whose files are copied as they are: not minified, not
+ * svg-minified, not ASCII-checked. For already-built output staged under `src` (the generated `ql-client/**`: the client's own
+ * esbuild/vite bundles and their assets), re-minifying is pointless and the non-ASCII check does not apply to them.
+ */
+export function minifyTask(src: string, sourceMapBaseUrl?: string, copyUnminified?: readonly string[]): (cb: any) => void {
 	const sourceMappingURL = sourceMapBaseUrl ? ((f: any) => `${sourceMapBaseUrl}/${f.relative}.map`) : undefined;
 	const target = getBuildTarget();
+	// gulp-filter matches `path.relative(file.cwd, file.path)` (cwd-relative, e.g. `out-vscode/vs/...`), not `file.relative`:
+	// an exclusion must carry the `src` prefix or it never fires (package 5 build, 2026-10-06).
+	const excluded = (copyUnminified ?? []).map(glob => `!${src}/${glob}`);
 
 	return cb => {
 
-		const esbuildFilter = filter('**/*.{js,css}', { restore: true });
-		const svgFilter = filter('**/*.svg', { restore: true });
+		const esbuildFilter = filter(['**/*.{js,css}', ...excluded], { restore: true });
+		const svgFilter = filter(['**/*.svg', ...excluded], { restore: true });
 
 		pump(
 			gulp.src([src + '/**', '!' + src + '/**/*.map']),

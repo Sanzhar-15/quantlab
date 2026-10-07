@@ -32,11 +32,17 @@ class FakeHostService extends Disposable implements IQuantlabHostIdentityService
 	identity: QuantlabIdentity = { epoch: 1, signedIn: false };
 	requestImpl: () => Promise<unknown> = async () => { throw new Error('no request answer was planted for this test'); };
 	subscribeImpl: () => Promise<void> = async () => { };
+	signOutImpl: () => Promise<boolean> = async () => { throw new Error('no sign-out answer was planted for this test'); };
+	signOuts = 0;
 	readonly requests: { op: string; input: unknown; epoch: number; token: CancellationToken }[] = [];
 	readonly subscribed: { handle: number; topic: string; params: unknown; epoch: number }[] = [];
 	readonly unsubscribed: number[] = [];
 
 	async getIdentity(): Promise<QuantlabIdentity> { return this.identity; }
+	signOut(): Promise<boolean> {
+		this.signOuts++;
+		return this.signOutImpl();
+	}
 	request(op: string, input: unknown, epoch: number, token: CancellationToken): Promise<unknown> {
 		this.requests.push({ op, input, epoch, token });
 		return this.requestImpl();
@@ -81,25 +87,25 @@ suite('MainThreadQuantlabHost', () => {
 		const customer = createCustomer();
 
 		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 1, signedIn: false });
-		service.identity = { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } };
-		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } });
+		service.identity = { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } };
+		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 7, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } });
 	});
 
 	test('$getIdentity sends a signed-in user without a name with no name field', async () => {
 		const customer = createCustomer();
-		service.identity = { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined } };
+		service.identity = { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: undefined, tier: 'pro' } };
 
-		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com' } });
+		assert.deepStrictEqual(await customer.$getIdentity(), { epoch: 2, signedIn: true, user: { id: 'u1', email: 'a@example.com', tier: 'pro' } });
 	});
 
 	test('an identity tick pushes the freshly pulled identity to the extension host', async () => {
 		createCustomer();
-		service.identity = { epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo' } };
+		service.identity = { epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo', tier: 'pro' } };
 
 		service.identityTick.fire();
 		await flush();
 
-		assert.deepStrictEqual(proxy.identities, [{ epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo' } }]);
+		assert.deepStrictEqual(proxy.identities, [{ epoch: 3, signedIn: true, user: { id: 'u2', email: 'b@example.com', name: 'Bo', tier: 'pro' } }]);
 	});
 
 	test('a tick whose pull fails is logged and pushes nothing', async () => {
@@ -254,5 +260,33 @@ suite('MainThreadQuantlabHost', () => {
 		assert.deepStrictEqual(service.unsubscribed.slice(1), open);
 		service.frames.fire({ handle: open[0], epoch: 2, kind: 'data', data: 1 });
 		assert.deepStrictEqual(proxy.data, []);
+	});
+
+	test('$signOut answers { ok: true, data } with the service\'s boolean', async () => {
+		const customer = createCustomer();
+
+		service.signOutImpl = async () => true;
+		assert.deepStrictEqual(await customer.$signOut(), { ok: true, data: true });
+		service.signOutImpl = async () => false;
+		assert.deepStrictEqual(await customer.$signOut(), { ok: true, data: false });
+		assert.strictEqual(service.signOuts, 2);
+	});
+
+	test('$signOut answers a host refusal as ok:false with its code and status', async () => {
+		const customer = createCustomer();
+		service.signOutImpl = async () => { throw new QuantlabHostError('server', 'logout failed', 502); };
+
+		assert.deepStrictEqual(await customer.$signOut(), { ok: false, code: 'server', message: 'logout failed', status: 502 });
+		assert.deepStrictEqual(log.errors, []);
+	});
+
+	test('$signOut rejects and logs a failure that is not a host answer', async () => {
+		const customer = createCustomer();
+		const failure = new Error('no handler for the channel');
+		service.signOutImpl = async () => { throw failure; };
+
+		await assert.rejects(customer.$signOut(), (error: Error) => error === failure);
+		assert.strictEqual(log.errors.length, 1);
+		assert.ok(log.errors[0].includes('no handler for the channel'));
 	});
 });

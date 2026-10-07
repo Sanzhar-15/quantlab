@@ -8,7 +8,6 @@ import type { FileOperationTools } from './fileOps.js';
 import type { SearchTools } from './searchTools.js';
 import type { ReferenceTools } from './referenceTools.js';
 import type { TerminalTools } from './terminalTools.js';
-import type { NetworkTools } from './networkTools.js';
 import type { PackageTools } from './packageTools.js';
 import type { LspTools } from './lspTools.js';
 import type { NotebookTools } from './notebookTools.js';
@@ -23,7 +22,6 @@ import type { GitTools } from './gitTools.js';
  *  8-9:   Search (SearchTools)
  *  10-11: References (ReferenceTools)
  *  12-13: Terminal (TerminalTools)
- *  14-15: Network (NetworkTools)
  *  16:    Package (PackageTools)
  *  17-19: LSP (LspTools)
  *  20-22: Notebook (NotebookTools)
@@ -36,7 +34,6 @@ export function registerAllTools(
 		search: SearchTools;
 		reference: ReferenceTools;
 		terminal: TerminalTools;
-		network: NetworkTools;
 		packages: PackageTools;
 		lsp: LspTools;
 		notebook: NotebookTools;
@@ -64,10 +61,6 @@ export function registerAllTools(
 	// 11-12: Terminal
 	router.register('run_terminal', (args, ctx) => deps.terminal.runTerminal(args, ctx));
 	router.register('run_command', (args, ctx) => deps.terminal.runCommand(args, ctx));
-
-	// 13-14: Network
-	router.register('web_fetch', (args) => deps.network.webFetch(args));
-	router.register('web_search', (args) => deps.network.webSearch(args));
 
 	// 15: Package
 	router.register('install_package', (args, ctx) => deps.packages.installPackage(args, ctx));

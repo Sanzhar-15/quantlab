@@ -78,20 +78,16 @@ export function applyTimeseriesPlan(
 /**
  * Tear down a Chart instance and clear the container.
  *
- * @charts-plus has a moving disposal API across versions; this helper
- * tries the common shapes (`chart.remove()`, `chart.destroy()`,
- * `chart.dispose()`) and finally falls back to clearing the container's
- * children. Call this before discarding a Chart reference.
+ * The terminal's chart engine disposes a chart through `destroy()` (chart-core `Chart`, its only disposal
+ * method), which also removes its own canvases. The container is then cleared as explicit cleanup of anything
+ * else left in it. A chart without `destroy()` is a named error, never a silent clear.
+ * Call this before discarding a Chart reference.
  */
 export function disposeChart(chart: Chart, container?: HTMLElement): void {
-	const c = chart as unknown as Record<string, unknown>;
-	for (const methodName of ['remove', 'destroy', 'dispose'] as const) {
-		const fn = c[methodName];
-		if (typeof fn === 'function') {
-			(fn as () => void).call(chart);
-			break;
-		}
+	if (typeof chart.destroy !== 'function') {
+		throw new Error('qviz disposeChart: the chart has no destroy() method');
 	}
+	chart.destroy();
 	if (container) {
 		while (container.firstChild) {
 			container.removeChild(container.firstChild);

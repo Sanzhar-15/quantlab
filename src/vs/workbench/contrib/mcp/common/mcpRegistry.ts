@@ -428,7 +428,7 @@ export class McpRegistry extends Disposable implements IMcpRegistry {
 			}
 		}
 
-		inputStorage.setPlainText(inputs);
+		await inputStorage.setPlainText(inputs);
 		await inputStorage.setSecrets(secrets);
 		this._onDidChangeInputs.fire();
 	}

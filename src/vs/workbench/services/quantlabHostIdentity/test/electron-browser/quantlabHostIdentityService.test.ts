@@ -8,14 +8,14 @@ import { CancellationToken, CancellationTokenSource } from '../../../../../base/
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { Event } from '../../../../../base/common/event.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-import { CommandsRegistry, ICommandEvent, ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
+import { IConfirmation, IConfirmationResult } from '../../../../../platform/dialogs/common/dialogs.js';
+import { TestDialogService } from '../../../../../platform/dialogs/test/common/testDialogService.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { INotification, INotificationHandle } from '../../../../../platform/notification/common/notification.js';
 import { TestNotificationService } from '../../../../../platform/notification/test/common/testNotificationService.js';
 import { ISecretStorageService } from '../../../../../platform/secrets/common/secrets.js';
 import {
-	QUANTLAB_EXT_DID_CHANGE_COMMAND,
-	QUANTLAB_EXT_GET_COMMAND,
 	QUANTLAB_HOST_DATA_CANCEL_CHANNEL,
 	QUANTLAB_HOST_DATA_REQUEST_CHANNEL,
 	QUANTLAB_HOST_DATA_SUBSCRIBE_CHANNEL,
@@ -32,10 +32,8 @@ import { QuantlabHostIdentityService } from '../../electron-browser/quantlabHost
 class RecordingLogService extends NullLogService {
 	readonly errors: string[] = [];
 	readonly infos: string[] = [];
-	readonly traces: string[] = [];
 	override error(message: string | Error): void { this.errors.push(String(message)); }
 	override info(message: string): void { this.infos.push(message); }
-	override trace(message: string): void { this.traces.push(message); }
 }
 
 class RecordingNotificationService extends TestNotificationService {
@@ -43,21 +41,6 @@ class RecordingNotificationService extends TestNotificationService {
 	override notify(notification: INotification): INotificationHandle {
 		this.notifications.push(notification);
 		return super.notify(notification);
-	}
-}
-
-class RecordingCommandService implements ICommandService {
-	declare readonly _serviceBrand: undefined;
-	readonly onWillExecuteCommand: Event<ICommandEvent> = Event.None;
-	readonly onDidExecuteCommand: Event<ICommandEvent> = Event.None;
-	readonly executed: { id: string; args: unknown[] }[] = [];
-	failWith: Error | undefined;
-	async executeCommand<R = unknown>(id: string, ...args: unknown[]): Promise<R | undefined> {
-		this.executed.push({ id, args });
-		if (this.failWith) {
-			throw this.failWith;
-		}
-		return undefined;
 	}
 }
 
@@ -78,6 +61,14 @@ class RecordingSecretStorageService extends Disposable implements ISecretStorage
 	}
 }
 
+class RecordingDialogService extends TestDialogService {
+	readonly confirmations: IConfirmation[] = [];
+	override confirm(confirmation: IConfirmation): Promise<IConfirmationResult> {
+		this.confirmations.push(confirmation);
+		return super.confirm(confirmation);
+	}
+}
+
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
 suite('QuantlabHostIdentityService', () => {
@@ -94,19 +85,19 @@ suite('QuantlabHostIdentityService', () => {
 		protected override listenChanged(listener: (payload: unknown) => void): void { tickListener = listener; }
 		protected override invokeData(): Promise<unknown> { throw new Error('the identity suite makes no data call'); }
 		protected override listenFrames(): void { /* the identity suite sends no frame */ }
+		protected override invokeSignOut(): Promise<unknown> { throw new Error('the identity suite makes no sign-out call'); }
 		whenPurged(): Promise<void> { return this.legacyKeyPurge; }
 	}
 
 	let log: RecordingLogService;
 	let notifications: RecordingNotificationService;
-	let commands: RecordingCommandService;
 	let secrets: RecordingSecretStorageService;
 
 	function createService(): TestService {
-		return disposables.add(new TestService(log, notifications, commands, secrets));
+		return disposables.add(new TestService(log, notifications, secrets, new RecordingDialogService()));
 	}
 
-	const signedIn: QuantlabIdentity = { epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } };
+	const signedIn: QuantlabIdentity = { epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } };
 
 	setup(() => {
 		invokeImpl = async () => ({ epoch: 1, signedIn: false });
@@ -114,12 +105,11 @@ suite('QuantlabHostIdentityService', () => {
 		invokeCount = 0;
 		log = new RecordingLogService();
 		notifications = new RecordingNotificationService();
-		commands = new RecordingCommandService();
 		secrets = disposables.add(new RecordingSecretStorageService());
 	});
 
 	test('getIdentity returns the parsed answer of the host', async () => {
-		invokeImpl = async () => ({ epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada' } });
+		invokeImpl = async () => ({ epoch: 4, signedIn: true, user: { id: 'u1', email: 'a@example.com', name: 'Ada', tier: 'pro' } });
 		const service = createService();
 		await service.whenPurged();
 
@@ -183,52 +173,6 @@ suite('QuantlabHostIdentityService', () => {
 		assert.deepStrictEqual(log.errors, []);
 	});
 
-	test('a tick executes the extension command, without an argument, when the extension registered it', async () => {
-		disposables.add(CommandsRegistry.registerCommand(QUANTLAB_EXT_DID_CHANGE_COMMAND, () => { }));
-		const service = createService();
-		await service.whenPurged();
-
-		assert.ok(tickListener);
-		tickListener(null);
-		await flush();
-
-		assert.deepStrictEqual(commands.executed, [{ id: QUANTLAB_EXT_DID_CHANGE_COMMAND, args: [] }]);
-	});
-
-	test('a tick calls no extension command when it is not registered (the extension pulls at activation)', async () => {
-		const service = createService();
-		await service.whenPurged();
-		let fired = 0;
-		disposables.add(service.onDidChangeIdentity(() => fired++));
-
-		assert.ok(tickListener);
-		tickListener(null);
-		await flush();
-
-		assert.strictEqual(fired, 1);
-		assert.deepStrictEqual(commands.executed, []);
-		assert.ok(log.traces.some(line => line.includes('extension not active')));
-		assert.deepStrictEqual(log.errors, []);
-	});
-
-	test('a failing extension command is logged and shown, and the tick still fired', async () => {
-		disposables.add(CommandsRegistry.registerCommand(QUANTLAB_EXT_DID_CHANGE_COMMAND, () => { }));
-		commands.failWith = new Error('extension refused');
-		const service = createService();
-		await service.whenPurged();
-		let fired = 0;
-		disposables.add(service.onDidChangeIdentity(() => fired++));
-
-		assert.ok(tickListener);
-		tickListener(null);
-		await flush();
-
-		assert.strictEqual(fired, 1);
-		assert.strictEqual(log.errors.length, 1);
-		assert.strictEqual(notifications.notifications.length, 1);
-		assert.ok(String(notifications.notifications[0].message).includes('extension refused'));
-	});
-
 	test('a tick whose payload is not null is logged and shown, and still fires', async () => {
 		const service = createService();
 		await service.whenPurged();
@@ -244,15 +188,20 @@ suite('QuantlabHostIdentityService', () => {
 		assert.strictEqual(notifications.notifications.length, 1);
 	});
 
-	test('the extension get command answers with the identity from the service', async () => {
-		invokeImpl = async () => ({ epoch: 1, signedIn: false });
+	// Security-relevant (rule 2, EXT-ISO direct-command case): identity reaches the extension host ONLY through
+	// `vscode.quantlabHost`, which the built-in quantlab extension alone receives. A `_quantlab.hostIdentity.*` command
+	// would hand the identity to ANY extension (`vscode.commands.executeCommand`), so none may exist once this module
+	// has loaded and the service runs.
+	// Planted negative control: re-add `CommandsRegistry.registerCommand('_quantlab.hostIdentity.get', accessor =>
+	// accessor.get(IQuantlabHostIdentityService).getIdentity());` at the bottom of quantlabHostIdentityService.ts and
+	// both assertions fail.
+	test('no _quantlab.hostIdentity command is registered (EXT-ISO direct command)', async () => {
 		const service = createService();
 		await service.whenPurged();
 
-		const command = CommandsRegistry.getCommand(QUANTLAB_EXT_GET_COMMAND);
-		assert.ok(command, 'the get command must be registered when the service module is loaded');
-		const accessor = { get: () => service } as never;
-		assert.deepStrictEqual(await command.handler(accessor), { epoch: 1, signedIn: false });
+		assert.strictEqual(CommandsRegistry.getCommand('_quantlab.hostIdentity.get'), undefined);
+		const leaked = [...CommandsRegistry.getCommands().keys()].filter(id => id.startsWith('_quantlab.hostIdentity'));
+		assert.deepStrictEqual(leaked, []);
 	});
 
 	test('start deletes every legacy login key, logs each deletion, and never reads or writes a secret', async () => {
@@ -301,13 +250,14 @@ suite('QuantlabHostIdentityService - data', () => {
 			return dataImpl(call);
 		}
 		protected override listenFrames(listener: (payload: unknown) => void): void { frameListener = listener; }
+		protected override invokeSignOut(): Promise<unknown> { throw new Error('the data suite makes no sign-out call'); }
 		whenPurged(): Promise<void> { return this.legacyKeyPurge; }
 	}
 
 	let log: RecordingLogService;
 
 	async function createService(): Promise<TestService> {
-		const service = disposables.add(new TestService(log, new RecordingNotificationService(), new RecordingCommandService(), disposables.add(new RecordingSecretStorageService())));
+		const service = disposables.add(new TestService(log, new RecordingNotificationService(), disposables.add(new RecordingSecretStorageService()), new RecordingDialogService()));
 		await service.whenPurged();
 		return service;
 	}
@@ -586,5 +536,99 @@ suite('QuantlabHostIdentityService - data', () => {
 		assert.deepStrictEqual(frames, []);
 		assert.strictEqual(log.errors.length, 2);
 		assert.ok(!log.errors.join('\n').includes('SENTINEL-NOT-A-REAL-TOKEN'));
+	});
+});
+
+suite('QuantlabHostIdentityService - sign-out', () => {
+
+	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	let signOutImpl: () => Promise<unknown>;
+	let signOutCount: number;
+
+	// every transport seam is overridden so no ipcRenderer is touched
+	class TestService extends QuantlabHostIdentityService {
+		protected override invokeGet(): Promise<unknown> { throw new Error('the sign-out suite makes no identity call'); }
+		protected override listenChanged(): void { /* the sign-out suite sends no tick */ }
+		protected override invokeData(): Promise<unknown> { throw new Error('the sign-out suite makes no data call'); }
+		protected override listenFrames(): void { /* the sign-out suite sends no frame */ }
+		protected override invokeSignOut(): Promise<unknown> { signOutCount++; return signOutImpl(); }
+		whenPurged(): Promise<void> { return this.legacyKeyPurge; }
+	}
+
+	let log: RecordingLogService;
+	let dialogs: RecordingDialogService;
+
+	async function createService(): Promise<TestService> {
+		const service = disposables.add(new TestService(log, new RecordingNotificationService(), disposables.add(new RecordingSecretStorageService()), dialogs));
+		await service.whenPurged();
+		return service;
+	}
+
+	setup(() => {
+		signOutImpl = async () => { throw new Error('no sign-out answer was planted for this test'); };
+		signOutCount = 0;
+		log = new RecordingLogService();
+		dialogs = new RecordingDialogService();
+	});
+
+	test('the user\'s yes invokes the host sign-out once and resolves true', async () => {
+		signOutImpl = async () => ({ ok: true, data: null });
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		assert.strictEqual(await service.signOut(), true);
+		assert.strictEqual(dialogs.confirmations.length, 1);
+		assert.ok(dialogs.confirmations[0].message.includes('Delta Plus'));
+		assert.strictEqual(signOutCount, 1);
+		assert.deepStrictEqual(log.errors, []);
+	});
+
+	// Security-relevant: sign-out ends the user's session in every view, so it happens only on the user's yes.
+	// Planted negative control: invoke before checking `confirmed` in signOut() and signOutCount is 1.
+	test('a cancelled confirm sends nothing and resolves false', async () => {
+		signOutImpl = async () => ({ ok: true, data: null });
+		dialogs.setConfirmResult({ confirmed: false });
+		const service = await createService();
+
+		assert.strictEqual(await service.signOut(), false);
+		assert.strictEqual(dialogs.confirmations.length, 1);
+		assert.strictEqual(signOutCount, 0);
+		assert.deepStrictEqual(log.errors, []);
+	});
+
+	// Planted negative control: make signOut() return true for an ok:false answer and assert.rejects fails.
+	test('a refusal rejects with its code, never resolves', async () => {
+		signOutImpl = async () => ({ ok: false, code: 'server', message: 'logout failed', status: 502 });
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		await assert.rejects(service.signOut(), (error: Error) => {
+			assert.ok(error instanceof QuantlabHostError);
+			assert.strictEqual(error.code, 'server');
+			assert.strictEqual(error.status, 502);
+			return true;
+		});
+		assert.strictEqual(signOutCount, 1);
+	});
+
+	test('a rejected invoke is rethrown and logged', async () => {
+		const failure = new Error('no handler for the channel');
+		signOutImpl = async () => { throw failure; };
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		await assert.rejects(service.signOut(), (error: Error) => error === failure);
+		assert.strictEqual(log.errors.length, 1);
+		assert.ok(log.errors[0].includes('no handler for the channel'));
+	});
+
+	test('an ok answer that carries data rejects visibly and is logged', async () => {
+		signOutImpl = async () => ({ ok: true, data: { signedOut: true } });
+		dialogs.setConfirmResult({ confirmed: true });
+		const service = await createService();
+
+		await assert.rejects(service.signOut(), /the contract says null/);
+		assert.strictEqual(log.errors.length, 1);
 	});
 });

@@ -457,7 +457,8 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: true,
-				json: async () => mockResponse
+				status: 200,
+				text: async () => JSON.stringify(mockResponse)
 			} as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -498,7 +499,7 @@ suite('OAuth', () => {
 		test('fetchDynamicRegistration should throw error on non-OK response', async () => {
 			fetchStub.resolves({
 				ok: false,
-				statusText: 'Bad Request',
+				status: 400,
 				text: async () => 'Bad Request'
 			} as Response);
 
@@ -510,14 +511,15 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Registration to https:\/\/auth\.example\.com\/register failed: Bad Request/
+				/Dynamic client registration failed: 400 \(body not JSON\)/
 			);
 		});
 
 		test('fetchDynamicRegistration should throw error on invalid response format', async () => {
 			fetchStub.resolves({
 				ok: true,
-				json: async () => ({ invalid: 'response' }) // Missing required fields
+				status: 200,
+				text: async () => JSON.stringify({ invalid: 'response' }) // Missing required fields
 			} as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -528,7 +530,7 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Invalid authorization dynamic client registration response/
+				/Invalid dynamic client registration response: 200 \(no error code in body\)/
 			);
 		});
 
@@ -541,7 +543,8 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: true,
-				json: async () => mockResponse
+				status: 200,
+				text: async () => JSON.stringify(mockResponse)
 			} as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -571,7 +574,8 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: true,
-				json: async () => mockResponse
+				status: 200,
+				text: async () => JSON.stringify(mockResponse)
 			} as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -613,6 +617,7 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: false,
+				status: 400,
 				text: async () => JSON.stringify(errorResponse)
 			} as Response);
 
@@ -624,7 +629,7 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Registration to https:\/\/auth\.example\.com\/register failed: invalid_client_metadata: The client metadata is invalid/
+				{ message: 'Dynamic client registration failed: 400 (invalid_client_metadata)' }
 			);
 		});
 
@@ -635,6 +640,7 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: false,
+				status: 400,
 				text: async () => JSON.stringify(errorResponse)
 			} as Response);
 
@@ -646,13 +652,14 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Registration to https:\/\/auth\.example\.com\/register failed: invalid_redirect_uri/
+				{ message: 'Dynamic client registration failed: 400 (invalid_redirect_uri)' }
 			);
 		});
 
 		test('fetchDynamicRegistration should handle malformed JSON error response', async () => {
 			fetchStub.resolves({
 				ok: false,
+				status: 400,
 				text: async () => 'Invalid JSON {'
 			} as Response);
 
@@ -664,7 +671,7 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Registration to https:\/\/auth\.example\.com\/register failed: Invalid JSON \{/
+				{ message: 'Dynamic client registration failed: 400 (body not JSON)' }
 			);
 		});
 
@@ -676,7 +683,8 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: true,
-				json: async () => mockResponse
+				status: 200,
+				text: async () => JSON.stringify(mockResponse)
 			} as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -701,7 +709,8 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: true,
-				json: async () => mockResponse
+				status: 200,
+				text: async () => JSON.stringify(mockResponse)
 			} as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -726,7 +735,8 @@ suite('OAuth', () => {
 
 			fetchStub.resolves({
 				ok: true,
-				json: async () => mockResponse
+				status: 200,
+				text: async () => JSON.stringify(mockResponse)
 			} as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -754,16 +764,15 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Network error/
+				{ message: 'Dynamic client registration failed: the request could not be completed' }
 			);
 		});
 
-		test('fetchDynamicRegistration should handle response.json() failure', async () => {
+		test('fetchDynamicRegistration should handle a malformed success body', async () => {
 			fetchStub.resolves({
 				ok: true,
-				json: async () => {
-					throw new Error('JSON parsing failed');
-				}
+				status: 200,
+				text: async () => 'not json {'
 			} as unknown as Response);
 
 			const serverMetadata: IAuthorizationServerMetadata = {
@@ -774,13 +783,14 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/JSON parsing failed/
+				{ message: 'Dynamic client registration failed: the response body is not valid JSON (200)' }
 			);
 		});
 
 		test('fetchDynamicRegistration should handle response.text() failure for error cases', async () => {
 			fetchStub.resolves({
 				ok: false,
+				status: 400,
 				text: async () => {
 					throw new Error('Text parsing failed');
 				}
@@ -794,7 +804,7 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Text parsing failed/
+				{ message: 'Dynamic client registration failed: 400 (body unreadable)' }
 			);
 		});
 	});
@@ -830,6 +840,7 @@ suite('OAuth', () => {
 		test('fetchDynamicRegistration should throw specific error for DCR failure', async () => {
 			fetchStub.resolves({
 				ok: false,
+				status: 400,
 				text: async () => 'DCR not supported'
 			} as Response);
 
@@ -841,7 +852,7 @@ suite('OAuth', () => {
 
 			await assert.rejects(
 				async () => await fetchDynamicRegistration(serverMetadata, 'Test Client'),
-				/Registration to https:\/\/auth\.example\.com\/register failed: DCR not supported/
+				{ message: 'Dynamic client registration failed: 400 (body not JSON)' }
 			);
 		});
 	});
@@ -956,7 +967,7 @@ suite('OAuth', () => {
 				async () => fetchResourceMetadata(targetResource, resourceMetadataUrl, { fetch: fetchStub }),
 				(error: any) => {
 					// Should be AggregateError since all URLs fail
-					assert.ok(error instanceof AggregateError || /Failed to fetch resource metadata from.*404 Not Found/.test(error.message));
+					assert.ok(error instanceof AggregateError || /Failed to fetch resource metadata from.*: 404$/.test(error.message));
 					return true;
 				}
 			);
@@ -977,7 +988,7 @@ suite('OAuth', () => {
 				async () => fetchResourceMetadata(targetResource, resourceMetadataUrl, { fetch: fetchStub }),
 				(error: any) => {
 					// Should be AggregateError since all URLs fail
-					assert.ok(error instanceof AggregateError || /Failed to fetch resource metadata from.*500 Internal Server Error/.test(error.message));
+					assert.ok(error instanceof AggregateError || /Failed to fetch resource metadata from.*: 500$/.test(error.message));
 					return true;
 				}
 			);
@@ -1002,7 +1013,7 @@ suite('OAuth', () => {
 				(error: any) => {
 					// Should be AggregateError since all URLs fail validation
 					assert.ok(error instanceof AggregateError);
-					assert.ok(error.errors.some((e: Error) => /does not match expected value/.test(e.message)));
+					assert.ok(error.errors.some((e: Error) => /does not match the expected resource/.test(e.message)));
 					return true;
 				}
 			);
@@ -1193,9 +1204,9 @@ suite('OAuth', () => {
 			} catch (error: any) {
 				// Should be AggregateError with validation errors
 				const errorMessage = error instanceof AggregateError ? error.errors.map((e: Error) => e.message).join(' ') : error.message;
-				assert.ok(/does not match expected value/.test(errorMessage), 'Error message should mention mismatch');
-				assert.ok(/https:\/\/different\.com\/other/.test(errorMessage), 'Error message should include actual resource value');
-				assert.ok(/https:\/\/example\.com\/api/.test(errorMessage), 'Error message should include expected resource value');
+				assert.ok(/does not match the expected resource/.test(errorMessage), 'Error message should mention mismatch');
+				assert.ok(!/different\.com/.test(errorMessage), 'Error message must not repeat the server supplied resource value');
+				assert.ok(!/example\.com/.test(errorMessage), 'Error message must not repeat a URL: it can hold a credential');
 			}
 		});
 
@@ -1272,8 +1283,8 @@ suite('OAuth', () => {
 				(error: any) => {
 					assert.ok(error instanceof AggregateError, 'Should be an AggregateError');
 					assert.strictEqual(error.errors.length, 2, 'Should contain 2 errors');
-					assert.ok(/Failed to fetch resource metadata from.*\/api\/v1.*404/.test(error.errors[0].message), 'First error should mention /api/v1 and 404');
-					assert.ok(/Failed to fetch resource metadata from.*\.well-known.*404/.test(error.errors[1].message), 'Second error should mention .well-known and 404');
+					assert.ok(/Failed to fetch resource metadata from the path-appended well-known URL: 404/.test(error.errors[0].message), 'First error should name the path-appended attempt and 404');
+					assert.ok(/Failed to fetch resource metadata from the root well-known URL: 404/.test(error.errors[1].message), 'Second error should name the root attempt and 404');
 					return true;
 				}
 			); assert.strictEqual(fetchStub.callCount, 2);
@@ -1373,8 +1384,8 @@ suite('OAuth', () => {
 				(error: any) => {
 					assert.ok(error instanceof AggregateError, 'Should be an AggregateError');
 					assert.strictEqual(error.errors.length, 2, 'Should contain 2 errors');
-					assert.ok(/Network connection failed/.test(error.errors[0].message), 'First error should mention network failure');
-					assert.ok(/Network connection failed/.test(error.errors[1].message), 'Second error should mention network failure');
+					assert.ok(/the request could not be completed$/.test(error.errors[0].message), 'First error should name the failed request without the transport text');
+					assert.ok(/the request could not be completed$/.test(error.errors[1].message), 'Second error should name the failed request without the transport text');
 					return true;
 				}
 			);
@@ -1400,7 +1411,7 @@ suite('OAuth', () => {
 				(error: any) => {
 					assert.ok(error instanceof AggregateError, 'Should be an AggregateError');
 					assert.strictEqual(error.errors.length, 2, 'Should contain 2 errors');
-					assert.ok(/Connection timeout/.test(error.errors[0].message), 'First error should be network error');
+					assert.ok(/the request could not be completed$/.test(error.errors[0].message), 'First error should be network error');
 					assert.ok(/Failed to fetch resource metadata.*404/.test(error.errors[1].message), 'Second error should be 404');
 					return true;
 				}
@@ -1501,9 +1512,9 @@ suite('OAuth', () => {
 					// First error is 404 from path-appended attempt
 					assert.ok(/404/.test(error.errors[0].message));
 					// Second error is validation failure from root attempt
-					assert.ok(/does not match expected value/.test(error.errors[1].message));
+					assert.ok(/does not match the expected resource/.test(error.errors[1].message));
 					// Check that validation was against root URL (origin) not full path
-					assert.ok(/https:\/\/example\.com\/api\/v1.*https:\/\/example\.com/.test(error.errors[1].message));
+					assert.ok(/for the root well-known URL/.test(error.errors[1].message));
 					return true;
 				}
 			);
@@ -1598,7 +1609,7 @@ suite('OAuth', () => {
 				async () => fetchResourceMetadata(targetResource, resourceMetadataUrl, { fetch: fetchStub }),
 				(error: any) => {
 					// Should be AggregateError since all URLs fail
-					assert.ok(error instanceof AggregateError || /DNS resolution failed/.test(error.message));
+					assert.ok(error instanceof AggregateError || /the request could not be completed$/.test(error.message));
 					return true;
 				}
 			);
@@ -1811,9 +1822,9 @@ suite('OAuth', () => {
 					assert.strictEqual(error.errors.length, 3, 'Should contain 3 errors (one for each URL)');
 					assert.strictEqual(error.message, 'Failed to fetch authorization server metadata from all attempted URLs');
 					// Verify each error includes the URL it attempted
-					assert.ok(/oauth-authorization-server.*404/.test(error.errors[0].message), 'First error should mention OAuth discovery and 404');
-					assert.ok(/openid-configuration.*404/.test(error.errors[1].message), 'Second error should mention OpenID path insertion and 404');
-					assert.ok(/openid-configuration.*404/.test(error.errors[2].message), 'Third error should mention OpenID path addition and 404');
+					assert.ok(/the OAuth 2\.0 discovery URL \(path insertion\): 404/.test(error.errors[0].message), 'First error should name the OAuth discovery attempt and 404');
+					assert.ok(/the OpenID Connect discovery URL \(path insertion\): 404/.test(error.errors[1].message), 'Second error should name OpenID path insertion and 404');
+					assert.ok(/the OpenID Connect discovery URL \(path addition\): 404/.test(error.errors[2].message), 'Third error should name OpenID path addition and 404');
 					return true;
 				}
 			);
@@ -1879,11 +1890,11 @@ suite('OAuth', () => {
 					assert.ok(error instanceof AggregateError, 'Should be an AggregateError');
 					assert.strictEqual(error.errors.length, 3, 'Should contain 3 errors');
 					// First error is network error
-					assert.ok(/Connection timeout/.test(error.errors[0].message), 'First error should be network error');
+					assert.ok(/the request could not be completed$/.test(error.errors[0].message), 'First error should be network error');
 					// Second error is 404
-					assert.ok(/404.*Not Found/.test(error.errors[1].message), 'Second error should be 404');
+					assert.ok(/: 404$/.test(error.errors[1].message), 'Second error should be 404');
 					// Third error is 500
-					assert.ok(/500.*Internal Server Error/.test(error.errors[2].message), 'Third error should be 500');
+					assert.ok(/: 500$/.test(error.errors[2].message), 'Third error should be 500');
 					return true;
 				}
 			);
@@ -1983,9 +1994,9 @@ suite('OAuth', () => {
 					assert.strictEqual(error.errors.length, 3, 'Should contain 3 errors');
 					assert.strictEqual(error.message, 'Failed to fetch authorization server metadata from all attempted URLs');
 					// All errors should be network errors
-					assert.ok(/Network error/.test(error.errors[0].message), 'First error should be network error');
-					assert.ok(/Network error/.test(error.errors[1].message), 'Second error should be network error');
-					assert.ok(/Network error/.test(error.errors[2].message), 'Third error should be network error');
+					assert.ok(/the request could not be completed$/.test(error.errors[0].message), 'First error should be network error');
+					assert.ok(/the request could not be completed$/.test(error.errors[1].message), 'Second error should be network error');
+					assert.ok(/the request could not be completed$/.test(error.errors[2].message), 'Third error should be network error');
 					return true;
 				}
 			);
@@ -2042,9 +2053,9 @@ suite('OAuth', () => {
 				(error: any) => {
 					assert.ok(error instanceof AggregateError, 'Should be an AggregateError');
 					assert.strictEqual(error.errors.length, 3, 'Should contain 3 errors');
-					// All errors should include status code and statusText (fallback when text() fails)
+					// All errors name the numeric status only: the body and the reason phrase are never used
 					for (const err of error.errors) {
-						assert.ok(/500 Internal Server Error/.test(err.message), `Error should mention 500 and statusText: ${err.message}`);
+						assert.ok(/: 500$/.test(err.message), `Error should mention the numeric status only: ${err.message}`);
 					}
 					return true;
 				}

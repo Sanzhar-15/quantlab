@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { app, BrowserWindow, BaseWindow, KeyboardEvent, Menu, MenuItem, MenuItemConstructorOptions, WebContents } from 'electron';
+import { app, BaseWindow, KeyboardEvent, Menu, MenuItem, MenuItemConstructorOptions, WebContents } from 'electron';
 import { WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } from '../../../base/common/actions.js';
 import { RunOnceScheduler } from '../../../base/common/async.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
@@ -23,7 +23,8 @@ import { IStateService } from '../../state/node/state.js';
 import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { IUpdateService, StateType } from '../../update/common/update.js';
 import { INativeRunActionInWindowRequest, INativeRunKeybindingInWindowRequest, IWindowOpenable, hasNativeMenu } from '../../window/common/window.js';
-import { IWindowsCountChangedEvent, IWindowsMainService, OpenContext } from '../../windows/electron-main/windows.js';
+// QuantLab host (U5): the focused window is asked for through `getFocusedWindowIncludingAdopted` (the workbench is a view of the host's BaseWindow)
+import { getFocusedWindowIncludingAdopted, IWindowsCountChangedEvent, IWindowsMainService, OpenContext } from '../../windows/electron-main/windows.js';
 import { IWorkspacesHistoryMainService } from '../../workspaces/electron-main/workspacesHistoryMainService.js';
 import { Disposable } from '../../../base/common/lifecycle.js';
 
@@ -251,7 +252,7 @@ export class Menubar extends Disposable {
 			return;
 		}
 
-		const focusedWindow = BrowserWindow.getFocusedWindow();
+		const focusedWindow = getFocusedWindowIncludingAdopted();
 		this.noActiveMainWindow = !focusedWindow || !!this.auxiliaryWindowsMainService.getWindowByWebContents(focusedWindow.webContents);
 		this.scheduleUpdateMenu();
 	}
@@ -422,7 +423,7 @@ export class Menubar extends Disposable {
 				const lastActiveWindow = this.windowsMainService.getLastActiveWindow();
 				if (
 					this.windowsMainService.getWindowCount() === 0 || 	// allow to quit when no more windows are open
-					!!BrowserWindow.getFocusedWindow() ||				// allow to quit when window has focus (fix for https://github.com/microsoft/vscode/issues/39191)
+					!!BaseWindow.getFocusedWindow() ||					// allow to quit when window has focus (fix for https://github.com/microsoft/vscode/issues/39191); QuantLab host (U5): any focused window, so also the host window while the terminal view has focus
 					lastActiveWindow?.win?.isMinimized()				// allow to quit when window has no focus but is minimized (https://github.com/microsoft/vscode/issues/63000)
 				) {
 					const confirmed = await this.confirmBeforeQuit(event);
@@ -735,7 +736,7 @@ export class Menubar extends Disposable {
 		return (menuItem: MenuItem, win: BaseWindow | undefined, event: KeyboardEvent) => {
 
 			// No Active Window
-			const activeWindow = BrowserWindow.getFocusedWindow();
+			const activeWindow = getFocusedWindowIncludingAdopted();
 			if (!activeWindow) {
 				return contextSpecificHandlers.inNoWindow();
 			}
@@ -756,7 +757,7 @@ export class Menubar extends Disposable {
 		// We want to support auxililary windows that may have focus by
 		// returning their parent windows as target to support running
 		// actions via the main window.
-		let activeBrowserWindow = BrowserWindow.getFocusedWindow();
+		let activeBrowserWindow = getFocusedWindowIncludingAdopted();
 		if (activeBrowserWindow) {
 			const auxiliaryWindowCandidate = this.auxiliaryWindowsMainService.getWindowByWebContents(activeBrowserWindow.webContents);
 			if (auxiliaryWindowCandidate) {

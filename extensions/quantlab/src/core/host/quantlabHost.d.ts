@@ -13,8 +13,10 @@ declare module 'vscode' {
 	export interface QuantlabHostUser {
 		readonly id: string;
 		readonly email: string;
-		readonly name: string;
-		readonly tier?: string;
+		/** Optional in the protocol: absent when the account has none. Nothing fills it in. */
+		readonly name?: string;
+		/** Required: Go's tier (PLAN-FINAL §3.2 item 1). Not displayed until E2. */
+		readonly tier: string;
 	}
 
 	export interface QuantlabHostIdentity {
@@ -41,6 +43,12 @@ declare module 'vscode' {
 	export interface QuantlabHostApi {
 		getIdentity(): Promise<QuantlabHostIdentity>;
 		readonly onDidChangeIdentity: Event<QuantlabHostIdentity>;
+		/**
+		 * Sign out of Delta Plus in every view. The workbench asks the user first (a modal confirm):
+		 * resolves true when signed out, false when the user cancelled (nothing was sent). A host
+		 * refusal rejects with an Error carrying `code`. The new identity arrives on onDidChangeIdentity.
+		 */
+		signOut(): Thenable<boolean>;
 		/** One named op; resolves with the parsed answer or rejects with a coded error. */
 		request(op: string, input: unknown, token?: CancellationToken): Promise<unknown>;
 		subscribe(topic: string, params: unknown): QuantlabHostStream;

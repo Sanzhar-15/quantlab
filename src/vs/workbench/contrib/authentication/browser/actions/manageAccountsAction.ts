@@ -11,9 +11,12 @@ import { ICommandService } from '../../../../../platform/commands/common/command
 import { IInstantiationService, ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { IQuickInputService, IQuickPickItem } from '../../../../../platform/quickinput/common/quickInput.js';
+import { ILogService } from '../../../../../platform/log/common/log.js';
+import { INotificationService } from '../../../../../platform/notification/common/notification.js';
 import { ISecretStorageService } from '../../../../../platform/secrets/common/secrets.js';
 import { AuthenticationSessionInfo, getCurrentAuthenticationSessionInfo } from '../../../../services/authentication/browser/authenticationService.js';
 import { IAuthenticationProvider, IAuthenticationService } from '../../../../services/authentication/common/authentication.js';
+import { runAtBoundary } from '../../../../services/authentication/common/storedSecretBoundary.js';
 
 export class ManageAccountsAction extends Action2 {
 	constructor() {
@@ -40,13 +43,16 @@ interface AccountActionQuickPickItem extends IQuickPickItem {
 	action: () => void;
 }
 
-class ManageAccountsActionImpl {
+/** Exported for tests only. */
+export class ManageAccountsActionImpl {
 	constructor(
 		@IQuickInputService private readonly quickInputService: IQuickInputService,
 		@IAuthenticationService private readonly authenticationService: IAuthenticationService,
 		@ICommandService private readonly commandService: ICommandService,
 		@ISecretStorageService private readonly secretStorageService: ISecretStorageService,
 		@IProductService private readonly productService: IProductService,
+		@ILogService private readonly logService: ILogService,
+		@INotificationService private readonly notificationService: INotificationService,
 	) { }
 
 	public async run() {
@@ -94,6 +100,9 @@ class ManageAccountsActionImpl {
 	private async showAccountActions(account: AccountQuickPickItem): Promise<void> {
 		const { providerId, label: accountLabel, canSignOut } = account;
 
+		// Decided before any UI exists: a stored session that cannot be read rejects here, and is never read as "may sign out".
+		const mayShowSignOut = await canSignOut();
+
 		const store = new DisposableStore();
 		const quickPick = store.add(this.quickInputService.createQuickPick<AccountActionQuickPickItem>());
 
@@ -106,7 +115,7 @@ class ManageAccountsActionImpl {
 			action: () => this.commandService.executeCommand('_manageTrustedExtensionsForAccount', { providerId, accountLabel })
 		}];
 
-		if (await canSignOut()) {
+		if (mayShowSignOut) {
 			items.push({
 				label: localize('signOut', "Sign Out"),
 				action: () => this.commandService.executeCommand('_signOutOfAccount', { providerId, accountLabel })
@@ -125,7 +134,11 @@ class ManageAccountsActionImpl {
 
 		store.add(quickPick.onDidTriggerButton((button) => {
 			if (button === this.quickInputService.backButton) {
-				void this.run();
+				// Nobody awaits the back button: a failure (for example a stored session that cannot be read) is shown, not dropped.
+				void runAtBoundary(() => this.run(), error => {
+					this.logService.error('Could not list the accounts to manage.', error);
+					this.notificationService.error(localize('manageAccountsFailed', "Could not list the accounts to manage. See the log for details."));
+				});
 			}
 		}));
 

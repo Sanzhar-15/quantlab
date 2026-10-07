@@ -223,11 +223,11 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryNode>
 	private buildAccessibilityLabel(entry: HistoryEntry): string {
 		const strategyName = path.basename(entry.strategyPath);
 		const metric = this.pickMetric(entry.metrics);
-		const metricPart = metric ? `, ${metric.label} ${metric.value.toFixed(2)}` : '';
+		const metricPart = metric ? `, ${metric.label} ${formatMetricValue(metric.value)}` : '';
 		return `${formatRunType(entry.type)} run ${entry.id}, ${entry.status}, strategy ${strategyName}${metricPart}`;
 	}
 
-	private pickMetric(metrics?: Record<string, number>): { label: string; value: number } | undefined {
+	private pickMetric(metrics?: Record<string, number | null>): { label: string; value: number | null } | undefined {
 		if (!metrics) {
 			return undefined;
 		}
@@ -247,4 +247,9 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryNode>
 		const [label, value] = entries[0];
 		return { label, value };
 	}
+}
+
+/** A metric for display: null is the engine's value for inf / NaN (run_backtest.py _sanitize_for_json). */
+export function formatMetricValue(value: number | null): string {
+	return value === null ? 'not finite' : value.toFixed(2);
 }

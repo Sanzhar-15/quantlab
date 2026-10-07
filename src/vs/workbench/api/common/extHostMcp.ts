@@ -8,7 +8,7 @@ import { DeferredPromise, raceCancellationError, Sequencer, timeout } from '../.
 import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { CancellationError } from '../../../base/common/errors.js';
 import { Disposable, DisposableMap, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
-import { AUTH_SCOPE_SEPARATOR, fetchAuthorizationServerMetadata, fetchResourceMetadata, getDefaultMetadataForUrl, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, parseWWWAuthenticateHeader, scopesMatch } from '../../../base/common/oauth.js';
+import { AUTH_SCOPE_SEPARATOR, describeOAuthFailure, fetchAuthorizationServerMetadata, fetchResourceMetadata, getDefaultMetadataForUrl, IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, parseWWWAuthenticateHeader, scopesMatch } from '../../../base/common/oauth.js';
 import { SSEParser } from '../../../base/common/sseParser.js';
 import { URI, UriComponents } from '../../../base/common/uri.js';
 import { vArray, vNumber, vObj, vObjAny, vOptionalProp, vString } from '../../../base/common/validation.js';
@@ -949,16 +949,17 @@ export async function createAuthMetadata(
 			fetch: (url, init) => fetch(url, init as MinimalRequestInit)
 		});
 		for (const err of errors) {
-			log(LogLevel.Warning, `Error fetching resource metadata: ${err}`);
+			log(LogLevel.Warning, `Error fetching resource metadata: ${describeOAuthFailure(err, 'the request failed unexpectedly')}`);
 		}
 		// TODO:@TylerLeonhardt support multiple authorization servers
 		// Consider using one that has an auth provider first, over the dynamic flow
 		serverMetadataUrl = metadata.authorization_servers?.[0];
-		log(LogLevel.Debug, `Using auth server metadata url: ${serverMetadataUrl}`);
+		// The URL is supplied by the server and can carry credentials: it is not logged
+		log(LogLevel.Debug, 'Using the auth server metadata url from the resource metadata');
 		scopesChallenge ??= metadata.scopes_supported;
 		resource = metadata;
 	} catch (e) {
-		log(LogLevel.Warning, `Could not fetch resource metadata: ${String(e)}`);
+		log(LogLevel.Warning, `Could not fetch resource metadata: ${describeOAuthFailure(e, 'the request failed unexpectedly')}`);
 	}
 
 	const baseUrl = new URL(originalResponse.url).origin;
@@ -976,7 +977,7 @@ export async function createAuthMetadata(
 	}
 
 	try {
-		log(LogLevel.Debug, `Fetching auth server metadata for: ${serverMetadataUrl} ...`);
+		log(LogLevel.Debug, 'Fetching auth server metadata ...');
 		const serverMetadataResponse = await fetchAuthorizationServerMetadata(serverMetadataUrl, {
 			additionalHeaders,
 			fetch: (url, init) => fetch(url, init as MinimalRequestInit)
@@ -990,7 +991,7 @@ export async function createAuthMetadata(
 			log
 		);
 	} catch (e) {
-		log(LogLevel.Warning, `Error populating auth server metadata for ${serverMetadataUrl}: ${String(e)}`);
+		log(LogLevel.Warning, `Error populating auth server metadata: ${describeOAuthFailure(e, 'the request failed unexpectedly')}`);
 	}
 
 	// If there's no well-known server metadata, then use the default values based off of the url.

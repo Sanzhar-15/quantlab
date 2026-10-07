@@ -74,6 +74,7 @@ import { FileUserDataProvider } from '../../platform/userData/common/fileUserDat
 import { addUNCHostToAllowlist, getUNCHost } from '../../base/node/unc.js';
 import { ThemeMainService } from '../../platform/theme/electron-main/themeMainServiceImpl.js';
 import { LINUX_SYSTEM_POLICY_FILE_PATH } from '../../base/common/policy.js';
+import { createQlCombinedPolicyService, registerQlChromePolicyConfiguration } from './qlHost/chromePolicy.js'; // QuantLab host (U7)
 
 /**
  * The main VS Code entry point.
@@ -236,6 +237,11 @@ class CodeMain {
 		} else {
 			policyService = new NullPolicyService();
 		}
+
+		// QuantLab host (U7, CH-2): the bundled chrome policy is added in front of the platform's policy service chosen above (never
+		// replacing it). `window.titleBarStyle` is registered in this process because the window frame is chosen here.
+		registerQlChromePolicyConfiguration();
+		policyService = disposables.add(createQlCombinedPolicyService(policyService, logService));
 		services.set(IPolicyService, policyService);
 
 		// Configuration

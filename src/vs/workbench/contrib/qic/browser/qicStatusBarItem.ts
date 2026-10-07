@@ -24,7 +24,7 @@ interface StatusBarInfo {
 export class QicStatusBarContribution {
 
 	private _state: QicState = 'ready';
-	private _connectionMode: ConnectionMode = 'cloud';
+	private _connectionMode: ConnectionMode = 'server';
 	private _modelName = 'claude-latest';
 	private _tokenUsage = 0;
 	private _degradationLevel: DegradationLevel = 0;
@@ -89,18 +89,12 @@ export class QicStatusBarContribution {
 	private getModeIcon(): string {
 		switch (this._connectionMode) {
 			case 'server': return '$(remote)';
-			case 'cloud': return '$(cloud)';
-			case 'byok': return '$(key)';
-			case 'local': return '$(server)';
 		}
 	}
 
 	private getModeName(): string {
 		switch (this._connectionMode) {
 			case 'server': return 'Delta Plus Server';
-			case 'cloud': return 'Quantlab Cloud';
-			case 'byok': return 'Bring Your Own Key';
-			case 'local': return 'Local (Ollama)';
 		}
 	}
 

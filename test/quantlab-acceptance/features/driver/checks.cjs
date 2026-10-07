@@ -9,11 +9,14 @@
 
 const fs = require('fs');
 const net = require('net');
+const os = require('os');
 const path = require('path');
 const vscode = require('vscode');
+const { ask } = require('../cues.cjs');
 
 const PINNED_IDS = ['ms-python.python', 'detachhead.basedpyright', 'ms-toolsai.jupyter'];
 const WAIT_MS = 120 * 1000;
+const BACKTEST_RUN_MS = 5 * 60 * 1000;
 
 function requireEnv(name) {
 	const value = process.env[name];
@@ -126,6 +129,11 @@ async function pythonIntelligence() {
 	if (pyright === undefined || !pyright.isActive) {
 		throw new Error('[language_server_inactive] detachhead.basedpyright is not active after the three requests');
 	}
+	// basedpyright alone: no other Python language server is installed to answer instead.
+	const pylance = vscode.extensions.getExtension('ms-python.vscode-pylance');
+	if (pylance !== undefined) {
+		throw new Error(`[pylance_present] ms-python.vscode-pylance ${pylance.packageJSON.version} is installed; completion must come from basedpyright alone`);
+	}
 	return { status: 'PASS', detail: `completion: path among ${completion} items; hover: ${hover} chars with the docstring; definition: ${definition}; server basedpyright ${pyright.packageJSON.version}` };
 }
 
@@ -161,6 +169,128 @@ async function notebookCell() {
 	return { status: 'PASS', detail: `fixture.ipynb cell 1 on ${python} printed ${JSON.stringify(printed)}` };
 }
 
+/** The extension's run folders: `<user data>/User/globalStorage/quantlab.quantlab/quantlab/runs/<jobId>/`. */
+function runsDir() {
+	return path.join(requireEnv('QL_FEATURES_USER_DATA'), 'User', 'globalStorage', 'quantlab.quantlab', 'quantlab', 'runs');
+}
+
+/**
+ * A backtest of the fixture strategy on the fixture bars, started from the Action view as a user does,
+ * runs on the BUNDLED engine of this app: the run's first log line names an executable inside the app.
+ */
+async function backtestBundledEngine() {
+	const strategy = workspaceFile('strategy_sma.py');
+	const bars = workspaceFile('bars.csv').fsPath;
+	const rows = fs.readFileSync(bars, 'utf8').trim().split('\n');
+	const first = rows[1].split(',')[0];
+	const last = rows[rows.length - 1].split(',')[0];
+	if (fs.existsSync(runsDir())) {
+		throw new Error(`[runs_not_fresh] ${runsDir()} exists before the backtest; the profile is not fresh`);
+	}
+
+	await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(strategy));
+	await vscode.commands.executeCommand('quantlab.action.openResource', 'offline-backtest');
+	const ui = await ask(requireEnv('QL_FEATURES_CUES'), 'backtest-form', {
+		values: { dataSource: bars, dateStart: first, dateEnd: last },
+		runTimeoutMs: BACKTEST_RUN_MS,
+	}, BACKTEST_RUN_MS + 120 * 1000);
+	if (ui.status !== 'completed') {
+		throw new Error(`[backtest_not_completed] the Action view shows status ${ui.status}: ${ui.error || ui.meta} (fields not found: ${ui.missingFields.join(', ') || 'none'})`);
+	}
+
+	const runs = fs.readdirSync(runsDir()).filter(name => name.startsWith('backtest-'));
+	if (runs.length !== 1) {
+		throw new Error(`[backtest_runs] expected one backtest run folder in ${runsDir()}, found [${runs.join(', ')}]`);
+	}
+	const folder = path.join(runsDir(), runs[0]);
+	const result = JSON.parse(fs.readFileSync(path.join(folder, 'result.json'), 'utf8'));
+	const metrics = Object.keys(result.metrics ?? {});
+	if (metrics.length === 0) {
+		throw new Error(`[backtest_no_metrics] ${path.join(folder, 'result.json')} holds no metrics`);
+	}
+	const logs = JSON.parse(fs.readFileSync(path.join(folder, 'logs.json'), 'utf8'));
+	const start = logs.find(entry => entry.message.startsWith('Starting backtest job: '));
+	if (start === undefined) {
+		throw new Error(`[engine_unnamed] no "Starting backtest job:" line among ${logs.length} log lines of ${runs[0]}`);
+	}
+	const match = /^Starting backtest job: (.+) -m quantlab\.cli\.run_backtest \(([^;]+); cwd /.exec(start.message);
+	const appRoot = vscode.env.appRoot;
+	if (match === null || match[2] !== 'packaged bundled engine' || !match[1].startsWith(`${appRoot}${path.sep}`)) {
+		throw new Error(`[engine_not_bundled] the run did not use this app's bundled engine (app root ${appRoot}): ${start.message}`);
+	}
+	return { status: 'PASS', detail: `${runs[0]}: ${ui.meta}; ${metrics.length} metrics (${metrics.slice(0, 3).join(', ')}); engine ${path.relative(appRoot, match[1])}` };
+}
+
+const IMPORT_SETTINGS = { 'editor.fontSize': 17, 'files.trimTrailingWhitespace': true };
+const IMPORT_KEYBINDING = { key: 'ctrl+alt+q', command: 'workbench.action.files.saveAll' };
+const IMPORT_EXTENSION = 'ms-python.python';
+
+/**
+ * Import from a VS Code profile planted in this run's HOME: the settings, the keybinding and the
+ * extension set arrive in the app's user directory; the user's previous settings are backed up.
+ */
+async function importFromVsCode() {
+	const home = os.homedir();
+	if (home !== requireEnv('HOME')) {
+		throw new Error(`[home_mismatch] the extension host's home is ${home}, the run set HOME=${process.env.HOME}`);
+	}
+	const source = path.join(home, 'Library', 'Application Support', 'Code', 'User');
+	fs.mkdirSync(source, { recursive: true });
+	fs.writeFileSync(path.join(source, 'settings.json'), JSON.stringify(IMPORT_SETTINGS));
+	fs.writeFileSync(path.join(source, 'keybindings.json'), JSON.stringify([IMPORT_KEYBINDING]));
+	fs.mkdirSync(path.join(home, '.vscode', 'extensions'), { recursive: true });
+	fs.writeFileSync(path.join(home, '.vscode', 'extensions', 'extensions.json'), JSON.stringify([{ identifier: { id: IMPORT_EXTENSION } }]));
+
+	const user = path.join(requireEnv('QL_FEATURES_USER_DATA'), 'User');
+	const before = JSON.parse(fs.readFileSync(path.join(user, 'settings.json'), 'utf8'));
+	const command = vscode.commands.executeCommand('quantlab.importFromEditor');
+	const modal = await ask(requireEnv('QL_FEATURES_CUES'), 'import-modal', { message: 'Import settings, keybindings and extensions from VS Code?', button: 'Import' }, 120 * 1000);
+	await command;
+
+	const settings = JSON.parse(fs.readFileSync(path.join(user, 'settings.json'), 'utf8'));
+	for (const [key, value] of Object.entries({ ...before, ...IMPORT_SETTINGS })) {
+		if (JSON.stringify(settings[key]) !== JSON.stringify(value)) {
+			throw new Error(`[import_setting] ${key} is ${JSON.stringify(settings[key])} after the import, expected ${JSON.stringify(value)}`);
+		}
+	}
+	const keybindings = JSON.parse(fs.readFileSync(path.join(user, 'keybindings.json'), 'utf8'));
+	if (!keybindings.some(k => k.key === IMPORT_KEYBINDING.key && k.command === IMPORT_KEYBINDING.command)) {
+		throw new Error(`[import_keybinding] ${IMPORT_KEYBINDING.key} -> ${IMPORT_KEYBINDING.command} is not in ${path.join(user, 'keybindings.json')}`);
+	}
+	const backups = fs.readdirSync(user).filter(name => name.startsWith('settings.json.pre-import-'));
+	if (backups.length !== 1 || JSON.stringify(JSON.parse(fs.readFileSync(path.join(user, backups[0]), 'utf8'))) !== JSON.stringify(before)) {
+		throw new Error(`[import_backup] expected one backup holding the previous settings, found [${backups.join(', ')}]`);
+	}
+	const report = vscode.workspace.textDocuments.find(document => document.getText().startsWith('Import from VS Code'));
+	if (report === undefined) {
+		throw new Error('[import_no_report] no "Import from VS Code" report document is open');
+	}
+	const extensionsLine = report.getText().split('\n').find(line => line.startsWith('Extensions: '));
+	if (extensionsLine !== 'Extensions: 0 installed, 1 already installed, 0 not imported') {
+		throw new Error(`[import_extensions] the report says ${JSON.stringify(extensionsLine)}, expected ${IMPORT_EXTENSION} already installed`);
+	}
+	return { status: 'PASS', detail: `modal "${modal.text}" -> Import; settings ${Object.keys(IMPORT_SETTINGS).join(', ')}; keybinding ${IMPORT_KEYBINDING.key}; ${extensionsLine}; backup ${backups[0]}` };
+}
+
+/**
+ * The extension-pack row's control: a Pylance prompt shown on purpose (the toast reader must see it) and a pack
+ * member installed on purpose (the profile and the request log must show it). The install's outcome is recorded:
+ * with the network off it fails, and its gallery request is what the row looks for.
+ */
+async function packTrigger() {
+	void vscode.window.showInformationMessage('[ql-features control] Install Pylance from the Python extension pack?', 'Install');
+	await new Promise(resolve => setTimeout(resolve, 2000));
+	const toasts = await ask(requireEnv('QL_FEATURES_CUES'), 'toasts', {}, 60 * 1000);
+	let install;
+	try {
+		await vscode.commands.executeCommand('workbench.extensions.installExtension', 'ms-python.debugpy');
+		install = 'ms-python.debugpy installed';
+	} catch (err) {
+		install = `ms-python.debugpy not installed: ${err instanceof Error ? err.message : String(err)}`;
+	}
+	return { install, toasts: toasts.texts };
+}
+
 async function guarded(check) {
 	try {
 		return await check();
@@ -178,12 +308,14 @@ exports.run = async function () {
 		result.checks = {
 			'python-intelligence': await guarded(pythonIntelligence),
 			'notebook-cell': await guarded(notebookCell),
-			// Not driven yet: both need the window driven from outside the extension host (the next unit).
-			'backtest-bundled-engine': { status: 'NOT RUN', detail: '[driver_not_written] a backtest starts from the Action view webview, which has no command; needs the window driver' },
-			'import': { status: 'NOT RUN', detail: '[driver_not_written] quantlab.importFromEditor confirms through a modal dialog; needs the window driver' },
+			// These two drive the window through the launcher (cues.cjs); import runs last because it changes the settings.
+			'backtest-bundled-engine': await guarded(backtestBundledEngine),
+			'import': await guarded(importFromVsCode),
 		};
+	} else if (mode === 'pack-trigger') {
+		result.packTrigger = await packTrigger();
 	} else if (mode !== 'pins') {
-		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all or pins)`);
+		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all, pins or pack-trigger)`);
 	}
 	fs.writeFileSync(resultPath, JSON.stringify(result, undefined, '\t') + '\n');
 };

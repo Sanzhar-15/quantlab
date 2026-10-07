@@ -23,7 +23,6 @@ import { StandardKeyboardEvent } from '../../../base/browser/keyboardEvent.js';
 import { StandardMouseEvent } from '../../../base/browser/mouseEvent.js';
 import { EventType as TouchEventType, GestureEvent } from '../../../base/browser/touch.js';
 import { AnchorAlignment, AnchorAxisAlignment } from '../../../base/browser/ui/contextview/contextview.js';
-import { Lazy } from '../../../base/common/lazy.js';
 import { getActionBarActions } from '../../../platform/actions/browser/menuEntryActionViewItem.js';
 import { IConfigurationService } from '../../../platform/configuration/common/configuration.js';
 import { IContextKeyService } from '../../../platform/contextkey/common/contextkey.js';
@@ -32,8 +31,8 @@ import { IKeybindingService } from '../../../platform/keybinding/common/keybindi
 import { ILogService } from '../../../platform/log/common/log.js';
 import { IProductService } from '../../../platform/product/common/productService.js';
 import { ISecretStorageService } from '../../../platform/secrets/common/secrets.js';
-import { AuthenticationSessionInfo, getCurrentAuthenticationSessionInfo } from '../../services/authentication/browser/authenticationService.js';
-import { AuthenticationSessionAccount, IAuthenticationService, INTERNAL_AUTH_PROVIDER_PREFIX } from '../../services/authentication/common/authentication.js';
+import { getCurrentAuthenticationSessionInfo } from '../../services/authentication/browser/authenticationService.js';
+import { IAuthenticationService, INTERNAL_AUTH_PROVIDER_PREFIX } from '../../services/authentication/common/authentication.js';
 import { IWorkbenchEnvironmentService } from '../../services/environment/common/environmentService.js';
 import { IHoverService } from '../../../platform/hover/browser/hover.js';
 import { ILifecycleService, LifecyclePhase } from '../../services/lifecycle/common/lifecycle.js';
@@ -44,6 +43,7 @@ import { KeyCode } from '../../../base/common/keyCodes.js';
 import { ACTIVITY_BAR_BADGE_BACKGROUND, ACTIVITY_BAR_BADGE_FOREGROUND } from '../../common/theme.js';
 import { IBaseActionViewItemOptions } from '../../../base/browser/ui/actionbar/actionViewItems.js';
 import { ICommandService } from '../../../platform/commands/common/commands.js';
+import { AccountsMenuModel } from './accountsMenuModel.js';
 
 export class GlobalCompositeBar extends Disposable {
 
@@ -259,11 +259,9 @@ export class AccountsActivityActionViewItem extends AbstractGlobalActivityAction
 
 	static readonly ACCOUNTS_VISIBILITY_PREFERENCE_KEY = 'workbench.activity.showAccounts';
 
-	private readonly groupedAccounts: Map<string, (AuthenticationSessionAccount & { canSignOut: boolean })[]> = new Map();
-	private readonly problematicProviders: Set<string> = new Set();
+	private readonly accountsModel: AccountsMenuModel;
 
 	private initialized = false;
-	private sessionFromEmbedder = new Lazy<Promise<AuthenticationSessionInfo | undefined>>(() => getCurrentAuthenticationSessionInfo(this.secretStorageService, this.productService));
 
 	constructor(
 		contextMenuActionsProvider: () => IAction[],
@@ -294,32 +292,30 @@ export class AccountsActivityActionViewItem extends AbstractGlobalActivityAction
 		});
 		super(MenuId.AccountsContext, action, options, contextMenuActionsProvider, contextMenuAlignmentOptions, themeService, hoverService, menuService, contextMenuService, contextKeyService, configurationService, keybindingService, activityService);
 		this._register(action);
+		// The embedder's session is read through the model, which forgets a rejected read, so that the next showing reads again.
+		this.accountsModel = new AccountsMenuModel(this.authenticationService, () => getCurrentAuthenticationSessionInfo(this.secretStorageService, this.productService), this.logService);
 		this.registerListeners();
 		this.initialize();
 	}
 
 	private registerListeners(): void {
 		this._register(this.authenticationService.onDidRegisterAuthenticationProvider(async (e) => {
-			await this.addAccountsFromProvider(e.id);
+			await this.accountsModel.addAccountsFromProvider(e.id);
 		}));
 
 		this._register(this.authenticationService.onDidUnregisterAuthenticationProvider((e) => {
-			this.groupedAccounts.delete(e.id);
-			this.problematicProviders.delete(e.id);
+			this.accountsModel.removeProvider(e.id);
 		}));
 
 		this._register(this.authenticationService.onDidChangeSessions(async e => {
 			if (e.event.removed) {
 				for (const removed of e.event.removed) {
-					this.removeAccount(e.providerId, removed.account);
+					this.accountsModel.removeAccount(e.providerId, removed.account);
 				}
 			}
 			for (const changed of [...(e.event.changed ?? []), ...(e.event.added ?? [])]) {
-				try {
-					await this.addOrUpdateAccount(e.providerId, changed.account);
-				} catch (e) {
-					this.logService.error(e);
-				}
+				// A failure is logged and marks the provider unavailable; the account is not added.
+				await this.accountsModel.addOrUpdateAccountReportingFailure(e.providerId, changed.account);
 			}
 		}));
 	}
@@ -341,7 +337,7 @@ export class AccountsActivityActionViewItem extends AbstractGlobalActivityAction
 
 	private async doInitialize(): Promise<void> {
 		const providerIds = this.authenticationService.getProviderIds();
-		const results = await Promise.allSettled(providerIds.map(providerId => this.addAccountsFromProvider(providerId)));
+		const results = await Promise.allSettled(providerIds.map(providerId => this.accountsModel.addAccountsFromProvider(providerId)));
 
 		// Log any errors that occurred while initializing. We try to be best effort here to show the most amount of accounts
 		for (const result of results) {
@@ -371,18 +367,20 @@ export class AccountsActivityActionViewItem extends AbstractGlobalActivityAction
 		} else {
 			for (const providerId of registeredProviders) {
 				const provider = this.authenticationService.getProvider(providerId);
-				const accounts = this.groupedAccounts.get(providerId);
-				if (!accounts) {
-					if (this.problematicProviders.has(providerId)) {
-						const providerUnavailableAction = disposables.add(new Action('providerUnavailable', localize('authProviderUnavailable', '{0} is currently unavailable', provider.label), undefined, false));
-						menus.push(providerUnavailableAction);
-						// try again in the background so that if the failure was intermittent, we can resolve it on the next showing of the menu
-						try {
-							await this.addAccountsFromProvider(providerId);
-						} catch (e) {
-							this.logService.error(e);
-						}
+				const accounts = this.accountsModel.groupedAccounts.get(providerId);
+				// A provider that could not be read (its sessions, or the embedder's stored session) is shown as unavailable
+				// whether or not it has accounts from an earlier read: a failed read is never shown as an absence.
+				if (this.accountsModel.problematicProviders.has(providerId)) {
+					const providerUnavailableAction = disposables.add(new Action('providerUnavailable', localize('authProviderUnavailable', '{0} is currently unavailable', provider.label), undefined, false));
+					menus.push(providerUnavailableAction);
+					// try again in the background so that if the failure was intermittent, we can resolve it on the next showing of the menu
+					try {
+						await this.accountsModel.addAccountsFromProvider(providerId);
+					} catch (e) {
+						this.logService.error(e);
 					}
+				}
+				if (!accounts) {
 					continue;
 				}
 
@@ -416,7 +414,7 @@ export class AccountsActivityActionViewItem extends AbstractGlobalActivityAction
 
 			for (const providerId of dynamicProviders) {
 				const provider = this.authenticationService.getProvider(providerId);
-				const accounts = this.groupedAccounts.get(providerId);
+				const accounts = this.accountsModel.groupedAccounts.get(providerId);
 				// Provide _some_ discoverable way to manage dynamic authentication providers.
 				// This will either show up inside the account submenu or as a top-level menu item if there
 				// are no accounts.
@@ -426,17 +424,17 @@ export class AccountsActivityActionViewItem extends AbstractGlobalActivityAction
 					enabled: true,
 					run: () => this.commandService.executeCommand('workbench.action.removeDynamicAuthenticationProviders')
 				});
-				if (!accounts) {
-					if (this.problematicProviders.has(providerId)) {
-						const providerUnavailableAction = disposables.add(new Action('providerUnavailable', localize('authProviderUnavailable', '{0} is currently unavailable', provider.label), undefined, false));
-						menus.push(providerUnavailableAction);
-						// try again in the background so that if the failure was intermittent, we can resolve it on the next showing of the menu
-						try {
-							await this.addAccountsFromProvider(providerId);
-						} catch (e) {
-							this.logService.error(e);
-						}
+				if (this.accountsModel.problematicProviders.has(providerId)) {
+					const providerUnavailableAction = disposables.add(new Action('providerUnavailable', localize('authProviderUnavailable', '{0} is currently unavailable', provider.label), undefined, false));
+					menus.push(providerUnavailableAction);
+					// try again in the background so that if the failure was intermittent, we can resolve it on the next showing of the menu
+					try {
+						await this.accountsModel.addAccountsFromProvider(providerId);
+					} catch (e) {
+						this.logService.error(e);
 					}
+				}
+				if (!accounts) {
 					menus.push(manageDynamicAuthProvidersAction);
 					continue;
 				}
@@ -486,78 +484,6 @@ export class AccountsActivityActionViewItem extends AbstractGlobalActivityAction
 		const actions = await super.resolveContextMenuActions(disposables);
 		this.fillContextMenuActions(actions);
 		return actions;
-	}
-
-	//#endregion
-
-	//#region groupedAccounts helpers
-
-	private async addOrUpdateAccount(providerId: string, account: AuthenticationSessionAccount): Promise<void> {
-		let accounts = this.groupedAccounts.get(providerId);
-		if (!accounts) {
-			accounts = [];
-			this.groupedAccounts.set(providerId, accounts);
-		}
-
-		const sessionFromEmbedder = await this.sessionFromEmbedder.value;
-		let canSignOut = true;
-		if (
-			sessionFromEmbedder												// if we have a session from the embedder
-			&& !sessionFromEmbedder.canSignOut								// and that session says we can't sign out
-			&& (await this.authenticationService.getSessions(providerId))	// and that session is associated with the account we are adding/updating
-				.some(s =>
-					s.id === sessionFromEmbedder.id
-					&& s.account.id === account.id
-				)
-		) {
-			canSignOut = false;
-		}
-
-		const existingAccount = accounts.find(a => a.label === account.label);
-		if (existingAccount) {
-			// if we have an existing account and we discover that we
-			// can't sign out of it, update the account to mark it as "can't sign out"
-			if (!canSignOut) {
-				existingAccount.canSignOut = canSignOut;
-			}
-		} else {
-			accounts.push({ ...account, canSignOut });
-		}
-	}
-
-	private removeAccount(providerId: string, account: AuthenticationSessionAccount): void {
-		const accounts = this.groupedAccounts.get(providerId);
-		if (!accounts) {
-			return;
-		}
-
-		const index = accounts.findIndex(a => a.id === account.id);
-		if (index === -1) {
-			return;
-		}
-
-		accounts.splice(index, 1);
-		if (accounts.length === 0) {
-			this.groupedAccounts.delete(providerId);
-		}
-	}
-
-	private async addAccountsFromProvider(providerId: string): Promise<void> {
-		try {
-			const sessions = await this.authenticationService.getSessions(providerId);
-			this.problematicProviders.delete(providerId);
-
-			for (const session of sessions) {
-				try {
-					await this.addOrUpdateAccount(providerId, session.account);
-				} catch (e) {
-					this.logService.error(e);
-				}
-			}
-		} catch (e) {
-			this.logService.error(e);
-			this.problematicProviders.add(providerId);
-		}
 	}
 
 	//#endregion

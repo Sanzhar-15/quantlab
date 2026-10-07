@@ -19,6 +19,7 @@ import { resolveNLSConfiguration } from './vs/base/node/nls.js';
 import { getUNCHost, addUNCHostToAllowlist } from './vs/base/node/unc.js';
 import { INLSConfiguration } from './vs/nls.js';
 import { NativeParsedArgs } from './vs/platform/environment/common/argv.js';
+import { disableBackgroundNetwork } from './vs/code/electron-main/ql-client/index.js'; // QuantLab host (EGRESS-MAIN)
 
 perf.mark('code/didStartMain');
 
@@ -29,6 +30,12 @@ perf.mark('code/willLoadMainBundle', {
 	startTime: Math.floor(performance.timeOrigin)
 });
 perf.mark('code/didLoadMainBundle');
+
+// QuantLab host (EGRESS-MAIN): the host makes no network request of its own beyond its backend. The client's ONE shared
+// implementation (host-shared/background-network.ts, also the light host's) switches Chromium's spellchecker dictionary
+// download off on every session, and throws when the app is already ready. It is called HERE, in the bootstrap:
+// vs/code/electron-main/main.ts is imported by startup() below, after `ready`. Row: build/qlhost/check-egress-call.mjs.
+disableBackgroundNetwork(app);
 
 // Enable portable support
 const portable = configurePortable(product);
@@ -101,7 +108,9 @@ protocol.registerSchemesAsPrivileged([
 	{
 		scheme: 'vscode-file',
 		privileges: { secure: true, standard: true, supportFetchAPI: true, corsEnabled: true, codeCache: true }
-	}
+	},
+	// QuantLab host (U3): the terminal's deny-scheme, registered so the host's protocol.handle('dp') refusal answers (R-53)
+	{ scheme: 'dp', privileges: {} }
 ]);
 
 // Global app listeners

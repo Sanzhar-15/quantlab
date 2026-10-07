@@ -9,15 +9,13 @@ import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { localize } from '../../../../nls.js';
-import { CommandsRegistry, ICommandService } from '../../../../platform/commands/common/commands.js';
+import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import {
 	IQuantlabHostIdentityService,
-	QUANTLAB_EXT_DID_CHANGE_COMMAND,
-	QUANTLAB_EXT_GET_COMMAND,
 	QUANTLAB_HOST_DATA_CANCEL_CHANNEL,
 	QUANTLAB_HOST_DATA_FRAME_CHANNEL,
 	QUANTLAB_HOST_DATA_REQUEST_CHANNEL,
@@ -26,6 +24,8 @@ import {
 	QUANTLAB_HOST_IDENTITY_CHANGED_CHANNEL,
 	QUANTLAB_HOST_IDENTITY_GET_CHANNEL,
 	QUANTLAB_HOST_IDENTITY_GET_REQUEST,
+	QUANTLAB_HOST_IDENTITY_SIGN_OUT_CHANNEL,
+	QUANTLAB_HOST_IDENTITY_SIGN_OUT_REQUEST,
 	QUANTLAB_LEGACY_LOGIN_SECRET_KEYS,
 	QuantlabHostError,
 	type QuantlabDataFrame,
@@ -49,14 +49,18 @@ const LOG_PREFIX = '[quantlab-host-identity]';
  * - `getIdentity()` invokes the main process's identity channel. A rejected invoke (or an answer
  *   that is not one of the contract's two shapes) is logged and RE-THROWN; it is never turned into
  *   `signedIn: false`.
- * - The main process's `changed` broadcast is a tick: the service fires {@link onDidChangeIdentity}
- *   and, when the extension has registered its `didChange` command, executes it (no argument; the
- *   extension pulls with the `_quantlab.hostIdentity.get` command registered below).
+ * - The main process's `changed` broadcast is a tick: the service fires {@link onDidChangeIdentity}.
+ *   The service registers and executes no command (rule 2): the identity reaches the extension host
+ *   ONLY through `vscode.quantlabHost`, which the main-thread quantlab host side feeds from this
+ *   service and gives to the built-in quantlab extension alone.
  * - At start the service deletes the login-bearing keys that older builds left in the workbench's
  *   secret storage (credentials at rest that nothing reads any more).
  * - Data (IPC-DATA): `request`, `subscribe` and `unsubscribe` invoke the data module's channels with
  *   the envelope `{ v: 1, input }`. An `ok: false` answer REJECTS with a {@link QuantlabHostError}
  *   carrying its code; a malformed answer rejects with a plain Error. Both are logged.
+ * - Sign-out (IPC-DATA amendment): `signOut()` asks a workbench modal confirm and invokes the host's
+ *   sign-out only on the user's yes. The host then moves the epoch and ticks `changed`; every store
+ *   empties on that tick. The extension reaches this only through `vscode.quantlabHost.signOut()`.
  */
 export class QuantlabHostIdentityService extends Disposable implements IQuantlabHostIdentityService {
 
@@ -80,8 +84,8 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 	constructor(
 		@ILogService private readonly logService: ILogService,
 		@INotificationService private readonly notificationService: INotificationService,
-		@ICommandService private readonly commandService: ICommandService,
-		@ISecretStorageService private readonly secretStorageService: ISecretStorageService
+		@ISecretStorageService private readonly secretStorageService: ISecretStorageService,
+		@IDialogService private readonly dialogService: IDialogService
 	) {
 		super();
 
@@ -97,6 +101,39 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 			this.logService.error(`${LOG_PREFIX} getIdentity failed: ${toErrorMessage(error)}`);
 			throw error;
 		}
+	}
+
+	async signOut(): Promise<boolean> {
+		const { confirmed } = await this.dialogService.confirm({
+			message: localize('quantlabHostIdentity.signOut.confirm', "Sign out of Delta Plus in both views, the terminal and the workbench?"),
+			primaryButton: localize({ key: 'quantlabHostIdentity.signOut.primary', comment: ['&& denotes a mnemonic'] }, "&&Sign Out"),
+		});
+		if (!confirmed) {
+			this.logService.info(`${LOG_PREFIX} sign-out cancelled by the user; nothing sent to the host`);
+			return false;
+		}
+
+		const what = 'sign-out';
+		let raw: unknown;
+		try {
+			raw = await this.invokeSignOut();
+		} catch (error) {
+			this.logService.error(`${LOG_PREFIX} ${what} failed: ${toErrorMessage(error)}`);
+			throw error;
+		}
+		const data = this.unwrapAnswer(raw, what);
+		if (data !== null) {
+			const error = new Error(`QuantLab host data: the ${what} answer carries data; the contract says null`);
+			this.logService.error(`${LOG_PREFIX} ${error.message}`);
+			throw error;
+		}
+		this.logService.info(`${LOG_PREFIX} signed out by the host`);
+		return true;
+	}
+
+	/** Transport seam (overridden by the unit test): the sign-out `ipcRenderer.invoke`. */
+	protected invokeSignOut(): Promise<unknown> {
+		return ipcRenderer.invoke(QUANTLAB_HOST_IDENTITY_SIGN_OUT_CHANNEL, QUANTLAB_HOST_IDENTITY_SIGN_OUT_REQUEST);
 	}
 
 	/** Transport seam (overridden by the unit test): the one `ipcRenderer.invoke` of the contract. */
@@ -258,24 +295,6 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 		}
 
 		this._onDidChangeIdentity.fire();
-		void this.notifyExtension();
-	}
-
-	// REMOVED when the extension moves to vscode.quantlabHost (rule 2; OPEN in LOGIN+DATA)
-	private async notifyExtension(): Promise<void> {
-		if (!CommandsRegistry.getCommand(QUANTLAB_EXT_DID_CHANGE_COMMAND)) {
-			// Contract section 3: the extension is not active, so nothing is sent; it pulls with
-			// `_quantlab.hostIdentity.get` at its activation.
-			this.logService.trace(`${LOG_PREFIX} extension not active; it pulls at activation`);
-			return;
-		}
-
-		try {
-			await this.commandService.executeCommand(QUANTLAB_EXT_DID_CHANGE_COMMAND);
-		} catch (error) {
-			this.logService.error(`${LOG_PREFIX} the extension's didChange command failed: ${toErrorMessage(error)}`);
-			this.notificationService.error(localize('quantlabHostIdentity.extensionNotifyFailed', "The Quantlab extension could not be told that the sign-in changed: {0}", toErrorMessage(error)));
-		}
 	}
 
 	private async purgeLegacyLoginKeys(): Promise<void> {
@@ -297,9 +316,6 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 	}
 }
 
-// Eager: the extension-facing `get` command below must exist before the extension host can call it.
+// Eager: the legacy-key purge runs at window start, and the `changed` listener is attached from the start.
+// No command is registered here (rule 2): the identity reaches the extension host only through `vscode.quantlabHost`.
 registerSingleton(IQuantlabHostIdentityService, QuantlabHostIdentityService, InstantiationType.Eager);
-
-// The extension host reaches the host identity only through this command (contract section 3).
-// REMOVED when the extension moves to vscode.quantlabHost (rule 2; OPEN in LOGIN+DATA)
-CommandsRegistry.registerCommand(QUANTLAB_EXT_GET_COMMAND, accessor => accessor.get(IQuantlabHostIdentityService).getIdentity());

@@ -20,7 +20,6 @@ import { registerDiagnosticsView } from './quantbook/shell/registerDiagnosticsVi
 import { registerFunctionCatalogView } from './quantbook/shell/registerFunctionCatalogView';
 import { registerLocalFirstStatus } from './quantbook/shell/registerLocalFirstStatus';
 import { SqlQueryViewProvider } from './quantbook/shell/SqlQueryViewProvider';
-import { registerQuantbookMcpServer } from './quantbook/mcp/mcpServer';
 import type { SessionInstance } from './quantbook/types';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
@@ -66,7 +65,7 @@ import { TrustManager } from './core/trust/TrustManager';
 import { StatsEngine } from './stats/StatsEngine';
 import { PythonBootstrap } from './core/engine/PythonBootstrap';
 import { ServerApiClient } from './core/server/ServerApiClient';
-import { DeltaPlusAuthProvider } from './auth/DeltaPlusAuthProvider';
+import { DeltaPlusAuthProvider, HOST_IDENTITY_UNAVAILABLE } from './auth/DeltaPlusAuthProvider';
 import { DataViewManager } from './views/DataViewManager';
 import { QuantLabHome } from './auth/QuantLabHome';
 import { DataService } from './core/engine/DataService';
@@ -100,14 +99,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(authProvider);
 
 	// Sign-in / sign-out commands.
-	// The extension has no sign-in of its own: the host identity is the only source and sign-in /
-	// sign-out happen in the Quantlab terminal view, so both commands say where to go.
+	// The extension has no sign-in of its own: the host identity is the only source and sign-in happens
+	// in the Quantlab terminal view, so the sign-in command says where to go. Sign-out goes to the host
+	// through vscode.quantlabHost (rule 2: the API object only this built-in extension receives); the
+	// workbench asks the user to confirm, and the new identity arrives on onDidChangeIdentity. The
+	// command returns nothing: no identity or answer reaches whoever executes it.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.signIn', async () => {
 			void vscode.window.showInformationMessage('Sign in happens in the Quantlab terminal view.');
 		}),
-		vscode.commands.registerCommand('quantlab.signOut', async () => {
-			void vscode.window.showInformationMessage('Sign out happens in the Quantlab terminal view.');
+		vscode.commands.registerCommand('quantlab.signOut', async (): Promise<void> => {
+			const host = vscode.quantlabHost;
+			if (host === undefined) {
+				void vscode.window.showErrorMessage(`Sign out failed: ${HOST_IDENTITY_UNAVAILABLE}.`);
+				return;
+			}
+			try {
+				await host.signOut();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+				void vscode.window.showErrorMessage(typeof code === 'string'
+					? `Sign out failed (${code}): ${message}`
+					: `Sign out failed, the host gave no answer: ${message}`);
+			}
 		})
 	);
 
@@ -434,7 +449,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 // The ONE place Quantbook runtime entry points are registered (commands, the reactive kernel, the
-// `.qnb` serializer and controller, the MCP server, the Activity Bar views, diagnostics, the status
+// `.qnb` serializer and controller, the Activity Bar views, diagnostics, the status
 // item). Called only when readQuantbookAuthorisation() says so; a new Quantbook registration goes here.
 function registerQuantbookRuntime(context: vscode.ExtensionContext, isTrustReady: () => boolean): void {
 	// Wave H2 (R10 part 2/2, 2026-06-19): the `.qbook` custom editor -- double-clicking a
@@ -457,12 +472,6 @@ function registerQuantbookRuntime(context: vscode.ExtensionContext, isTrustReady
 	// FE-1.5 W-N (N-1): the NotebookController that runs `.qnb` Python cells against the focused grid's
 	// reactive kernel (bind-on-first-execute, serialized, lifetime-safe). Built after the manager exists.
 	registerReactiveNotebookController(context, builtKernelManager);
-
-	// FE-BEYOND B1 (W3): the read-only Quantbook MCP server. Runs IN this host so its tools read the
-	// SAME live per-panel Session the grid renders (the shared-state requirement). Registered AFTER the
-	// reactive notebook controller (W3 anchor; W4/FE-5 uses the later panel-providers anchor) so the two
-	// parallel windows never edit overlapping lines here.
-	registerQuantbookMcpServer(context, builtKernelManager);
 
 	// FE-5 (W4 product shell): the Quantbook Activity Bar surface (Live-Python sidebar + the
 	// `quantbook.hasOpenGrid` context key gating the quantbook views). Registered AFTER the panel
@@ -586,8 +595,8 @@ async function initializeServerConnection(
 ): Promise<void> {
 	const output = getServerOutputChannel();
 	try {
-		// Pull the sign-in state from the host (a tick sent before the provider registered its
-		// command is not replayed, so this pull is the start-up read).
+		// Read the sign-in state from the host at start-up; later changes arrive through
+		// vscode.quantlabHost.onDidChangeIdentity.
 		const loaded = await authProvider.initializeFromHost();
 		output.appendLine(
 			`[${new Date().toISOString()}] Delta Plus: ${loaded ? 'Signed in at the host' : 'Not signed in (sign in in the terminal view)'}`

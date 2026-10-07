@@ -115,6 +115,7 @@ import { ExtHostWebviewViews } from './extHostWebviewView.js';
 import { IExtHostWindow } from './extHostWindow.js';
 import { IExtHostWorkspace } from './extHostWorkspace.js';
 import { ExtHostChatContext } from './extHostChatContext.js';
+import { ExtHostQuantlabHost } from './extHostQuantlabHost.js';
 if (globalThis.QL_TEST_BUILD) { await import('./test-instruments/index.js'); }
 
 export interface IExtensionRegistries {
@@ -177,6 +178,7 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 	rpcProtocol.set(ExtHostContext.ExtHostAuthentication, extHostAuthentication);
 	rpcProtocol.set(ExtHostContext.ExtHostChatProvider, extHostLanguageModels);
 	rpcProtocol.set(ExtHostContext.ExtHostDataChannels, extHostDataChannels);
+	const extHostQuantlabHost = rpcProtocol.set(ExtHostContext.ExtHostQuantlabHost, new ExtHostQuantlabHost(rpcProtocol, extHostLogService, initData.environment.appRoot));
 
 	// automatically create and register addressable instances
 	const extHostDecorations = rpcProtocol.set(ExtHostContext.ExtHostDecorations, accessor.get(IExtHostDecorations));
@@ -1651,6 +1653,7 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 			tests,
 			window,
 			workspace,
+			...extHostQuantlabHost.createApiProperties(extension),
 			// types
 			Breakpoint: extHostTypes.Breakpoint,
 			TerminalOutputAnchor: extHostTypes.TerminalOutputAnchor,

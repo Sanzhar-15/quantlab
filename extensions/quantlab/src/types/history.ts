@@ -18,7 +18,7 @@ export interface HistoryEntry {
 	progress?: number;
 	progressMessage?: string;
 	passed?: boolean;
-	metrics?: Record<string, number>;
+	metrics?: Record<string, number | null>;
 	warnings?: string[];
 	errorMessage?: string;
 	artifactPath: string;
@@ -36,6 +36,6 @@ export interface HistoryQuery {
 }
 
 export interface HistoryArtifacts {
-	signals?: Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number }>;
-	equity?: Array<{ t: number; v: number }>;
+	signals?: Array<{ t: number; type: 'entry' | 'exit'; label?: string; price?: number | null }>;
+	equity?: Array<{ t: number; v: number | null }>;
 }

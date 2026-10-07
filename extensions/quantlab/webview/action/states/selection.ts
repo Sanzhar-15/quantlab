@@ -5,7 +5,7 @@
 
 import type { ActionSelectionState, QuickActionType, StrategyInfo } from '../../../src/types/action';
 import type { HistoryEntry } from '../../../src/types/history';
-import { escapeHtml, formatRelativeTime, formatRunType, pickMetric } from '../utils';
+import { escapeHtml, formatMetricValue, formatRelativeTime, formatRunType, pickMetric } from '../utils';
 
 const QUICK_ACTIONS: Array<{ type: QuickActionType; label: string; description: string }> = [
 	{ type: 'backtest', label: 'Backtest', description: 'Run strategy on historical data' },
@@ -132,7 +132,7 @@ function renderRunItem(run: HistoryEntry): string {
 				<div class="recent-run-meta">
 					<span class="status-pill ${statusClass}">${escapeHtml(statusLabel)}</span>
 					<span>${escapeHtml(relativeTime)}</span>
-					${metric ? `<span>${escapeHtml(metric.label)}: ${metric.value.toFixed(2)}</span>` : ''}
+					${metric ? `<span>${escapeHtml(metric.label)}: ${escapeHtml(formatMetricValue(metric.value))}</span>` : ''}
 				</div>
 			</div>
 			<div class="recent-run-actions">

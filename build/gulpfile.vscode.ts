@@ -39,6 +39,9 @@ gulp.task(bundleQuantlabEngineTask);
 import { quantbookEngineStream, stageQuantbookEngineTask } from './quantbook/bundle.ts';
 gulp.task(stageQuantbookEngineTask);
 // --- end quantlab engine packaging ---
+// --- quantlab built-in extension module type (F-PACK-14) ---
+import { findEsmMainsWithoutModuleType } from './lib/extensionModuleType.ts';
+// --- end quantlab built-in extension module type ---
 
 
 const glob = promisify(globCallback);
@@ -111,7 +114,14 @@ const vscodeResourceIncludes = [
 	'out-build/vs/editor/common/languages/highlights/*.scm',
 
 	// Tree Sitter injection queries
-	'out-build/vs/editor/common/languages/injections/*.scm'
+	'out-build/vs/editor/common/languages/injections/*.scm',
+
+	// QuantLab terminal view (R-52)
+	'out-build/vs/code/electron-main/ql-client/terminal/preload.cjs',
+	'out-build/vs/code/electron-main/ql-client/terminal/renderer/**',
+
+	// QuantLab host (U7): the bundled chrome policy file (the chrome keys the user cannot change, CH-2)
+	'out-build/vs/code/electron-main/qlHost/ql-chrome-policy.json'
 ];
 
 const vscodeResources = [
@@ -160,7 +170,8 @@ const sourceMappingURLBase = `https://main.vscode-cdn.net/sourcemaps/${commit}`;
 const minifyVSCodeTask = task.define('minify-vscode', task.series(
 	bundleVSCodeTask,
 	util.rimraf('out-vscode-min'),
-	optimize.minifyTask('out-vscode', `${sourceMappingURLBase}/core`)
+	// QuantLab host (F-PACK-15): the generated client tree is already-built output; it is copied as it is (R-52 resources above)
+	optimize.minifyTask('out-vscode', `${sourceMappingURLBase}/core`, ['vs/code/electron-main/ql-client/**'])
 ));
 gulp.task(minifyVSCodeTask);
 
@@ -508,6 +519,15 @@ function patchWin32DependenciesTask(destinationFolderName: string) {
 
 const buildRoot = path.dirname(root);
 
+// --- quantlab built-in extension module type (F-PACK-14) ---
+const checkBuiltinExtensionModuleTypeTask = task.define('check-builtin-extension-module-type', async () => {
+	const problems = findEsmMainsWithoutModuleType(path.join(root, '.build', 'extensions'));
+	if (problems.length > 0) {
+		throw new Error(`Built-in extensions the extension host cannot load:\n${problems.join('\n')}`);
+	}
+});
+// --- end quantlab built-in extension module type ---
+
 const BUILD_TARGETS = [
 	{ platform: 'win32', arch: 'x64' },
 	{ platform: 'win32', arch: 'arm64' },
@@ -529,6 +549,7 @@ BUILD_TARGETS.forEach(buildTarget => {
 
 		const tasks = [
 			compileNativeExtensionsBuildTask,
+			checkBuiltinExtensionModuleTypeTask, // quantlab (F-PACK-14)
 			util.rimraf(path.join(buildRoot, destinationFolderName)),
 			packageTask(platform, arch, sourceFolderName, destinationFolderName, opts)
 		];

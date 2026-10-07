@@ -478,8 +478,9 @@ export class RemoveStoredInput extends Action2 {
 		});
 	}
 
-	run(accessor: ServicesAccessor, scope: StorageScope, id?: string): void {
-		accessor.get(IMcpRegistry).clearSavedInputs(scope, id);
+	run(accessor: ServicesAccessor, scope: StorageScope, id?: string): Promise<void> {
+		// Returned, so that a stored input that cannot be read rejects to the caller of the command.
+		return accessor.get(IMcpRegistry).clearSavedInputs(scope, id);
 	}
 }
 
@@ -493,9 +494,10 @@ export class EditStoredInput extends Action2 {
 		});
 	}
 
-	run(accessor: ServicesAccessor, inputId: string, uri: URI | undefined, configSection: string, target: ConfigurationTarget): void {
+	run(accessor: ServicesAccessor, inputId: string, uri: URI | undefined, configSection: string, target: ConfigurationTarget): Promise<void> {
 		const workspaceFolder = uri && accessor.get(IWorkspaceContextService).getWorkspaceFolder(uri);
-		accessor.get(IMcpRegistry).editSavedInput(inputId, workspaceFolder || undefined, configSection, target);
+		// Returned, so that a stored input that cannot be read rejects to the caller of the command.
+		return accessor.get(IMcpRegistry).editSavedInput(inputId, workspaceFolder || undefined, configSection, target);
 	}
 }
 

@@ -24,16 +24,17 @@ export const QUANTLAB_HOST_IDENTITY_GET_CHANNEL = 'vscode:quantlab-host-identity
 /** The broadcast channel the main process uses as a TICK ("ask again"); its payload is `null` (contract amendment A-1). */
 export const QUANTLAB_HOST_IDENTITY_CHANGED_CHANNEL = 'vscode:quantlab-host-identity:changed';
 
-// REMOVED when the extension moves to vscode.quantlabHost (rule 2; OPEN in LOGIN+DATA)
-/** Extension-facing command: the extension host calls it to pull the identity. */
-export const QUANTLAB_EXT_GET_COMMAND = '_quantlab.hostIdentity.get';
-
-// REMOVED when the extension moves to vscode.quantlabHost (rule 2; OPEN in LOGIN+DATA)
-/** Extension-side command the service executes on every tick, when the extension has registered it. No argument: the extension pulls. */
-export const QUANTLAB_EXT_DID_CHANGE_COMMAND = '_quantlab.hostIdentity.didChange';
-
 /** The request envelope of the invoke: `{ v: 1, input: null }` (MODCH envelope; the identity op takes no input). */
 export const QUANTLAB_HOST_IDENTITY_GET_REQUEST = Object.freeze({ v: 1, input: null });
+
+/**
+ * IPC-DATA sign-out amendment: the invoke channel that signs the host out (every view of the app). Its answer is
+ * `{ ok: true, data: null }` or `{ ok: false, code: 'server', ... }`; main moves the epoch and sends the `changed` tick.
+ */
+export const QUANTLAB_HOST_IDENTITY_SIGN_OUT_CHANNEL = 'vscode:quantlab-host-identity:sign-out';
+
+/** The request envelope of the sign-out invoke: `{ v: 1, input: null }` (any other input is answered `bad-request`). */
+export const QUANTLAB_HOST_IDENTITY_SIGN_OUT_REQUEST = Object.freeze({ v: 1, input: null });
 
 /** IPC-DATA: the data module's invoke channels. Every invoke carries the envelope `{ v: 1, input }`. */
 export const QUANTLAB_HOST_DATA_REQUEST_CHANNEL = 'vscode:quantlab-host-data:request';
@@ -138,6 +139,8 @@ export interface IQuantlabHostUser {
 	readonly id: string;
 	readonly email: string;
 	readonly name: string | undefined;
+	/** Required: Go's tier (PLAN-FINAL section 3.2 item 1). Not displayed until E2. */
+	readonly tier: string;
 }
 
 /**
@@ -164,6 +167,15 @@ export interface IQuantlabHostIdentityService {
 	 * error to the user. A rejection is never to be read as "signed out".
 	 */
 	getIdentity(): Promise<QuantlabIdentity>;
+
+	/**
+	 * Sign out of Delta Plus in every view. Asks the user first with a workbench modal confirm; on cancel
+	 * it resolves `false` and sends nothing. On yes it invokes the host's sign-out and resolves `true`
+	 * after an `ok` answer. A refusal REJECTS with a {@link QuantlabHostError} carrying its code; a
+	 * failed invoke or a malformed answer rejects with a plain Error. Stores empty on the `changed` tick
+	 * that follows, not here.
+	 */
+	signOut(): Promise<boolean>;
 
 	/**
 	 * One authorised data call (IPC-DATA `request`). Resolves with the host's `data`. A refusal REJECTS
@@ -236,7 +248,7 @@ export function parseIdentity(value: unknown): QuantlabIdentity {
 	if (!isRecord(user)) {
 		throw new Error('QuantLab host identity: a signed-in answer has no user object');
 	}
-	assertOnlyKeys(user, ['id', 'email', 'name'], 'the user', IDENTITY_ERROR_PREFIX);
+	assertOnlyKeys(user, ['id', 'email', 'name', 'tier'], 'the user', IDENTITY_ERROR_PREFIX);
 	if (typeof user.id !== 'string') {
 		throw new Error('QuantLab host identity: user.id is not a string');
 	}
@@ -246,10 +258,13 @@ export function parseIdentity(value: unknown): QuantlabIdentity {
 	if (user.name !== undefined && typeof user.name !== 'string') {
 		throw new Error('QuantLab host identity: user.name is neither a string nor absent');
 	}
+	if (typeof user.tier !== 'string' || user.tier === '') {
+		throw new Error('QuantLab host identity: user.tier is not a non-empty string');
+	}
 
 	const epoch = parseEpoch(value.epoch, IDENTITY_ERROR_PREFIX);
 
-	return { epoch, signedIn: true, user: { id: user.id, email: user.email, name: user.name } };
+	return { epoch, signedIn: true, user: { id: user.id, email: user.email, name: user.name, tier: user.tier } };
 }
 
 /**

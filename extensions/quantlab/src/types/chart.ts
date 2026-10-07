@@ -111,4 +111,5 @@ export type ChartInboundMessage =
 	| { type: 'dropFile'; filePath: string }
 	| { type: 'dropRun'; runId: string }
 	| { type: 'toggleFullscreen' }
-	| { type: 'selectTool'; tool: string | null };
+	| { type: 'selectTool'; tool: string | null }
+	| { type: 'chartDrawn'; bars: number; width: number; height: number };
