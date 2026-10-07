@@ -25,6 +25,15 @@ class CSVLoaderError(Exception):
     pass
 
 
+def _utc(value: datetime) -> datetime:
+    """The one timezone rule of this loader: a naive datetime is UTC (as backtest() reads its start/end);
+    an aware one is converted to UTC. Every timestamp it yields and both filters go through here, so the
+    filter comparisons never mix naive and aware values."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class CSVLoader:
     """
     Load market data from CSV files.
@@ -127,20 +136,20 @@ class CSVLoader:
         # Use detected format if available
         if self._detected_date_format:
             try:
-                return datetime.strptime(date_str, self._detected_date_format)
+                return _utc(datetime.strptime(date_str, self._detected_date_format))
             except ValueError:
                 pass  # Fall through to auto-detect
 
         # Use specified format
         if self.date_format:
-            return datetime.strptime(date_str, self.date_format)
+            return _utc(datetime.strptime(date_str, self.date_format))
 
         # Auto-detect format
         for fmt in self.DATE_FORMATS:
             try:
                 result = datetime.strptime(date_str, fmt)
                 self._detected_date_format = fmt  # Cache for future rows
-                return result
+                return _utc(result)
             except ValueError:
                 continue
 
@@ -195,8 +204,14 @@ class CSVLoader:
             end: Optional end date filter
 
         Yields:
-            Bar objects
+            Bar objects (timestamps UTC-aware)
+
+        Raises:
+            CSVLoaderError: a row that cannot be read, naming its row number and cells; no row is skipped
+            silently (a blank line holds no data and is not a row)
         """
+        start = _utc(start) if start is not None else None
+        end = _utc(end) if end is not None else None
         with open(self.path, "r", newline="", encoding="utf-8-sig") as f:
             reader = csv.reader(f, delimiter=self.delimiter)
 
@@ -218,11 +233,13 @@ class CSVLoader:
                 raise CSVLoaderError(f"Could not find close column. Headers: {headers}")
 
             # Read data rows
+            needed = max(i for i in (ts_idx, open_idx, high_idx, low_idx, close_idx, volume_idx) if i is not None) + 1
             for row_num, row in enumerate(reader, start=2):
+                if not row:
+                    continue  # a blank line: no cells, no data
+                if len(row) < needed:
+                    raise CSVLoaderError(f"{self.path}: row {row_num} has {len(row)} cells, {needed} needed: {row!r}")
                 try:
-                    if len(row) < max(ts_idx, close_idx) + 1:
-                        continue  # Skip incomplete rows
-
                     timestamp = self._parse_date(row[ts_idx])
 
                     # Apply date filters
@@ -248,9 +265,8 @@ class CSVLoader:
                         volume=volume,
                     )
 
-                except Exception as e:
-                    logger.warning(f"Error parsing row {row_num}: {e}")
-                    continue
+                except (ValueError, ArithmeticError, CSVLoaderError) as e:
+                    raise CSVLoaderError(f"{self.path}: row {row_num} cannot be read ({e}): {row!r}") from e
 
     def get_date_range(self) -> tuple[datetime, datetime] | None:
         """
