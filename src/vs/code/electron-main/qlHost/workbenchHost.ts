@@ -23,6 +23,7 @@ import { IAdoptedWorkbench } from './adopt.js';
 import { QlDialogMainService } from './dialogs.js';
 import { IQlWorkbenchListener, QlWindowsGate } from './gate.js';
 import { secureWorkbenchContents } from './security.js';
+import { IQlFramePolicy } from './securityPolicy.js';
 import type { IQlVisibleTarget } from './standIn.js';
 import { createToggleSequencer, type ToggleView } from './toggleSequencer.js';
 
@@ -99,6 +100,9 @@ export interface IQlWorkbenchHostDeps {
 
 	/** Opens `url` in the system browser. */
 	openExternal(url: string): void;
+
+	/** Review c1 M2: the workbench document and webview scheme the adopted contents' navigation decisions use. */
+	readonly framePolicy: IQlFramePolicy;
 }
 
 export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener {
@@ -405,7 +409,7 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		const disposables = new DisposableStore();
 
 		try {
-			disposables.add(secureWorkbenchContents(workbench.webContents, { logService: this.deps.logService, openExternal: url => this.deps.openExternal(url) }));
+			disposables.add(secureWorkbenchContents(workbench.webContents, { logService: this.deps.logService, policy: this.deps.framePolicy, openExternal: url => this.deps.openExternal(url) }));
 			disposables.add(this.watchKeys(workbench.webContents)); // QuantLab host (U6): the toggle key and the overlay key
 
 			// hidden until it signalled ready: the terminal stays on screen meanwhile

@@ -132,6 +132,7 @@ import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type Te
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
 import { QlWorkbenchHost } from './qlHost/workbenchHost.js';
+import { IQlFramePolicy, isGrantedPermission } from './qlHost/securityPolicy.js';
 // QuantLab host (U6): the chrome seed (the four chrome settings of a fresh default profile)
 import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
 
@@ -176,6 +177,14 @@ export class CodeApplication extends Disposable {
 		this.registerListeners();
 	}
 
+	/** QuantLab host (review c1 M2 + M3): the document the CodeWindow loads (`windowImpl.ts` `load`) and the webview scheme. */
+	private qlFramePolicy(): IQlFramePolicy {
+		return {
+			workbenchDocument: FileAccess.asBrowserUri(`vs/code/electron-browser/workbench/workbench${this.environmentMainService.isBuilt ? '' : '-dev'}.html`).toString(true),
+			webviewScheme: Schemas.vscodeWebview
+		};
+	}
+
 	private configureSession(): void {
 
 		//#region Security related measures (https://electronjs.org/docs/tutorial/security)
@@ -183,48 +192,22 @@ export class CodeApplication extends Disposable {
 		// !!! DO NOT CHANGE without consulting the documentation !!!
 		//
 
-		const isUrlFromWindow = (requestingUrl?: string | undefined) => requestingUrl?.startsWith(`${Schemas.vscodeFileResource}://${VSCODE_AUTHORITY}`);
-		const isUrlFromWebview = (requestingUrl: string | undefined) => requestingUrl?.startsWith(`${Schemas.vscodeWebview}://`);
+		// QuantLab host (review c1 M3): one decision for the request and the check handler, by frame ownership (the exact
+		// workbench document, webviews it created and their own frames): `clipboard-sanitized-write` and `fullscreen`, nothing
+		// else (the fork's prefix match granted `pointerLock`, clipboard reads and `local-fonts`; media and notifications were
+		// removed in U5). See qlHost/securityPolicy.ts.
+		const framePolicy = this.qlFramePolicy();
 
-		// QuantLab host (U5): `notifications` is no longer allowed (the fork allowed it for core documents and webviews)
-		const alwaysAllowedPermissions = new Set(['pointerLock']);
-
-		const allowedPermissionsInWebview = new Set([
-			...alwaysAllowedPermissions,
-			'clipboard-read',
-			'clipboard-sanitized-write',
-			// TODO(deepak1556): Should be removed once migration is complete
-			// https://github.com/microsoft/vscode/issues/239228
-			'deprecated-sync-clipboard-read',
-		]);
-
-		const allowedPermissionsInCore = new Set([
-			...alwaysAllowedPermissions,
-			// QuantLab host (U5): `media` (camera, microphone) is no longer allowed for core documents
-			'local-fonts',
-			// TODO(deepak1556): Should be removed once migration is complete
-			// https://github.com/microsoft/vscode/issues/239228
-			'deprecated-sync-clipboard-read',
-		]);
-
-		session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
-			if (isUrlFromWebview(details.requestingUrl)) {
-				return callback(allowedPermissionsInWebview.has(permission));
+		session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+			const granted = isGrantedPermission(webContents, permission, details.requestingUrl, details.isMainFrame, framePolicy);
+			if (!granted) {
+				this.logService.warn(`QuantLab host: denied permission request ${permission} from ${details.requestingUrl} (${details.isMainFrame ? 'main frame' : 'sub-frame'})`);
 			}
-			if (isUrlFromWindow(details.requestingUrl)) {
-				return callback(allowedPermissionsInCore.has(permission));
-			}
-			return callback(false);
+			return callback(granted);
 		});
 
-		session.defaultSession.setPermissionCheckHandler((_webContents, permission, _origin, details) => {
-			if (isUrlFromWebview(details.requestingUrl)) {
-				return allowedPermissionsInWebview.has(permission);
-			}
-			if (isUrlFromWindow(details.requestingUrl)) {
-				return allowedPermissionsInCore.has(permission);
-			}
-			return false;
+		session.defaultSession.setPermissionCheckHandler((webContents, permission, _origin, details) => {
+			return isGrantedPermission(webContents, permission, details.requestingUrl, details.isMainFrame, framePolicy);
 		});
 
 		//#endregion
@@ -1337,6 +1320,7 @@ export class CodeApplication extends Disposable {
 			dialogs: this.requireQlDialogMainService(dialogMainService),
 			lifecycleMainService: this.lifecycleMainService,
 			logService: this.logService,
+			framePolicy: this.qlFramePolicy(),
 			openWorkbench: () => {
 				const protocolUrls = launchProtocolUrls;
 				launchProtocolUrls = undefined;
