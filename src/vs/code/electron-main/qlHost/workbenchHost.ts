@@ -132,7 +132,7 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 
 	//#region start
 
-	/** Called once, after the terminal host started. */
+	/** Called once, from the terminal host's onBeforeShow (review c1 M7). */
 	attach(terminalHost: TerminalHost): void {
 		if (this.terminalHost) {
 			throw new Error('QuantLab host (U5): the workbench host is already attached');
@@ -153,8 +153,8 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		if (perfDelayedSwitchActive()) {
 			terminalHost.host.log(`mutant ${PERF_DELAYED_SWITCH_MUTANT} ACTIVE`);
 		}
-		// From here on the toggle key and the overlay key are watched: a key pressed on the terminal page BEFORE this line reached
-		// no watch (the page can finish loading before startTerminalHost() returns). The line makes that gap readable in the log.
+		// Review c1 M7: called from the start's onBeforeShow, before the window is shown and the terminal's first document loads,
+		// so no key and no close of the start reaches the host before these watches.
 		terminalHost.host.log('workbench host attached');
 		this.attached.complete(terminalHost);
 	}

@@ -1346,7 +1346,11 @@ export class CodeApplication extends Disposable {
 			devTools: !this.environmentMainService.isBuilt,
 			preloadPath,
 			rendererDir,
-			openQuantlab: intent => qlWorkbenchHost.openQuantlab(intent)
+			openQuantlab: intent => qlWorkbenchHost.openQuantlab(intent),
+			// QuantLab host (review c1 M7): the workbench host takes over the window's close (the quit handshake runs through the
+			// lifecycle before the window goes), the toggle key and the gate's requests while the window is still hidden and nothing
+			// is loaded: no key at the first did-finish-load and no close during the start reaches a host without them
+			onBeforeShow: started => qlWorkbenchHost.attach(started)
 		};
 
 		let terminalHost: TerminalHost;
@@ -1368,9 +1372,6 @@ export class CodeApplication extends Disposable {
 		const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
 		updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
 
-		// QuantLab host (U5): the workbench host takes over the window's close (the quit handshake runs through the lifecycle
-		// before the window goes), the toggle key, and the gate's requests
-		qlWorkbenchHost.attach(terminalHost);
 
 		// QuantLab host (DRIVER): TEST BUILDS ONLY. `globalThis.QL_TEST_BUILD` is a constant `false` in a product bundle (esbuild define,
 		// build/lib/optimize.ts), so esbuild drops this block and the dynamic import with it: a product bundle carries neither the dump
