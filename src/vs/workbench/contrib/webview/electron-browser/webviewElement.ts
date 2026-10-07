@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { CodeWindow } from '../../../../base/browser/window.js';
 import { Delayer } from '../../../../base/common/async.js';
 import { VSBuffer, VSBufferReadableStream } from '../../../../base/common/buffer.js';
 import { Schemas } from '../../../../base/common/network.js';
@@ -19,7 +20,7 @@ import { INativeHostService } from '../../../../platform/native/common/native.js
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
 import { IRemoteAuthorityResolverService } from '../../../../platform/remote/common/remoteAuthorityResolver.js';
 import { ITunnelService } from '../../../../platform/tunnel/common/tunnel.js';
-import { FindInFrameOptions, IWebviewManagerService } from '../../../../platform/webview/common/webviewManagerService.js';
+import { FindInFrameOptions, IWebviewManagerService, WebviewWindowId } from '../../../../platform/webview/common/webviewManagerService.js';
 import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
 import { WebviewThemeDataProvider } from '../browser/themeing.js';
 import { WebviewInitInfo } from '../browser/webview.js';
@@ -38,6 +39,9 @@ export class ElectronWebviewElement extends WebviewElement {
 
 	private readonly _webviewMainService: IWebviewManagerService;
 	private readonly _iframeDelayer = this._register(new Delayer<void>(200));
+
+	// QuantLab host (review c2 M2 + M3): the window whose main-process registry holds this frame's registration
+	private _qlRegisteredIn: WebviewWindowId | undefined;
 
 	protected override get platform() { return 'electron'; }
 
@@ -83,7 +87,27 @@ export class ElectronWebviewElement extends WebviewElement {
 		// Make sure keyboard handler knows it closed (#71800)
 		this._webviewKeyboardHandler.didBlur();
 
+		if (this._qlRegisteredIn) {
+			this._webviewMainService.qlUnregisterWebview(this._qlRegisteredIn, this.id);
+			this._qlRegisteredIn = undefined;
+		}
+
 		super.dispose();
+	}
+
+	/**
+	 * QuantLab host (review c2 M2 + M3): the main process owns a webview document only in a frame the workbench registered
+	 * (`qlHost/securityPolicy.ts`): this frame's name and authority reach it before the frame gets its `src`.
+	 */
+	protected override async qlRegisterFrame(encodedWebviewOrigin: string, targetWindow: CodeWindow): Promise<void> {
+		const windowId: WebviewWindowId = { windowId: targetWindow.vscodeWindowId };
+		await this._webviewMainService.qlRegisterWebview(windowId, this.id, encodedWebviewOrigin);
+
+		if (this.element) {
+			this._qlRegisteredIn = windowId;
+		} else {
+			await this._webviewMainService.qlUnregisterWebview(windowId, this.id); // disposed while the registration was under way
+		}
 	}
 
 	protected override webviewContentEndpoint(iframeId: string): string {

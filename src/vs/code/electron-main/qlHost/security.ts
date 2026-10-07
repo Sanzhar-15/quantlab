@@ -6,7 +6,7 @@
 // QuantLab host (U5): the workbench column of the security matrix, for the contents the host adopted.
 //
 //  - navigations and redirects, main frame and sub-frames: only to a document the workbench owns (`securityPolicy.ts`,
-//    review c1 M2: the exact workbench document, webviews the workbench created and their own frames); the fork's
+//    review c1 M2, c2 M2: the exact workbench document, webviews the workbench registered and their own frames); the fork's
 //    `web-contents-created` listener also cancels every main-frame `will-navigate`;
 //  - everything else is cancelled and logged by name;
 //  - new windows are denied (the host holds ONE workbench window; there is no auxiliary window), an `https:` URL goes to the
@@ -47,7 +47,7 @@ export function secureWorkbenchContents(contents: WebContents, deps: IQlWorkbenc
 	});
 
 	const guard = (kind: 'navigation' | 'redirect') => (event: FrameNavigationEvent | RedirectEvent) => {
-		if (isAllowedNavigation(event.url, event.isMainFrame, event.frame, deps.policy)) {
+		if (isAllowedNavigation(contents, event.url, event.isMainFrame, event.frame, deps.policy)) {
 			return;
 		}
 

@@ -133,6 +133,7 @@ import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
 import { QlWorkbenchHost } from './qlHost/workbenchHost.js';
 import { IQlFramePolicy, isGrantedPermission } from './qlHost/securityPolicy.js';
+import { QlWebviewRegistry } from './qlHost/webviewRegistry.js';
 // QuantLab host (U6): the chrome seed (the four chrome settings of a fresh default profile)
 import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
 
@@ -157,6 +158,10 @@ export class CodeApplication extends Disposable {
 	// QuantLab host (U5): the host's side of the workbench view (the gate and the adoption are in qlHost/)
 	private qlWorkbenchHost: QlWorkbenchHost | undefined;
 
+	// QuantLab host (review c2 M2 + M3): the webviews the workbench registered; written by the webview manager service,
+	// read by the frame policy (navigations, redirects, both permission handlers)
+	private readonly qlWebviewRegistry = new QlWebviewRegistry();
+
 	constructor(
 		private readonly mainProcessNodeIpcServer: NodeIPCServer,
 		private readonly userEnv: IProcessEnvironment,
@@ -177,11 +182,12 @@ export class CodeApplication extends Disposable {
 		this.registerListeners();
 	}
 
-	/** QuantLab host (review c1 M2 + M3): the document the CodeWindow loads (`windowImpl.ts` `load`) and the webview scheme. */
+	/** QuantLab host (review c1 M2 + M3, c2 M2 + M3): the document the CodeWindow loads (`windowImpl.ts` `load`), the webview scheme and the registered webviews. */
 	private qlFramePolicy(): IQlFramePolicy {
 		return {
 			workbenchDocument: FileAccess.asBrowserUri(`vs/code/electron-browser/workbench/workbench${this.environmentMainService.isBuilt ? '' : '-dev'}.html`).toString(true),
-			webviewScheme: Schemas.vscodeWebview
+			webviewScheme: Schemas.vscodeWebview,
+			webviews: contents => this.qlWebviewRegistry.of(contents)
 		};
 	}
 
@@ -193,7 +199,7 @@ export class CodeApplication extends Disposable {
 		//
 
 		// QuantLab host (review c1 M3): one decision for the request and the check handler, by frame ownership (the exact
-		// workbench document, webviews it created and their own frames): `clipboard-sanitized-write` and `fullscreen`, nothing
+		// workbench document, webviews it registered and their own frames): `clipboard-sanitized-write` and `fullscreen`, nothing
 		// else (the fork's prefix match granted `pointerLock`, clipboard reads and `local-fonts`; media and notifications were
 		// removed in U5). See qlHost/securityPolicy.ts.
 		const framePolicy = this.qlFramePolicy();
@@ -1057,7 +1063,7 @@ export class CodeApplication extends Disposable {
 		services.set(IWebContentExtractorService, new SyncDescriptor(NativeWebContentExtractorService, undefined, false /* proxied to other processes */));
 
 		// Webview Manager
-		services.set(IWebviewManagerService, new SyncDescriptor(WebviewMainService));
+		services.set(IWebviewManagerService, new SyncDescriptor(WebviewMainService, [this.qlWebviewRegistry])); // QuantLab host (review c2 M2 + M3): the registry the frame policy reads
 
 		// Menubar
 		services.set(IMenubarMainService, new SyncDescriptor(MenubarMainService));
