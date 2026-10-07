@@ -461,7 +461,11 @@ window.addEventListener('message', event => {
 		return;
 	}
 	if (message?.type === 'reducedMotion') {
-		applyReducedMotion(message.mode ?? 'auto');
+		// The host always sends the mode (ChartViewProvider.broadcastReducedMotion); a missing one is a contract break.
+		if (message.mode !== 'auto' && message.mode !== 'always' && message.mode !== 'never') {
+			throw new Error(`chart: the reducedMotion message has no valid mode (${String(message.mode)})`);
+		}
+		applyReducedMotion(message.mode);
 		return;
 	}
 	handler(event.data);

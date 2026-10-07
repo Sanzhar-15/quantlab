@@ -2,7 +2,6 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-
 /**
  * Debugger Service for Time-Travel Debugging.
  *
@@ -164,75 +163,64 @@ export class DebuggerService implements vscode.Disposable {
 	}
 
 	/**
-	 * Load a debug file.
+	 * Load a debug file. Any failure (engine, empty result, unreadable JSON) rejects with a named error.
 	 */
-	async loadDebugFile(filePath: string): Promise<boolean> {
-		try {
-			// Call Python engine to read debug file
-			const data = await this.readDebugFile(filePath);
+	async loadDebugFile(filePath: string): Promise<void> {
+		// Call Python engine to read debug file
+		const data = await this.readDebugFile(filePath);
 
-			if (!data) {
-				return false;
-			}
+		this.metadata = data.metadata;
+		this.totalBars = data.metadata.barCount;
+		this.tradeBarIndices = data.tradeBarIndices;
 
-			this.metadata = data.metadata;
-			this.totalBars = data.metadata.barCount;
-			this.tradeBarIndices = data.tradeBarIndices;
+		// Cache all data
+		this.statesCache.clear();
+		this.conditionsCache.clear();
+		this.signalsCache.clear();
+		this.fillsCache.clear();
 
-			// Cache all data
-			this.statesCache.clear();
-			this.conditionsCache.clear();
-			this.signalsCache.clear();
-			this.fillsCache.clear();
-
-			for (const state of data.states) {
-				this.statesCache.set(state.barIndex, state);
-			}
-
-			for (const condition of data.conditions) {
-				const existing = this.conditionsCache.get(condition.barIndex) || [];
-				existing.push(condition);
-				this.conditionsCache.set(condition.barIndex, existing);
-			}
-
-			for (const signal of data.signals) {
-				const existing = this.signalsCache.get(signal.barIndex) || [];
-				existing.push(signal);
-				this.signalsCache.set(signal.barIndex, existing);
-			}
-
-			for (const fill of data.fills) {
-				const existing = this.fillsCache.get(fill.barIndex) || [];
-				existing.push(fill);
-				this.fillsCache.set(fill.barIndex, existing);
-			}
-
-			// Set up code sync
-			if (this.metadata.strategyPath) {
-				this.codeSyncManager.setStrategyFile(this.metadata.strategyPath);
-				this.codeSyncManager.loadConditions(data.conditions);
-			}
-
-			this.enabled = true;
-			this.currentBarIndex = 0;
-
-			this._onStateChange.fire({
-				type: 'enabled',
-				barIndex: 0,
-				totalBars: this.totalBars,
-			});
-
-			this._onStateChange.fire({
-				type: 'dataLoaded',
-				barIndex: 0,
-				totalBars: this.totalBars,
-			});
-
-			return true;
-		} catch (error) {
-			console.error('Failed to load debug file:', error);
-			return false;
+		for (const state of data.states) {
+			this.statesCache.set(state.barIndex, state);
 		}
+
+		for (const condition of data.conditions) {
+			const existing = this.conditionsCache.get(condition.barIndex) || [];
+			existing.push(condition);
+			this.conditionsCache.set(condition.barIndex, existing);
+		}
+
+		for (const signal of data.signals) {
+			const existing = this.signalsCache.get(signal.barIndex) || [];
+			existing.push(signal);
+			this.signalsCache.set(signal.barIndex, existing);
+		}
+
+		for (const fill of data.fills) {
+			const existing = this.fillsCache.get(fill.barIndex) || [];
+			existing.push(fill);
+			this.fillsCache.set(fill.barIndex, existing);
+		}
+
+		// Set up code sync
+		if (this.metadata.strategyPath) {
+			this.codeSyncManager.setStrategyFile(this.metadata.strategyPath);
+			this.codeSyncManager.loadConditions(data.conditions);
+		}
+
+		this.enabled = true;
+		this.currentBarIndex = 0;
+
+		this._onStateChange.fire({
+			type: 'enabled',
+			barIndex: 0,
+			totalBars: this.totalBars,
+		});
+
+		this._onStateChange.fire({
+			type: 'dataLoaded',
+			barIndex: 0,
+			totalBars: this.totalBars,
+		});
 	}
 
 	/**
@@ -360,37 +348,26 @@ export class DebuggerService implements vscode.Disposable {
 		signals: DebugSignal[];
 		fills: DebugFill[];
 		tradeBarIndices: number[];
-	} | null> {
-		// This would normally call the Python engine via IPC
-		// For now, we'll use a command that the engine provides
-
+	}> {
+		// One route: the engine command. A failure of it is the failure; there is no second reader.
+		let result: string | undefined;
 		try {
-			// Execute Python script to read debug file
-			const result = await vscode.commands.executeCommand<string>(
+			result = await vscode.commands.executeCommand<string>(
 				'quantlab.engine.readDebugFile',
 				filePath
 			);
+		} catch (error) {
+			throw new Error(`quantlab debugger: the engine could not read the debug file ${filePath}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+		}
 
-			if (!result) {
-				return null;
-			}
+		if (!result) {
+			throw new Error(`quantlab debugger: the engine returned no debug data for ${filePath}`);
+		}
 
+		try {
 			return JSON.parse(result);
 		} catch (error) {
-			console.error('Failed to read debug file:', error);
-
-			// Fallback: try to read directly if it's a JSON file
-			if (filePath.endsWith('.json')) {
-				try {
-					const fs = await import('fs/promises');
-					const content = await fs.readFile(filePath, 'utf-8');
-					return JSON.parse(content);
-				} catch {
-					return null;
-				}
-			}
-
-			return null;
+			throw new Error(`quantlab debugger: the debug data for ${filePath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 		}
 	}
 

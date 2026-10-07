@@ -174,9 +174,11 @@ suite('chart messageHandler: loading / empty / addSignal (H15+H17)', () => {
 		assert.strictEqual(recorded.addedSignals.length, 1);
 		assert.strictEqual(recorded.addedSignals[0].label, 'BUY 5 @ 1.5');
 
-		// Malformed payloads are dropped, not crashed on.
-		handler({ type: 'addSignal', signal: { type: 'entry' } });
-		await flush();
+		// A malformed payload is a named error (F-CHARTS-FB2), and nothing is added.
+		await assert.rejects(
+			(handler as (message: unknown) => Promise<void>)({ type: 'addSignal', signal: { type: 'entry' } }),
+			new Error('chart: malformed addSignal message (signal {"type":"entry"})')
+		);
 		assert.strictEqual(recorded.addedSignals.length, 1);
 	});
 

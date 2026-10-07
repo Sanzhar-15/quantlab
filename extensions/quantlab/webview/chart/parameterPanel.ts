@@ -179,8 +179,18 @@ export class ParameterPanel {
 			});
 
 			numeric.addEventListener('change', () => {
+				// An empty or non-numeric entry (Number('') is 0) is not committed: the box is marked invalid and the override is untouched.
+				const entered = numeric.value.trim() === '' ? Number.NaN : Number(numeric.value);
+				if (!Number.isFinite(entered)) {
+					numeric.setAttribute('aria-invalid', 'true');
+					numeric.setCustomValidity(`${param.name ?? param.id} needs a number`);
+					numeric.reportValidity();
+					return;
+				}
+				numeric.removeAttribute('aria-invalid');
+				numeric.setCustomValidity('');
 				range.value = numeric.value;
-				onValueChange(Number(numeric.value), true);
+				onValueChange(entered, true);
 			});
 
 			wrapper.appendChild(range);

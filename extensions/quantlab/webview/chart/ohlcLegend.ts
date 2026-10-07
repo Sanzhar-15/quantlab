@@ -67,11 +67,13 @@ export function createOhlcLegend(): OhlcLegend {
 			return;
 		}
 
-		const clamped = index === null
-			? bars.length - 1
-			: Math.max(0, Math.min(index, bars.length - 1));
-		const bar = bars[clamped];
-		const prev = clamped > 0 ? bars[clamped - 1] : undefined;
+		// null = pointer left -> last bar. chartApi sends null outside the bars, so any other index must be inside them.
+		if (index !== null && (!Number.isInteger(index) || index < 0 || index >= bars.length)) {
+			throw new Error(`chart: legend index outside the bars (${index}, ${bars.length} bars)`);
+		}
+		const position = index === null ? bars.length - 1 : index;
+		const bar = bars[position];
+		const prev = position > 0 ? bars[position - 1] : undefined;
 
 		symbolEl.textContent = symbol;
 		open.value.textContent = formatPrice(bar.o);

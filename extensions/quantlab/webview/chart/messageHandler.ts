@@ -44,8 +44,8 @@ interface ChartToolbarState {
 	complexity: ComplexityInfo;
 	hasVisualization: boolean;
 	viewOnly: boolean;
-	/** 'data' = market-data viewing (server-symbol tabs); 'strategy' = classic surface. */
-	mode?: 'data' | 'strategy';
+	/** 'data' = market-data viewing (server-symbol tabs); 'strategy' = classic surface. Always set by the host (buildToolbarState). */
+	mode: 'data' | 'strategy';
 }
 
 type ChartErrorAction = 'selectData' | 'editVisualization' | 'reload';
@@ -117,7 +117,12 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 	const setBanner = (message: string, tone?: 'info' | 'warning') => {
 		context.banner.textContent = message;
 		context.banner.classList.toggle('show', Boolean(message));
-		context.banner.dataset.tone = tone ?? 'info';
+		// An un-toned banner is the base look; a tone left over from the previous banner must not stick.
+		if (tone === undefined) {
+			delete context.banner.dataset.tone;
+		} else {
+			context.banner.dataset.tone = tone;
+		}
 	};
 
 	const setLoading = (visible: boolean) => {
@@ -276,7 +281,10 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 	};
 
 	const updateToolbar = (toolbar: ChartToolbarState) => {
-		const mode = toolbar.mode ?? 'strategy';
+		const mode = toolbar.mode;
+		if (mode !== 'data' && mode !== 'strategy') {
+			throw new Error(`chart: the toolbar has no valid mode (${String(mode)})`);
+		}
 		context.applyMode(mode);
 		if (mode === 'data') {
 			const source = toolbar.dataSource;
@@ -321,10 +329,17 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 		}
 	};
 
+	// The chart gets a timeframe only when the host sends one; it names a missing one when it formats the axis.
+	const echoTimeframe = (timeframe: string | undefined) => {
+		if (timeframe !== undefined) {
+			context.chart.setTimeframe(timeframe);
+		}
+	};
+
 	return async (message: unknown) => {
 		const data = message as ChartMessage;
 		if (!data || typeof data !== 'object' || typeof (data as { type?: unknown }).type !== 'string') {
-			return;
+			throw new Error(`chart: malformed message (${describeValue(message)})`);
 		}
 
 		switch (data.type) {
@@ -333,12 +348,12 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				overrides = data.payload.overrides;
 				updateToolbar(data.payload.toolbar);
 				context.parameterPanel.render(parameters, overrides);
-				context.chart.setTimeframe(data.payload.toolbar.timeframe ?? '1D');
+				echoTimeframe(data.payload.toolbar.timeframe);
 				await context.chart.initialize(data.payload.theme);
 				return;
 			case 'setToolbar':
 				updateToolbar(data.toolbar);
-				context.chart.setTimeframe(data.toolbar.timeframe ?? '1D');
+				echoTimeframe(data.toolbar.timeframe);
 				return;
 			case 'setRecentSources':
 				populateDropdown(data.sources);
@@ -363,7 +378,7 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 					return;
 				}
 				if (!(data.buffer instanceof ArrayBuffer) || typeof data.count !== 'number' || data.count < 0) {
-					return;
+					throw new Error(`chart: malformed setDataBinary message (buffer ${describeValue(data.buffer)}, count ${String(data.count)})`);
 				}
 				lastDataRequestId = data.requestId;
 				clearError();
@@ -394,7 +409,7 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 			case 'addSignal':
 				// H15: live trade fill markers appended without replacing the set.
 				if (!data.signal || typeof data.signal.t !== 'number') {
-					return;
+					throw new Error(`chart: malformed addSignal message (signal ${describeValue(data.signal)})`);
 				}
 				await context.chart.addSignal(data.signal);
 				return;
@@ -435,9 +450,19 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				renderError(data.message, data.actions, data.detail);
 				return;
 			default:
-				return;
+				// The host's 'theme' and 'reducedMotion' never get here (index.ts handles them first); any other type is a contract break.
+				throw new Error(`chart: unknown message type (${String((data as { type: unknown }).type)})`);
 		}
 	};
+}
+
+/** A short, safe rendering of an unexpected value for an error message. */
+function describeValue(value: unknown): string {
+	if (value instanceof ArrayBuffer) {
+		return `ArrayBuffer of ${value.byteLength} bytes`;
+	}
+	const json = JSON.stringify(value);
+	return json === undefined ? String(value) : json;
 }
 
 function decodeOhlcvBuffer(buffer: ArrayBuffer, count: number): OhlcvBar[] {

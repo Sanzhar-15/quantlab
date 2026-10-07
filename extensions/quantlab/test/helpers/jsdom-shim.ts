@@ -103,7 +103,6 @@ function loadJsdom(): { mod: JsdomModule; version: string; major: number } {
 			`jsdom-shim: resolved jsdom at ${resolvedPath} but its package.json is missing: ${(e as Error).message}`,
 		);
 	}
-	// eslint-disable-next-line @typescript-eslint/no-require-imports
 	const pkg = require(pkgPath) as { version?: string };
 	const version = typeof pkg.version === 'string' ? pkg.version : '?';
 	const majorMatch = version.match(/^(\d+)\./);
@@ -117,7 +116,6 @@ function loadJsdom(): { mod: JsdomModule; version: string; major: number } {
 			+ `extensions/quantlab/package.json devDependencies.`,
 		);
 	}
-	// eslint-disable-next-line @typescript-eslint/no-require-imports
 	const mod = require(resolvedPath) as JsdomModule;
 	return { mod, version, major };
 }
@@ -183,7 +181,7 @@ export function installDom(): DomHandle {
 	// PointerEvent must use `target.dispatchEvent(new PointerEvent(...))`
 	// for pointerdown and `window.dispatchEvent(new PointerEvent(...))`
 	// for pointermove/up -- jsdom does NOT auto-bubble pointer events.
-	if (!('PointerEvent' in w)) {
+	if (w.PointerEvent === undefined) {
 		const MouseEventCtor = w.MouseEvent as typeof MouseEvent;
 		class PointerEventShim extends MouseEventCtor {
 			readonly pointerId: number;
@@ -275,14 +273,23 @@ export function resetDom(): void {
 		// re-enter the array we're iterating.
 		const snapshot = docListeners.slice();
 		docListeners.length = 0;
+		// A removal that throws is collected, every other listener is still removed, and the aggregate
+		// is thrown after the loop: a reset that could not clean up fails the test that called it.
+		const failures: Error[] = [];
 		for (const e of snapshot) {
 			try {
 				docAny.removeEventListener(
 					e.type as keyof DocumentEventMap, e.listener, e.useCapture,
 				);
-			} catch {
-				// remove failures shouldn't block reset
+			} catch (error) {
+				failures.push(error instanceof Error ? error : new Error(String(error)));
 			}
+		}
+		if (failures.length > 0) {
+			throw new AggregateError(
+				failures,
+				`jsdom-shim.resetDom: ${failures.length} document listener(s) could not be removed: ${failures.map(f => f.message).join('; ')}`,
+			);
 		}
 	}
 }

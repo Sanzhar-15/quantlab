@@ -520,8 +520,12 @@ export class ChartClient {
 						break;
 					case 'addIndicator':
 					case 'removeIndicator':
-					default:
-						break;
+						// The chart draws no indicators: a strategy asking for one hears so.
+						throw new Error(`chart: the chart draws no indicators (${command.type})`);
+					default: {
+						const exhaustive: never = command;
+						throw new Error(`chart: unknown visualization command (${String((exhaustive as { type?: unknown }).type)})`);
+					}
 				}
 			}
 		});
@@ -617,8 +621,8 @@ export class ChartClient {
 		}
 
 		// W4.1: crosshair-move events map the chart's ordinal (fake) time back
-		// to a bar index for the OHLC legend; pointer leaving the chart falls
-		// back to the last bar (null).
+		// to a bar index for the OHLC legend; the pointer leaving the chart, or
+		// sitting outside the bars, is null (the legend shows the last bar).
 		this.chart.onCrosshairMove(event => {
 			if (!this.hoverListener) {
 				return;
@@ -627,8 +631,9 @@ export class ChartClient {
 				this.hoverListener(null);
 				return;
 			}
-			const index = Math.max(0, Math.min(Math.round(event.time / ORD_STEP_MS), this.lastBars.length - 1));
-			this.hoverListener(index);
+			// A pointer outside the bars (or a NaN time) is the pointer-left state, not the edge bar.
+			const index = Math.round(event.time / ORD_STEP_MS);
+			this.hoverListener(Number.isFinite(index) && index >= 0 && index < this.lastBars.length ? index : null);
 		});
 		this.container.addEventListener('pointerleave', () => {
 			this.hoverListener?.(null);
@@ -1035,13 +1040,15 @@ export class ChartClient {
 		if (typeof options.title === 'string') {
 			seriesOptions.title = options.title;
 		}
-		const width = typeof options.lineWidth === 'number' ? options.lineWidth : Number(options.lineWidth);
-		if (Number.isFinite(width)) {
-			seriesOptions.width = width;
+		if (options.lineWidth !== undefined) {
+			if (typeof options.lineWidth !== 'number' || !Number.isFinite(options.lineWidth)) {
+				throw new Error(`chart: series option lineWidth must be a finite number (${String(options.lineWidth)})`);
+			}
+			seriesOptions.width = options.lineWidth;
 		} else if (typeof options.width === 'number' && Number.isFinite(options.width)) {
 			seriesOptions.width = options.width;
 		}
-		if (typeof options.lineStyle === 'string') {
+		if (options.lineStyle !== undefined) {
 			const dash = this.resolveDash(options.lineStyle);
 			if (dash) {
 				seriesOptions.dash = dash;
@@ -1057,15 +1064,19 @@ export class ChartClient {
 		return seriesOptions;
 	}
 
-	private resolveDash(style: string): number[] | undefined {
-		const normalized = style.toLowerCase();
+	/** The dash pattern of a lineStyle; undefined means solid, which only 'solid' asks for. */
+	private resolveDash(style: unknown): number[] | undefined {
+		const normalized = typeof style === 'string' ? style.toLowerCase() : style;
 		if (normalized === 'dashed') {
 			return [6, 4];
 		}
 		if (normalized === 'dotted') {
 			return [2, 4];
 		}
-		return undefined;
+		if (normalized === 'solid') {
+			return undefined;
+		}
+		throw new Error(`chart: unknown series lineStyle (${String(style)}; expected solid, dashed or dotted)`);
 	}
 
 	private buildSeriesOptionsKey(options: Record<string, unknown>, seriesType: string): string {

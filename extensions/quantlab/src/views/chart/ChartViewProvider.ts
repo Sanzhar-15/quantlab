@@ -255,6 +255,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	private async onMessage(session: ChartSession, message: unknown): Promise<void> {
 		if (!message || typeof message !== 'object') {
+			this.showChartError(`quantlab chart: malformed webview message (${ChartViewProvider.describeValue(message)})`);
 			return;
 		}
 
@@ -351,9 +352,25 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			case 'chartDrawn':
 				fireChartDrawn({ uri: session.document.uri.toString(), bars: payload.bars, width: payload.width, height: payload.height });
 				return;
-			default:
+			default: {
+				// Every type the webview posts (index.ts, marketHeader.ts, parameterPanel callbacks) is a case above.
+				const unknownType = (payload as { type?: unknown }).type;
+				this.showChartError(`quantlab chart: unknown webview message type (${String(unknownType)})`);
 				return;
+			}
 		}
+	}
+
+	/** A short, safe rendering of an unexpected value for an error message. */
+	private static describeValue(value: unknown): string {
+		const json = JSON.stringify(value);
+		return json === undefined ? String(value) : json;
+	}
+
+	/** The provider's user-visible error path for a webview-side or host-side contract break. */
+	private showChartError(message: string): void {
+		console.error(message);
+		void vscode.window.showErrorMessage(message);
 	}
 
 	private async handleFilePicker(session: ChartSession): Promise<void> {
@@ -808,7 +825,11 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		}
 		if (isServerSource(dataSource)) {
 			// Load from Delta Plus server
-			const timeframe = toolbar.timeframe ?? '1D';
+			// buildToolbarState always sets a server source's timeframe (clampServerTimeframe); absence is a contract break.
+			const timeframe = toolbar.timeframe;
+			if (timeframe === undefined) {
+				throw new Error(`quantlab chart: the toolbar has no timeframe for the server source ${dataSource.symbol}`);
+			}
 			const result = await this.dataService.getOHLCVFromServer(
 				dataSource.symbol,
 				timeframe,
@@ -834,6 +855,11 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	 * patching each origin. An unsupported interval would otherwise fetch
 	 * zero bars (equities) or be silently downsampled to daily (crypto)
 	 * with no active highlight in the header.
+	 *
+	 * The clamped value is what the user sees: buildToolbarState puts it in
+	 * toolbar.timeframe, which the webview shows as the active interval
+	 * (marketHeader.setTimeframe -> setActiveTimeframe) and in the toolbar label.
+	 * So the 1D here is a product default, not a hidden substitute.
 	 */
 	private static clampServerTimeframe(timeframe: Timeframe | undefined, assetClass: string | undefined): Timeframe {
 		const supported = assetClass?.toLowerCase() === 'crypto'
@@ -1231,17 +1257,13 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 	/**
 	 * Execute an async operation with error boundary.
-	 * Catches and logs errors from fire-and-forget async calls.
+	 * Logs errors from fire-and-forget async calls and shows every one to the user.
 	 */
 	private executeWithErrorBoundary(operation: () => Promise<void>, operationName: string): void {
 		operation().catch(error => {
 			console.error(`ChartViewProvider.${operationName} failed:`, error);
-			// Optionally show error to user for critical operations
-			if (operationName.includes('reload') || operationName.includes('load')) {
-				void vscode.window.showErrorMessage(
-					`Failed to ${operationName}: ${error instanceof Error ? error.message : String(error)}`
-				);
-			}
+			const failure = `Failed to ${operationName}: ${error instanceof Error ? error.message : String(error)}`;
+			void vscode.window.showErrorMessage(failure);
 		});
 	}
 }

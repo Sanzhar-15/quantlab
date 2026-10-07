@@ -2,7 +2,6 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-
 /**
  * Code Synchronization for Time-Travel Debugger.
  *
@@ -137,6 +136,8 @@ export class CodeSyncManager implements vscode.Disposable {
 			return;
 		}
 
+		const line = CodeSyncManager.toLineIndex(lineNumber); // Convert to 0-based
+
 		// Open the document if not visible
 		const document = await vscode.workspace.openTextDocument(this.strategyUri);
 		this.editor = await vscode.window.showTextDocument(document, {
@@ -145,7 +146,6 @@ export class CodeSyncManager implements vscode.Disposable {
 		});
 
 		// Scroll to and highlight the line
-		const line = Math.max(0, lineNumber - 1); // Convert to 0-based
 		const range = new vscode.Range(line, 0, line, 0);
 
 		this.editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
@@ -164,6 +164,16 @@ export class CodeSyncManager implements vscode.Disposable {
 	}
 
 	/**
+	 * The 0-based line of an engine line number (1-based). A number below 1 is the engine's error, not line 0.
+	 */
+	private static toLineIndex(lineNumber: number): number {
+		if (!Number.isInteger(lineNumber) || lineNumber < 1) {
+			throw new Error(`quantlab code sync: the engine reported an invalid line number (${lineNumber}; lines start at 1)`);
+		}
+		return lineNumber - 1;
+	}
+
+	/**
 	 * Update code decorations based on current bar's conditions.
 	 */
 	private updateDecorations(): void {
@@ -177,10 +187,10 @@ export class CodeSyncManager implements vscode.Disposable {
 		const falseDecorations: vscode.DecorationOptions[] = [];
 
 		for (const condition of barConditions) {
-			const line = Math.max(0, condition.lineNumber - 1);
+			const line = CodeSyncManager.toLineIndex(condition.lineNumber);
 
 			if (line >= this.editor.document.lineCount) {
-				continue;
+				throw new Error(`quantlab code sync: the engine reported a condition on line ${condition.lineNumber}, but the strategy file has ${this.editor.document.lineCount} lines`);
 			}
 
 			const lineRange = this.editor.document.lineAt(line).range;
