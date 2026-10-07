@@ -1386,7 +1386,10 @@ export class CodeApplication extends Disposable {
 		const { autoUpdater } = electronUpdater;
 		const updateConfig = join(process.resourcesPath, 'app-update.yml');
 		const bundled = isMacintosh && !process.defaultApp && /\.app\/Contents\/MacOS\/[^/]+$/.test(process.execPath) && existsSync(updateConfig);
-		if (!bundled && !app.isPackaged) {
+		// PACK HIGH c1 O1: on macOS only the bundle predicate registers (app.isPackaged is false there for this executable, and a
+		// true one must still pass the bundle test); elsewhere Electron's app.isPackaged decides.
+		const registrable = isMacintosh ? bundled : app.isPackaged;
+		if (!registrable) {
 			const why = `execPath ${process.execPath}, defaultApp ${process.defaultApp === true}, ${updateConfig} ${existsSync(updateConfig) ? 'present' : 'absent'}`;
 			if (this.environmentMainService.isBuilt) {
 				this.logService.error(`updater: NOT registered: a built app that is not a packaged app bundle (${why})`);
@@ -1394,15 +1397,16 @@ export class CodeApplication extends Disposable {
 				this.logService.info(`updater: not registered: development run (${why})`);
 			}
 		} else {
-			if (bundled) {
+			if (isMacintosh) {
 				autoUpdater.updateConfigPath = updateConfig;
 				autoUpdater.forceDevUpdateConfig = true;
 			}
 			autoUpdater.autoDownload = true;
 			autoUpdater.autoInstallOnAppQuit = true;
-			this.logService.info(`updater: registered (${bundled ? `bundle, config ${updateConfig}` : 'app.isPackaged'})`);
+			this.logService.info(`updater: registered (${isMacintosh ? `bundle, config ${updateConfig}` : 'app.isPackaged'})`);
 			const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
-			updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
+			// PACK HIGH c1 M1: the module has logged the reason, redacted ('updater: check FAILED: …'); the raw error (URLs, stacks) is not logged again
+			updater.checkForUpdates().catch(() => this.logService.error('updater: check failed (reason logged by the updater module)'));
 		}
 
 		// QuantLab host (U5): the workbench host takes over the window's close (the quit handshake runs through the lifecycle
