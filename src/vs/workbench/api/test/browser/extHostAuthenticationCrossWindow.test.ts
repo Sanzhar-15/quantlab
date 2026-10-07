@@ -32,7 +32,8 @@ const CLIENT_ID = 'client-1';
 type StoredToken = IAuthorizationTokenResponse & { created_at: number };
 /** A stored token as this version saves it, without the bookkeeping of its list. */
 type SessionRecord = StoredToken & { session_id: string; revision: string };
-type TokensChange = { authProviderId: string; clientId: string; tokens: StoredToken[] };
+/** `tokens` undefined: the stored sessions were deleted (the provider was removed). */
+type TokensChange = { authProviderId: string; clientId: string; tokens: StoredToken[] | undefined };
 
 class TestDynamicAuthProvider extends DynamicAuthProvider {
 	/** One sign-in flow that returns `token`. */
@@ -56,7 +57,10 @@ class RecordingLogger extends NullLogger {
  * order. A read that comes after a later save sees that save's list, as a real read does.
  */
 class SharedSessionStorage {
-	private _value: string;
+	/** The stored list (JSON); undefined once the provider's sessions were deleted. */
+	private _value: string | undefined;
+	/** The provider's registration is committed: a save is refused once it is not (as the storage service does). */
+	private _registered = true;
 	private readonly _windows: { emitter: Emitter<TokensChange>; providerId: () => string; delayed: boolean; missed: boolean }[] = [];
 	private _pendingReads = 0;
 	private _pendingSaves = 0;
@@ -69,12 +73,36 @@ class SharedSessionStorage {
 
 	/** The stored sessions: the record that stands for an empty list (F-SECRETS-6) is not a session. */
 	get stored(): StoredToken[] {
-		return (JSON.parse(this._value) as (StoredToken & { session_list_record?: boolean })[]).filter(t => !t.session_list_record);
+		return (this.raw as (StoredToken & { session_list_record?: boolean })[]).filter(t => !t.session_list_record);
 	}
 
 	/** The raw stored value, for a window that reads it (as initial tokens). */
 	get raw(): StoredToken[] {
+		assert.ok(this._value !== undefined, 'the stored sessions are present');
 		return JSON.parse(this._value);
+	}
+
+	/** The stored sessions were deleted, and nothing stored them again. */
+	get absent(): boolean {
+		return this._value === undefined;
+	}
+
+	private _read(): StoredToken[] | undefined {
+		return this._value === undefined ? undefined : JSON.parse(this._value);
+	}
+
+	/**
+	 * The first steps of removing the provider in another window: its sessions are deleted and the deletion is announced
+	 * and read. Its registration (the list entry) is removed last, by {@link unregister}.
+	 */
+	deleteSessions(): void {
+		this._value = undefined;
+		this._announce();
+	}
+
+	/** The last step of removing the provider: from now on a save is refused. */
+	unregister(): void {
+		this._registered = false;
 	}
 
 	connect(emitter: Emitter<TokensChange>, providerId: () => string): number {
@@ -91,13 +119,23 @@ class SharedSessionStorage {
 		target.delayed = false;
 		if (target.missed) {
 			target.missed = false;
-			target.emitter.fire({ authProviderId: target.providerId(), clientId: CLIENT_ID, tokens: JSON.parse(this._value) });
+			target.emitter.fire({ authProviderId: target.providerId(), clientId: CLIENT_ID, tokens: this._read() });
 		}
 	}
 
 	async save(tokens: unknown[]): Promise<void> {
+		if (!this._registered) {
+			const error = new Error('not registered');
+			error.name = 'DynamicAuthProviderNotRegisteredError';
+			throw error;
+		}
 		this._value = JSON.stringify(tokens);
 		this.saved.push(this._value);
+		this._announce();
+	}
+
+	/** A change is announced: each window reads the list stored when the read runs. */
+	private _announce(): void {
 		this._pendingReads++;
 		setTimeout(() => {
 			this._pendingReads--;
@@ -105,7 +143,7 @@ class SharedSessionStorage {
 				if (win.delayed) {
 					win.missed = true;
 				} else {
-					win.emitter.fire({ authProviderId: win.providerId(), clientId: CLIENT_ID, tokens: JSON.parse(this._value) });
+					win.emitter.fire({ authProviderId: win.providerId(), clientId: CLIENT_ID, tokens: this._read() });
 				}
 			}
 		}, 0);
@@ -656,6 +694,77 @@ suite('ExtHostAuthentication - dynamic auth sessions across windows', () => {
 				assert.ok(keepers[0].revision < forks[0].revision, `round ${round}: the smaller revision keeps the session id`);
 				await assertAgree(storage, ['at-here', 'at-there'], here, there);
 			}
+		});
+	});
+
+	// F-SECRETS-6 review c1 (M3): removing the provider deletes its stored sessions (then its registration, then its list
+	// entry). The deletion is a terminal removal, never an empty list: no window restores the removed registration's
+	// credentials, by a merge, by a change it had not saved yet, or by a save in flight.
+	suite('a provider removed in another window', () => {
+
+		function removedError(e: unknown): boolean {
+			return e instanceof Error && e.name === 'DynamicAuthProviderRemovedError';
+		}
+
+		test('a window that started from an empty list and holds a session signed in since: the deletion is not merged as an empty list', async () => {
+			const storage = new SharedSessionStorage([]);
+			const here = openWindow(storage), there = openWindow(storage);
+			here.provider.useTokenFlow({ access_token: 'at-other', token_type: 'Bearer', scope: 'other' });
+			await here.provider.createSession(['other'], {});
+			await storage.readsDelivered();
+			assert.deepStrictEqual(await accessTokens(there), ['at-other'], 'the other window holds the session');
+
+			storage.deleteSessions();
+			await storage.settled();
+			storage.unregister();
+			await storage.settled();
+
+			assert.ok(storage.absent, 'the stored sessions stay deleted');
+			assert.deepStrictEqual(await accessTokens(here), []);
+			assert.deepStrictEqual(await accessTokens(there), []);
+		});
+
+		test('a sign-in not saved yet in the other window: it is not saved after the removal, and no further sign-in is asked for', async () => {
+			const storage = new SharedSessionStorage([{ ...expiring, created_at: Date.now() }]);
+			const here = openWindow(storage), there = openWindow(storage);
+			there.provider.useTokenFlow({ access_token: 'at-other', token_type: 'Bearer', scope: 'other' });
+			there.failSaves = true;
+			await assert.rejects(there.provider.createSession(['other'], {}));
+			there.failSaves = false;
+
+			storage.deleteSessions();
+			await storage.settled();
+			storage.unregister();
+			await storage.settled();
+
+			assert.ok(storage.absent, 'the stored sessions stay deleted');
+			assert.deepStrictEqual(await accessTokens(there), [], 'the unsaved sign-in belonged to the removed registration');
+			assert.deepStrictEqual(await accessTokens(here), []);
+			await assert.rejects(there.provider.createSession(['other'], {}), removedError);
+			assert.ok(storage.absent);
+		});
+
+		test('a refresh whose save is in flight when the provider is removed: it rejects named, and nothing is stored', async () => {
+			const storage = new SharedSessionStorage([expiring]);
+			const here = openWindow(storage), there = openWindow(storage);
+			refreshResponses.push(refreshedThere);
+			there.hold = new DeferredPromise<void>();
+			const hold = there.hold;
+			const refreshing = there.provider.getSessions(['read'], {}).then(() => undefined, e => e);
+			await waitUntilHolding(there);
+
+			storage.deleteSessions();
+			await storage.readsDelivered();
+			storage.unregister();
+			hold.complete();
+			const outcome = await refreshing;
+			await storage.settled();
+
+			assert.ok(removedError(outcome), `the refresh rejects named: ${outcome}`);
+			assert.ok(storage.absent, 'the stored sessions stay deleted');
+			assert.deepStrictEqual(await accessTokens(there), []);
+			assert.deepStrictEqual(await accessTokens(here), []);
+			assertNoTokenInLogs([here, there], ALL_TOKENS);
 		});
 	});
 });

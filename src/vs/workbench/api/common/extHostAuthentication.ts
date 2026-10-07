@@ -83,7 +83,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 	private _onDidChangeSessions = new Emitter<vscode.AuthenticationSessionsChangeEvent & { extensionIdFilter?: string[] }>();
 	private _getSessionTaskSingler = new TaskSingler<vscode.AuthenticationSession | undefined>();
 
-	private _onDidDynamicAuthProviderTokensChange = new Emitter<{ authProviderId: string; clientId: string; tokens: IAuthorizationToken[] }>();
+	/** `tokens` undefined: the stored sessions were deleted, which only the removal of the provider does (a terminal removal). */
+	private _onDidDynamicAuthProviderTokensChange = new Emitter<{ authProviderId: string; clientId: string; tokens: IAuthorizationToken[] | undefined }>();
 
 	constructor(
 		@IExtHostRpcService extHostRpc: IExtHostRpcService,
@@ -389,7 +390,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 		return provider.id;
 	}
 
-	async $onDidChangeDynamicAuthProviderTokens(authProviderId: string, clientId: string, tokens: IAuthorizationToken[]): Promise<void> {
+	async $onDidChangeDynamicAuthProviderTokens(authProviderId: string, clientId: string, tokens: IAuthorizationToken[] | undefined): Promise<void> {
 		this._onDidDynamicAuthProviderTokensChange.fire({ authProviderId, clientId, tokens });
 	}
 }
@@ -444,6 +445,17 @@ export class DynamicAuthClientRejectedError extends Error {
 	override readonly name = 'DynamicAuthClientRejectedError';
 	constructor(label: string) {
 		super(nls.localize('dynamicAuthClientRejected', "The authorization server rejected the stored client registration of '{0}'; it is kept. Remove it with the command 'Authentication: Remove Dynamic Authentication Providers' ({1}), then sign in again.", label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
+	}
+}
+
+/**
+ * The provider was removed (its stored sessions were deleted, see TokenStore): its sessions are dropped in this window and
+ * nothing is saved for it again, so no change made here restores a credential of the removed registration. Fixed text.
+ */
+export class DynamicAuthProviderRemovedError extends Error {
+	override readonly name = 'DynamicAuthProviderRemovedError';
+	constructor() {
+		super(nls.localize('dynamicAuthProviderRemoved', "The dynamic authentication provider was removed: its sessions were deleted and none is saved again. Add the provider and sign in again."));
 	}
 }
 
@@ -505,7 +517,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		protected readonly _resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined,
 		protected _clientId: string,
 		protected _clientSecret: string | undefined,
-		onDidDynamicAuthProviderTokensChange: Emitter<{ authProviderId: string; clientId: string; tokens: IAuthorizationToken[] }>,
+		onDidDynamicAuthProviderTokensChange: Emitter<{ authProviderId: string; clientId: string; tokens: IAuthorizationToken[] | undefined }>,
 		initialTokens: IAuthorizationToken[],
 	) {
 		const stringifiedServer = authorizationServer.toString(true);
@@ -657,6 +669,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 
 	async createSession(scopes: string[], _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
 		this._logger.info(`Creating session for ${scopeCountText(scopes)}`);
+		// A removed provider asks nobody to sign in: the session could not be saved.
+		this._tokenStore.assertNotRemoved();
 		// Saved before the user is asked to sign in: a storage that cannot save would lose the new session too.
 		await this._tokenStore.savePending();
 		let token: IAuthorizationTokenResponse | undefined;
@@ -1348,6 +1362,11 @@ class TokenStore implements Disposable {
 	/** Counts the lists read from storage, so that a save tells whether one was read while it ran. */
 	private _reads = 0;
 	private _saving = false;
+	/**
+	 * The provider was removed: its stored sessions were deleted. Terminal: the sessions here are dropped, no list read
+	 * afterwards is used, and nothing is saved again ({@link _onDidRemove}).
+	 */
+	private _removed = false;
 	private readonly _saves = new Sequencer();
 	/** The tokens known to be saved: completed-change events are published from these only. */
 	private readonly _tokensObservable: ISettableObservable<readonly ISessionToken[]>;
@@ -1392,12 +1411,24 @@ class TokenStore implements Disposable {
 		this._disposable.dispose();
 	}
 
-	/** A list was stored (by any window, this one included): it is merged into the sessions here. */
+	/**
+	 * A list was stored (by any window, this one included): it is merged into the sessions here. `undefined` is not a list:
+	 * the stored sessions were deleted, which only the removal of the provider does (the storage service deletes them under
+	 * every client ID of the provider, then its registration, then its list entry): a terminal removal ({@link _onDidRemove}),
+	 * never read as an empty list.
+	 */
 	private _onDidStore(stored: IAuthorizationToken[] | undefined): void {
+		if (stored === undefined) {
+			this._onDidRemove();
+			return;
+		}
+		if (this._removed) {
+			this._logger.error('Sessions were stored for this provider after it was removed; they are not used here, and nothing is saved from this window.');
+			return;
+		}
 		let list: ISessionList;
 		try {
-			// The storage reports a deleted list as undefined. Only removing the provider deletes it: it holds no session.
-			list = readSessionList(stored === undefined ? [] : stored);
+			list = readSessionList(stored);
 		} catch (error) {
 			if (!(error instanceof InvalidStoredSessionsError)) {
 				throw error;
@@ -1461,6 +1492,33 @@ class TokenStore implements Disposable {
 	}
 
 	/**
+	 * The provider was removed. Its sessions here are dropped (a change not saved yet included: it belongs to the removed
+	 * registration), the completed-change event reports them removed, and nothing is saved again: {@link update} rejects
+	 * with {@link DynamicAuthProviderRemovedError}, a save in flight that the storage refuses rejects with it too, and no
+	 * list read afterwards is used or repaired.
+	 */
+	private _onDidRemove(): void {
+		if (this._removed) {
+			return;
+		}
+		this._removed = true;
+		// Counted as a read: a save in flight does not publish its tokens as the stored ones.
+		this._reads++;
+		this._logger.info(`The provider was removed: its ${this._tokens.length} session(s) here are dropped, and nothing is saved for it again.`);
+		this._tokens = [];
+		this._stored = { tokens: [], revisions: this._stored.revisions, signedOut: [] };
+		this._tokensObservable.set([], undefined);
+	}
+
+	/** Rejects with {@link DynamicAuthProviderRemovedError} (after one error line) once the provider was removed. */
+	assertNotRemoved(): void {
+		if (this._removed) {
+			this._logger.error('The provider was removed; the operation is not run.');
+			throw new DynamicAuthProviderRemovedError();
+		}
+	}
+
+	/**
 	 * Applies the change here and saves it. When it cannot be saved this rejects with {@link DynamicAuthSessionPersistError}
 	 * (after one error line) and the change stays pending: {@link savePending} saves it before a later operation succeeds.
 	 * A refresh replaces the credential of its session only if it is still the one refreshed: when another window
@@ -1474,6 +1532,7 @@ class TokenStore implements Disposable {
 		removed?: readonly ISessionToken[];
 	}): Promise<ISessionToken[]> {
 		this._logger.trace(`Updating tokens: added ${added.length + refreshed.length}, removed ${refreshed.length + removed.length}`);
+		this.assertNotRemoved();
 		const signedOut = new Set(this._signedOut);
 		let tokens = [...this._tokens];
 		for (const { previous, token } of refreshed) {
@@ -1524,7 +1583,7 @@ class TokenStore implements Disposable {
 	private async _saveRounds(): Promise<void> {
 		this._saving = true;
 		try {
-			for (let round = 1; !sameSessions(this._tokens, this._stored.tokens); round++) {
+			for (let round = 1; !this._removed && !sameSessions(this._tokens, this._stored.tokens); round++) {
 				if (round > SAVE_ROUNDS_MAX) {
 					this._logger.error(`The stored sessions kept changing while ${this._tokens.length} token(s) were saved; the change is kept here and saved by the next operation.`);
 					throw new DynamicAuthSessionPersistError(this._tokens.length, SESSION_CONCURRENT_CHANGE_FAILURE);
@@ -1554,6 +1613,11 @@ class TokenStore implements Disposable {
 		try {
 			await this._persistence.set(stored);
 		} catch {
+			if (this._removed) {
+				// Removed while it was saved: the change is not kept, and the storage refused it (the registration is gone).
+				this._logger.error(`The provider was removed while ${tokens.length} token(s) were saved; they are not saved.`);
+				throw new DynamicAuthProviderRemovedError();
+			}
 			// The tokens are credentials, and the storage error is foreign text (its name included): only the count and a
 			// fixed category are logged and carried (no cause).
 			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${SESSION_PERSIST_FAILURE}`);
