@@ -62,17 +62,17 @@ const storedToken: IAuthorizationTokenResponse & { created_at: number } = { acce
 let createdProviders: RecordingDynamicAuthProvider[] = [];
 
 class RecordingDynamicAuthProvider extends DynamicAuthProvider {
-	disposed = false;
+	disposeCount = 0;
 	constructor(...args: ConstructorParameters<typeof DynamicAuthProvider>) {
 		super(...args);
 		createdProviders.push(this);
 	}
-	override dispose(): void {
-		this.disposed = true;
-		super.dispose();
+	get disposed(): boolean {
+		return this.disposeCount > 0;
 	}
-	generateNewClientId(): Promise<void> {
-		return this._generateNewClientId();
+	override dispose(): void {
+		this.disposeCount++;
+		super.dispose();
 	}
 }
 
@@ -107,27 +107,6 @@ function rpcProxy<T extends object>(target: () => T, overrides: Partial<Record<s
 	}) as T;
 }
 
-type NodeProcess = {
-	on(event: 'unhandledRejection', listener: (reason: unknown) => void): unknown;
-	removeListener(event: 'unhandledRejection', listener: (reason: unknown) => void): unknown;
-};
-
-/** Runs `run`, lets every pending promise settle, and returns the rejections nobody handled meanwhile. */
-async function collectUnhandledRejections(run: () => Promise<void>): Promise<unknown[]> {
-	const nodeProcess = (globalThis as unknown as { process?: NodeProcess }).process;
-	assert.ok(nodeProcess, 'an unhandled rejection can only be observed under node');
-	const seen: unknown[] = [];
-	const listener = (reason: unknown) => { seen.push(reason); };
-	nodeProcess.on('unhandledRejection', listener);
-	try {
-		await run();
-		await new Promise<void>(resolve => setTimeout(resolve, 20));
-	} finally {
-		nodeProcess.removeListener('unhandledRejection', listener);
-	}
-	return seen;
-}
-
 function isInvalidListError(e: unknown): boolean {
 	assert.ok(e instanceof Error, `expected an error, got ${e}`);
 	assert.strictEqual(e.name, 'InvalidStoredProviderListError');
@@ -135,8 +114,8 @@ function isInvalidListError(e: unknown): boolean {
 	return true;
 }
 
-// F-AUTHPROV-2: a dynamic provider is validated and saved before it is published in either registry, and a client-ID change
-// is saved (awaited) before the new identity is used. A failed read or save of the provider list leaves runtime state as it was.
+// F-AUTHPROV-2: a dynamic provider is validated and saved before it is published in either registry. A failed read or save of
+// the provider list leaves runtime state as it was.
 suite('Dynamic authentication providers - persistence before publication', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
@@ -167,9 +146,10 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 			{ options: undefined } as unknown as IBrowserWorkbenchEnvironmentService,
 			logService
 		));
-		const calls = { registrationPrompts: 0 };
+		const calls = { registrationPrompts: 0, forwardedSessionEvents: 0 };
 		const mainOverrides = {
 			$promptForClientRegistration: async () => { calls.registrationPrompts++; return { clientId: 'client-typed' }; },
+			$sendDidChangeSessions: async () => { calls.forwardedSessionEvents++; },
 		};
 		let extHost: TestExtHostAuthentication | undefined;
 		const extHostContext = {
@@ -290,58 +270,23 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 		assert.strictEqual(createdProviders[0].disposed, true, 'unregistering disposes it');
 	});
 
-	test('a client-ID change whose save is rejected (real event path) rejects, named; no unhandled rejection; identity unchanged', async () => {
+	// review-c1 S7: a successful re-registration disposes the provider it replaces; a rejected one keeps it (test above).
+	test('a successful re-registration disposes the replaced provider once; only the current one forwards session events', async () => {
 		const world = createWorld();
 		await world.seedStoredClient();
 		await world.create();
-		const provider = createdProviders[0];
-		const changes: string[] = [];
-		store.add(provider.onDidChangeClientId(() => changes.push(provider.clientId)));
-		world.corruptList();
-		const before = await world.snapshot();
-
-		const unhandled = await collectUnhandledRejections(async () => {
-			await assert.rejects(provider.generateNewClientId(), isInvalidListError);
-		});
-
-		assert.deepStrictEqual(unhandled, [], 'no rejection is left unhandled');
-		assert.strictEqual(provider.clientId, 'client-1', 'the client ID in use is unchanged');
-		assert.strictEqual(provider.clientSecret, 'secret-1', 'the client secret in use is unchanged');
-		assert.deepStrictEqual(changes, [], 'no change is notified');
-		assert.strictEqual(world.calls.registrationPrompts, 0, 'a failed save does not fall back to prompting the user');
-		assert.strictEqual(await world.snapshot(), before);
-		await world.cleanUp();
-	});
-
-	test('a client-ID change is saved before the new identity is used, and notified only after', async () => {
-		const world = createWorld();
-		await world.seedStoredClient();
 		await world.create();
-		const provider = createdProviders[0];
-		const seenAtNotification: { inUse: string; stored: string | undefined }[] = [];
-		store.add(provider.onDidChangeClientId(() => seenAtNotification.push({ inUse: provider.clientId, stored: world.dynamicStorage.getClientId(PROVIDER_ID) })));
+		assert.strictEqual(createdProviders.length, 2);
+		assert.strictEqual(createdProviders[0].disposeCount, 1, 'the replaced provider is disposed');
+		assert.strictEqual(createdProviders[1].disposeCount, 0, 'the current provider is installed');
 
-		await provider.generateNewClientId();
+		await world.extHost.$onDidChangeDynamicAuthProviderTokens(PROVIDER_ID, 'client-1', [{ ...storedToken, access_token: 'at-2' }]);
+		await new Promise(resolve => setTimeout(resolve, 0));
+		assert.strictEqual(world.calls.forwardedSessionEvents, 1, 'one session event, from the current provider only');
+		const sessions = await world.extHost.$getSessions(PROVIDER_ID, undefined, {});
+		assert.deepStrictEqual(sessions.map(s => s.accessToken), ['at-2']);
 
-		assert.deepStrictEqual(seenAtNotification, [{ inUse: 'client-2', stored: 'client-2' }]);
-		assert.strictEqual(provider.clientSecret, 'secret-2');
-		assert.deepStrictEqual(await world.dynamicStorage.getClientRegistration(PROVIDER_ID), { clientId: 'client-2', clientSecret: 'secret-2' });
-		assert.strictEqual(world.calls.registrationPrompts, 0);
 		await world.cleanUp();
-	});
-
-	test('a failed dynamic registration falls back to the prompt, and the typed client ID is saved before it is used', async () => {
-		const world = createWorld();
-		await world.seedStoredClient();
-		await world.create();
-		const provider = createdProviders[0];
-		fetchStub.callsFake(async () => new Response('', { status: 500 }));
-
-		await provider.generateNewClientId();
-
-		assert.strictEqual(world.calls.registrationPrompts, 1);
-		assert.strictEqual(provider.clientId, 'client-typed');
-		assert.strictEqual(world.dynamicStorage.getClientId(PROVIDER_ID), 'client-typed');
-		await world.cleanUp();
+		assert.deepStrictEqual(createdProviders.map(p => p.disposeCount), [1, 1], 'each is disposed exactly once');
 	});
 });

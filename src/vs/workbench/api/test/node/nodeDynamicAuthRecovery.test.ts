@@ -59,12 +59,15 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 			}
 			return new Response('', { status: 404 });
 		});
-		const calls = { registrationPrompts: 0, continuePrompts: 0, clientIdChanges: 0 };
+		const calls = { registrationPrompts: 0, continuePrompts: 0, registrationSaves: 0 };
 		const proxy: Partial<MainThreadAuthenticationShape> = {
 			$showDeviceCodeModal: async () => true,
 			$showContinueNotification: async () => { calls.continuePrompts++; return false; },
 			$promptForClientRegistration: async () => { calls.registrationPrompts++; return { clientId: 'client-typed' }; },
 			$setSessionsForDynamicAuthProvider: async () => { },
+			// The call that saves a client registration on the main thread (the only one: the client-ID change call is
+			// removed, review QL-G-LOGIN-SECRETS c1 M3): it may not be made.
+			$registerDynamicAuthenticationProvider: async () => { calls.registrationSaves++; },
 		};
 		// No authorization_endpoint: the device code flow is the only sign-in flow.
 		const serverMetadata: IAuthorizationServerMetadata = {
@@ -91,8 +94,6 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 			[],
 		);
 		store.add({ dispose: () => provider.dispose() });
-		// The client registration is stored only through this event (ExtHostAuthentication → storeClientRegistration).
-		store.add(provider.onDidChangeClientId(() => { calls.clientIdChanges++; }));
 		return { provider, calls };
 	}
 
@@ -102,10 +103,10 @@ suite('NodeDynamicAuthProvider - device code invalid_client keeps the registrati
 		return true;
 	}
 
-	function assertRegistrationKept(provider: NodeDynamicAuthProvider, calls: { registrationPrompts: number; clientIdChanges: number }): void {
+	function assertRegistrationKept(provider: NodeDynamicAuthProvider, calls: { registrationPrompts: number; registrationSaves: number }): void {
 		assert.strictEqual(provider.clientId, 'client-1');
 		assert.strictEqual(provider.clientSecret, 'client-secret-1');
-		assert.strictEqual(calls.clientIdChanges, 0, 'the stored client registration is not replaced');
+		assert.strictEqual(calls.registrationSaves, 0, 'the stored client registration is not replaced');
 		assert.strictEqual(calls.registrationPrompts, 0);
 		assert.ok(fetchStub.getCalls().every(c => String(c.args[0]) !== REGISTRATION_ENDPOINT), 'no dynamic registration request');
 	}

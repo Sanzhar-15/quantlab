@@ -221,7 +221,6 @@ export interface MainThreadAuthenticationShape extends IDisposable {
 	$promptForClientRegistration(authorizationServerUrl: string): Promise<{ clientId: string; clientSecret?: string } | undefined>;
 	$registerDynamicAuthenticationProvider(details: IRegisterDynamicAuthenticationProviderDetails): Promise<void>;
 	$setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void>;
-	$sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret }: { providerId: string; clientId?: string; authorizationServer?: UriComponents; label?: string; clientSecret?: string }): Promise<void>;
 }
 
 export interface MainThreadSecretStateShape extends IDisposable {

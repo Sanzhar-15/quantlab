@@ -437,7 +437,7 @@ export class McpHTTPHandle extends Disposable {
 			try {
 				await this._sendLegacySSE(endpoint, message);
 			} catch (err) {
-				// Only the error's class: its text is not safe by construction.
+				// A named error of this file or a fixed category: no text of a foreign error (see safeErrorText).
 				this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Error, message: `Error sending message to ${this._endpointForLog()}: ${safeErrorText(err)}` });
 			}
 		}
@@ -521,7 +521,7 @@ export class McpHTTPHandle extends Disposable {
 			} catch (e) {
 				if (e instanceof McpAuthorizationRejectedError || e instanceof McpAuthenticationFailedError) {
 					// Retrying cannot succeed without an act of the user; stop, as for any other 4xx status below.
-					this._log(LogLevel.Warning, `Async notifications from ${this._endpointForLog()} are disabled: ${e.name}`);
+					this._log(LogLevel.Warning, `Async notifications from ${this._endpointForLog()} are disabled: ${safeErrorText(e)}`);
 					return;
 				}
 				this._log(LogLevel.Info, `Error connecting to ${this._endpointForLog()} for async notifications, will retry`);
@@ -687,15 +687,16 @@ export class McpHTTPHandle extends Disposable {
 					this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Stopped, reason: 'needs-user-interaction' });
 					throw new CancellationError();
 				}
-				// Only the error's class: its text is not safe by construction.
-				this._log(LogLevel.Warning, `Error getting token from server metadata: ${e instanceof Error ? e.name : typeof e}`);
+				// A fixed category: the error comes from another process, so its name, message, stack and cause are foreign text.
+				this._log(LogLevel.Warning, `Error getting token from server metadata: ${safeErrorText(e)}`);
 				throw new McpAuthenticationFailedError('server metadata');
 			}
 		}
 		if (this._launch.authentication) {
 			try {
-				// The scope values are not logged, only their count: wherever a scope can come from, it is not a log value.
-				this._log(LogLevel.Debug, `Using provided authentication config: providerId=${this._launch.authentication.providerId}, ${scopeCountText(this._launch.authentication.scopes)}`);
+				// Neither the provider id (a dynamic provider's id is its issuer string, which can hold a credential) nor the scope
+				// values (wherever a scope can come from, it is not a log value): only the scopes' count.
+				this._log(LogLevel.Debug, `Using provided authentication config: ${scopeCountText(this._launch.authentication.scopes)}`);
 				const token = await this._proxy.$getTokenForProviderId(
 					this._id,
 					this._launch.authentication.providerId,
@@ -713,8 +714,8 @@ export class McpHTTPHandle extends Disposable {
 					this._proxy.$onDidChangeState(this._id, { state: McpConnectionState.Kind.Stopped, reason: 'needs-user-interaction' });
 					throw new CancellationError();
 				}
-				// Only the error's class: its text is not safe by construction.
-				this._log(LogLevel.Warning, `Error getting token from provided authentication config: ${e instanceof Error ? e.name : typeof e}`);
+				// A fixed category: the error comes from another process, so its name, message, stack and cause are foreign text.
+				this._log(LogLevel.Warning, `Error getting token from provided authentication config: ${safeErrorText(e)}`);
 				throw new McpAuthenticationFailedError('provided authentication config');
 			}
 		}
@@ -740,21 +741,22 @@ export class McpHTTPHandle extends Disposable {
 		}
 	}
 
-	/** The configured MCP endpoint for a log line: origin and path only (see {@link endpointForLog}). */
+	/** The configured MCP endpoint for a log line: its origin and a fixed description (see {@link endpointForLog}). */
 	private _endpointForLog(): string {
 		return endpointForLog(this._launch.uri);
 	}
 
 	/**
-	 * A request URL for a log line. Never the user info, query or fragment, which can carry a credential. The path is shown
-	 * for the configured MCP endpoint only: any other URL (metadata lookups, a challenge's resource_metadata URL, a redirect
-	 * target, a legacy SSE endpoint) is server-provided, and its path is not logged.
+	 * A request URL for a log line: its origin and a fixed description. No path, user info, query or fragment, any of which
+	 * can carry a credential: the configured endpoint's path is the user's configuration (an API key in the path is a common
+	 * form), and any other URL (metadata lookups, a challenge's resource_metadata URL, a redirect target, a legacy SSE
+	 * endpoint) is server-provided. The request itself uses the full URL.
 	 */
 	private _urlForLog(url: string): string {
 		const target = new URL(url);
 		const endpoint = new URL(this._launch.uri.toString(true));
 		return target.origin === endpoint.origin && target.pathname === endpoint.pathname
-			? target.origin + target.pathname
+			? endpointForLog(this._launch.uri)
 			: `${target.origin} (server-provided path not logged)`;
 	}
 
@@ -894,15 +896,22 @@ function isJSON(str: string): boolean {
 }
 
 /**
- * Text for an error shown in a log line or the server state. The named authentication errors are built from safe parts
- * (a status, fixed text), so their message is shown; any other error is shown by its class only, as its text is not safe
- * by construction.
+ * Text for an error shown in a log line or the server state. Only errors constructed in this process are recognised, by
+ * instanceof, and named by fixed text: the named authentication errors are built from safe parts (a status, fixed text),
+ * so their message is shown. Any other failure (an error from another process, a transport, a stream, or a thrown
+ * non-error) gets a fixed category: its name, message, stack and cause are foreign text, and none is repeated.
  */
 function safeErrorText(err: unknown): string {
-	if (err instanceof McpAuthorizationRejectedError || err instanceof McpAuthenticationFailedError) {
-		return `${err.name}: ${err.message}`;
+	if (err instanceof McpAuthorizationRejectedError) {
+		return `McpAuthorizationRejectedError: ${err.message}`;
 	}
-	return err instanceof Error ? err.name : typeof err;
+	if (err instanceof McpAuthenticationFailedError) {
+		return `McpAuthenticationFailedError: ${err.message}`;
+	}
+	if (err instanceof CancellationError) {
+		return 'cancelled';
+	}
+	return err instanceof Error ? 'unexpected error (details not logged)' : 'unexpected non-error value (details not logged)';
 }
 
 function isAuthStatusCode(status: number): boolean {
@@ -923,12 +932,11 @@ function hasAuthorizationHeader(headers: Record<string, string>): boolean {
 }
 
 /**
- * The configured MCP endpoint for a log line: origin and path. Never the user info, query or fragment, which can carry a
- * credential.
+ * The configured MCP endpoint for a log line: its origin and a fixed description. Never its path, user info, query or
+ * fragment, any of which can carry a credential.
  */
 function endpointForLog(uri: URI): string {
-	const url = new URL(uri.toString(true));
-	return url.origin + url.pathname;
+	return `${new URL(uri.toString(true)).origin} (configured endpoint)`;
 }
 
 /** A request body for a log line: its byte length, never its text. */

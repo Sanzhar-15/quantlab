@@ -225,6 +225,218 @@ suite('DynamicAuthenticationProviderStorageService', () => {
 		});
 	});
 
+	// review-c1 M1: a registration or removal that fails part-way keeps the previous committed identity and the cleanup
+	// identity, so a retry completes it. review-c1 M2 (storage side): once a removal has completed, a session write for
+	// the provider is rejected, named, and recreates nothing.
+	suite('partial storage failures and writes after removal', () => {
+		const AS = 'https://as.example';
+		const NEW_CREDENTIALS_VALUE = JSON.stringify({ clientId: 'client-2', clientSecret: 'secret-2' });
+		const PREVIOUS_CREDENTIALS = JSON.stringify({ clientId: 'client-1', clientSecret: 'secret-1' });
+		const sessionsKey = (clientId: string) => JSON.stringify({ isDynamicAuthProvider: true, authProviderId: 'p1', clientId });
+
+		/** Refuses the named secret writes or deletions; `refuseSet` sees the value too, so a restore can be refused alone. */
+		class FailingSecretStorageService extends TestSecretStorageService {
+			refuseSet: (key: string, value: string) => boolean = () => false;
+			readonly refuseDelete = new Set<string>();
+			override async set(key: string, value: string): Promise<void> {
+				if (this.refuseSet(key, value)) {
+					throw new Error('set refused');
+				}
+				return super.set(key, value);
+			}
+			override async delete(key: string): Promise<void> {
+				if (this.refuseDelete.has(key)) {
+					throw new Error('delete refused');
+				}
+				return super.delete(key);
+			}
+		}
+
+		class FailingStorageService extends TestStorageService {
+			refuseListStore = false;
+			override store(...args: Parameters<TestStorageService['store']>): void {
+				if (this.refuseListStore && args[0] === PROVIDERS_STORAGE_KEY) {
+					throw new Error('store refused');
+				}
+				super.store(...args);
+			}
+		}
+
+		async function createSeeded() {
+			const storage = disposables.add(new FailingStorageService());
+			const secrets = disposables.add(new FailingSecretStorageService());
+			const log = disposables.add(new RecordingLogService());
+			const dynamicStorage = disposables.add(new DynamicAuthenticationProviderStorageService(storage, secrets, log));
+			await dynamicStorage.storeClientRegistration('p1', AS, 'client-1', 'secret-1', 'Label');
+			await dynamicStorage.setSessionsForDynamicAuthProvider('p1', 'client-1', JSON.parse(SESSIONS_VALUE));
+			const list = () => storage.get(PROVIDERS_STORAGE_KEY, StorageScope.APPLICATION);
+			const listedClientIds = () => dynamicStorage.getInteractedProviders().map(p => [p.providerId, p.clientId]);
+			const allSecrets = async () => JSON.stringify(await Promise.all((await secrets.keys()).sort().map(async key => [key, await secrets.get(key)])));
+			return { storage, secrets, log, dynamicStorage, list, listedClientIds, allSecrets };
+		}
+
+		test('registration: the credential write fails; the previous identity is kept whole; a retry commits the new one', async () => {
+			const w = await createSeeded();
+			const listBefore = w.list();
+			const secretsBefore = await w.allSecrets();
+			w.secrets.refuseSet = key => key === CREDENTIALS_KEY;
+
+			await assert.rejects(w.dynamicStorage.storeClientRegistration('p1', AS, 'client-2', 'secret-2', 'Label'), /set refused/);
+
+			assert.strictEqual(w.list(), listBefore, 'the list still names the previous client');
+			assert.strictEqual(await w.allSecrets(), secretsBefore, 'the client registration and sessions are byte-identical');
+			assert.deepStrictEqual(await w.dynamicStorage.getClientRegistration('p1'), { clientId: 'client-1', clientSecret: 'secret-1' });
+
+			w.secrets.refuseSet = () => false;
+			await w.dynamicStorage.storeClientRegistration('p1', AS, 'client-2', 'secret-2', 'Label');
+			assert.deepStrictEqual(w.listedClientIds(), [['p1', 'client-2']]);
+			assert.strictEqual(await w.secrets.get(CREDENTIALS_KEY), NEW_CREDENTIALS_VALUE);
+		});
+
+		test('registration: the list commit fails; the previous client registration is restored; a retry commits the new one', async () => {
+			const w = await createSeeded();
+			const listBefore = w.list();
+			const secretsBefore = await w.allSecrets();
+			w.storage.refuseListStore = true;
+
+			await assert.rejects(w.dynamicStorage.storeClientRegistration('p1', AS, 'client-2', 'secret-2', 'Label'), /store refused/);
+
+			assert.strictEqual(w.list(), listBefore);
+			assert.strictEqual(await w.secrets.get(CREDENTIALS_KEY), PREVIOUS_CREDENTIALS, 'the previous client registration is back');
+			assert.strictEqual(await w.allSecrets(), secretsBefore);
+
+			w.storage.refuseListStore = false;
+			await w.dynamicStorage.storeClientRegistration('p1', AS, 'client-2', 'secret-2', 'Label');
+			assert.deepStrictEqual(w.listedClientIds(), [['p1', 'client-2']]);
+			assert.strictEqual(await w.secrets.get(CREDENTIALS_KEY), NEW_CREDENTIALS_VALUE);
+		});
+
+		test('registration of a new provider: the list commit fails; its client registration is not left behind', async () => {
+			const w = await createSeeded();
+			const secretsBefore = await w.allSecrets();
+			w.storage.refuseListStore = true;
+
+			await assert.rejects(w.dynamicStorage.storeClientRegistration('p2', AS, 'client-9', 'secret-9', 'Other'), /store refused/);
+
+			assert.deepStrictEqual(w.listedClientIds(), [['p1', 'client-1']]);
+			assert.strictEqual(await w.allSecrets(), secretsBefore, 'no client registration of p2 is stored');
+		});
+
+		test('registration: the commit and the restore both fail; a named error with fixed text; a removal still finds every identity', async () => {
+			const w = await createSeeded();
+			w.storage.refuseListStore = true;
+			w.secrets.refuseSet = (key, value) => key === CREDENTIALS_KEY && value === PREVIOUS_CREDENTIALS;
+			w.log.lines.length = 0;
+			w.log.errors.length = 0;
+
+			await assert.rejects(w.dynamicStorage.storeClientRegistration('p1', AS, 'client-2', 'secret-2', 'Label'), (e: unknown) => {
+				assert.ok(e instanceof Error);
+				assert.strictEqual(e.name, 'DynamicAuthRegistrationRecoveryError');
+				assert.strictEqual(e.cause, undefined);
+				assert.ok(!/secret-[12]|refused/.test(e.message), e.message);
+				assert.ok(e.message.includes('Remove Dynamic Authentication Providers'), e.message);
+				return true;
+			});
+			assert.strictEqual(w.log.errors.length, 1, w.log.lines.join('\n'));
+			assert.ok(w.log.argumentTexts.every(text => !/secret-[12]|refused/.test(text)), w.log.lines.join('\n'));
+
+			// The list names client-1 and the client registration client-2: the removal deletes the sessions of both.
+			w.storage.refuseListStore = false;
+			w.secrets.refuseSet = () => false;
+			await w.secrets.set(sessionsKey('client-2'), SESSIONS_VALUE);
+			await w.dynamicStorage.removeDynamicProvider('p1');
+			assert.deepStrictEqual(await w.secrets.keys(), []);
+			assert.deepStrictEqual(w.listedClientIds(), []);
+		});
+
+		for (const [name, refused] of [['the session deletion', SESSIONS_KEY], ['the credential deletion', CREDENTIALS_KEY]] as const) {
+			test(`removal: ${name} fails; the list entry (the cleanup identity) is kept; a retry removes every stored credential`, async () => {
+				const w = await createSeeded();
+				w.secrets.refuseDelete.add(refused);
+
+				await assert.rejects(w.dynamicStorage.removeDynamicProvider('p1'), /delete refused/);
+
+				assert.deepStrictEqual(w.listedClientIds(), [['p1', 'client-1']], 'the provider can still be found for a retry');
+				assert.strictEqual(await w.secrets.get(CREDENTIALS_KEY), PREVIOUS_CREDENTIALS, 'the client registration is still stored');
+
+				w.secrets.refuseDelete.clear();
+				await w.dynamicStorage.removeDynamicProvider('p1');
+				assert.deepStrictEqual(await w.secrets.keys(), [], 'no session and no client registration is left');
+				assert.deepStrictEqual(w.listedClientIds(), []);
+			});
+		}
+
+		test('removal deletes the sessions stored under the list entry\'s and the client registration\'s client IDs', async () => {
+			const w = await createSeeded();
+			// A registration written before a failed commit (an earlier version, or a crash): the identities differ.
+			await w.secrets.set(CREDENTIALS_KEY, NEW_CREDENTIALS_VALUE);
+			await w.secrets.set(sessionsKey('client-2'), SESSIONS_VALUE);
+
+			await w.dynamicStorage.removeDynamicProvider('p1');
+
+			assert.deepStrictEqual(await w.secrets.keys(), []);
+			assert.deepStrictEqual(w.listedClientIds(), []);
+		});
+
+		test('removal of an unreadable client registration: it is deleted, named in a fixed log line without its text', async () => {
+			const w = await createSeeded();
+			await w.secrets.set(CREDENTIALS_KEY, `{"clientSecret":"${CREDENTIAL_MARKER}"`);
+			w.log.lines.length = 0;
+
+			await w.dynamicStorage.removeDynamicProvider('p1');
+
+			assert.deepStrictEqual(await w.secrets.keys(), []);
+			assert.deepStrictEqual(w.listedClientIds(), []);
+			assert.ok(w.log.lines.some(line => line.includes('not readable')), w.log.lines.join('\n'));
+			assert.ok(w.log.argumentTexts.every(text => !text.includes(CREDENTIAL_MARKER)));
+		});
+
+		function isNotRegistered(e: unknown): boolean {
+			assert.ok(e instanceof Error, `expected an error, got ${e}`);
+			assert.strictEqual(e.name, 'DynamicAuthProviderNotRegisteredError');
+			assert.ok(!e.message.includes('p1') && !e.message.includes('client-1') && !e.message.includes(SESSION_MARKER), e.message);
+			return true;
+		}
+
+		test('a session write after the removal completed is rejected, named, and recreates no stored session', async () => {
+			const w = await createSeeded();
+			await w.dynamicStorage.removeDynamicProvider('p1');
+
+			await assert.rejects(w.dynamicStorage.setSessionsForDynamicAuthProvider('p1', 'client-1', JSON.parse(SESSIONS_VALUE)), isNotRegistered);
+
+			assert.deepStrictEqual(await w.secrets.keys(), []);
+		});
+
+		test('a session write that arrives during the removal waits for it and is rejected', async () => {
+			const w = await createSeeded();
+			const removal = w.dynamicStorage.removeDynamicProvider('p1');
+			const write = w.dynamicStorage.setSessionsForDynamicAuthProvider('p1', 'client-1', JSON.parse(SESSIONS_VALUE));
+
+			await removal;
+			await assert.rejects(write, isNotRegistered);
+			assert.deepStrictEqual(await w.secrets.keys(), []);
+		});
+
+		test('a session write for a client ID the provider is not registered under is rejected', async () => {
+			const w = await createSeeded();
+			const secretsBefore = await w.allSecrets();
+
+			await assert.rejects(w.dynamicStorage.setSessionsForDynamicAuthProvider('p1', 'client-9', JSON.parse(SESSIONS_VALUE)), isNotRegistered);
+
+			assert.strictEqual(await w.allSecrets(), secretsBefore);
+		});
+
+		test('when the removal fails, the registration stays usable: a session write is saved', async () => {
+			const w = await createSeeded();
+			w.secrets.refuseDelete.add(SESSIONS_KEY);
+			await assert.rejects(w.dynamicStorage.removeDynamicProvider('p1'), /delete refused/);
+
+			await w.dynamicStorage.setSessionsForDynamicAuthProvider('p1', 'client-1', [{ access_token: 'at-new', token_type: 'Bearer', created_at: 2 }]);
+
+			assert.deepStrictEqual((await w.dynamicStorage.getSessionsForDynamicAuthProvider('p1', 'client-1'))?.map(t => t.access_token), ['at-new']);
+		});
+	});
+
 	suite('stored list is valid', () => {
 		test('a legacy entry with issuer and no authorizationServer migrates', async () => {
 			storeRaw(JSON.stringify([{ providerId: 'legacy', label: 'Legacy', issuer: 'https://issuer.example', clientId: 'client-legacy' }]));
