@@ -29,6 +29,37 @@ import { CancellationError, isCancellationError } from '../../../base/common/err
 import { raceCancellationError, SequencerByKey } from '../../../base/common/async.js';
 
 export interface IExtHostAuthentication extends ExtHostAuthentication { }
+
+/**
+ * Scopes for a log line: their count, never their values. A scope can come from a server (an MCP WWW-Authenticate challenge
+ * or the resource metadata's scopes_supported), so its text is not a log value. The scopes used for authentication are not
+ * changed.
+ */
+export function scopeCountText(scopes: readonly string[]): string {
+	return `${scopes.length} scope(s)`;
+}
+
+/** The opaque id given to each provider id that is not an extension's plain name, in the order they are first seen. */
+const opaqueProviderIds = new Map<string, string>();
+
+/**
+ * A provider's identity for a log line, an error message or a logger id; never for the protocol or for storage, which keep
+ * the id itself. An id made only of letters, digits, '.', '_' and '-' is an extension's own name for its provider and is
+ * shown as it is. Any other id is shown as an opaque id, the same for the same id in this process: a dynamic provider's id
+ * is its issuer string (and resource), which can hold a credential in its user info, path or query. The opaque id is not
+ * derived from the id's text, so it confirms nothing about it.
+ */
+export function authProviderIdForDiagnostics(id: string): string {
+	if (/^[\w.-]{1,128}$/.test(id)) {
+		return id;
+	}
+	let opaque = opaqueProviderIds.get(id);
+	if (opaque === undefined) {
+		opaque = `dynamic-auth-provider-${opaqueProviderIds.size + 1}`;
+		opaqueProviderIds.set(id, opaque);
+	}
+	return opaque;
+}
 export const IExtHostAuthentication = createDecorator<IExtHostAuthentication>('IExtHostAuthentication');
 
 interface ProviderWithMetadata {
@@ -138,7 +169,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 			// may have unregistered the provider in the meantime. I don't see how this could really be done
 			// synchronously, so we just say first one wins.
 			if (this._authenticationProviders.get(id)) {
-				this._logService.error(`An authentication provider with id '${id}' is already registered. The existing provider will not be replaced.`);
+				this._logService.error(`An authentication provider with id '${authProviderIdForDiagnostics(id)}' is already registered. The existing provider will not be replaced.`);
 				return;
 			}
 			const listener = provider.onDidChangeSessions(e => this._proxy.$sendDidChangeSessions(id, e));
@@ -173,7 +204,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				return await providerData.provider.createSession(scopes, options);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -184,7 +215,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				return await providerData.provider.removeSession(sessionId);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -196,7 +227,7 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 				return await providerData.provider.getSessions(scopes, options);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -210,10 +241,10 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					options.authorizationServer = URI.revive(options.authorizationServer);
 					return await provider.getSessionsFromChallenges(constraint, options);
 				}
-				throw new Error(`Authentication provider with handle: ${providerId} does not support getSessionsFromChallenges`);
+				throw new Error(`Authentication provider with handle: ${authProviderIdForDiagnostics(providerId)} does not support getSessionsFromChallenges`);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -227,10 +258,10 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					options.authorizationServer = URI.revive(options.authorizationServer);
 					return await provider.createSessionFromChallenges(constraint, options);
 				}
-				throw new Error(`Authentication provider with handle: ${providerId} does not support createSessionFromChallenges`);
+				throw new Error(`Authentication provider with handle: ${authProviderIdForDiagnostics(providerId)} does not support createSessionFromChallenges`);
 			}
 
-			throw new Error(`Unable to find authentication provider with handle: ${providerId}`);
+			throw new Error(`Unable to find authentication provider with handle: ${authProviderIdForDiagnostics(providerId)}`);
 		});
 	}
 
@@ -258,7 +289,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 		resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined,
 		clientId: string | undefined,
 		clientSecret: string | undefined,
-		initialTokens: IAuthorizationToken[] | undefined
+		initialTokens: IAuthorizationToken[] | undefined,
+		removalCount: number
 	): Promise<string> {
 		if (!clientId) {
 			const authorizationServer = URI.revive(authorizationServerComponents);
@@ -315,39 +347,48 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 			initialTokens || []
 		);
 
-		// Use the sequencer to ensure dynamic provider registration is serialized
-		await this._providerOperations.queue(provider.id, async () => {
-			this._authenticationProviders.set(
-				provider.id,
-				{
+		// Use the sequencer to ensure dynamic provider registration is serialized. A call for this provider from the main
+		// thread (which publishes it once saved) queues behind this operation, so it finds the provider installed below.
+		try {
+			await this._providerOperations.queue(provider.id, async () => {
+				// The main thread validates and saves the registration before it publishes the provider; it is installed here
+				// only after that resolves. A rejection leaves an entry already registered under this id untouched. The main
+				// thread refuses a registration it began before a removal of the provider completed (`removalCount`): such a
+				// registration may be queued here behind an operation that was pending during the removal, and carries the
+				// client ID and sessions read before it.
+				await this._proxy.$registerDynamicAuthenticationProvider({
+					id: provider.id,
 					label: provider.label,
-					provider,
-					disposable: Disposable.from(
+					supportsMultipleAccounts: true,
+					authorizationServer: authorizationServerComponents,
+					resourceServer: resourceMetadata ? URI.parse(resourceMetadata.resource) : undefined,
+					clientId: provider.clientId,
+					clientSecret: provider.clientSecret,
+					removalCount
+				});
+
+				const replaced = this._authenticationProviders.get(provider.id);
+				this._authenticationProviders.set(
+					provider.id,
+					{
+						label: provider.label,
 						provider,
-						provider.onDidChangeSessions(e => this._proxy.$sendDidChangeSessions(provider.id, e)),
-						provider.onDidChangeClientId(() => this._proxy.$sendDidChangeDynamicProviderInfo({
-							providerId: provider.id,
-							clientId: provider.clientId,
-							clientSecret: provider.clientSecret
-						}))
-					),
-					options: { supportsMultipleAccounts: true }
-				}
-			);
-
-			await this._proxy.$registerDynamicAuthenticationProvider({
-				id: provider.id,
-				label: provider.label,
-				supportsMultipleAccounts: true,
-				authorizationServer: authorizationServerComponents,
-				resourceServer: resourceMetadata ? URI.parse(resourceMetadata.resource) : undefined,
-				clientId: provider.clientId,
-				clientSecret: provider.clientSecret
+						disposable: Disposable.from(
+							provider,
+							provider.onDidChangeSessions(e => this._proxy.$sendDidChangeSessions(provider.id, e))
+						),
+						options: { supportsMultipleAccounts: true }
+					}
+				);
+				// The registration succeeded and the new provider is installed: the one it replaces is disposed, so it no
+				// longer forwards session events and its listeners are released.
+				replaced?.disposable?.dispose();
 			});
-		});
-
-
-
+		} catch (error) {
+			// Not saved, so published on neither side: the provisional provider is disposed and the rejection is the caller's.
+			provider.dispose();
+			throw error;
+		}
 
 		return provider.id;
 	}
@@ -372,15 +413,70 @@ class TaskSingler<T> {
 	}
 }
 
+/** The id of the explicit reset of a stored dynamic client registration and its sessions (RemoveDynamicAuthenticationProvidersAction). */
+const REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID = 'workbench.action.removeDynamicAuthenticationProviders';
+
+/**
+ * Refreshing stored sessions failed. They stay stored: a failure may be transient, and a refresh token is a credential.
+ * Only an explicit act of the user (signing out, or removing the provider) removes them. The message carries no token and
+ * no issuer string and no server-provided name: `label` is the issuer's host alone ({@link DynamicAuthProvider} `_errorLabel`).
+ */
+export class DynamicAuthSessionRefreshError extends Error {
+	override readonly name = 'DynamicAuthSessionRefreshError';
+	constructor(label: string, count: number) {
+		super(nls.localize('dynamicAuthSessionRefreshFailed', "Refreshing {0} stored session(s) of '{1}' failed; they are kept. Try again, sign out and sign in again, or remove them with the command 'Authentication: Remove Dynamic Authentication Providers' ({2}).", count, label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
+	}
+}
+
+/**
+ * Stored sessions have expired and carry no refresh token. They stay stored: only an explicit act of the user (signing
+ * out, or removing the provider) removes them. The message carries no token and no issuer string (see `label` above).
+ */
+export class DynamicAuthSessionExpiredError extends Error {
+	override readonly name = 'DynamicAuthSessionExpiredError';
+	constructor(label: string, count: number) {
+		super(nls.localize('dynamicAuthSessionExpired', "{0} stored session(s) of '{1}' have expired and cannot be refreshed; they are kept. Sign out and sign in again, or remove them with the command 'Authentication: Remove Dynamic Authentication Providers' ({2}).", count, label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
+	}
+}
+
+/**
+ * The authorization server rejected the stored client registration (invalid_client). It is kept, with its sessions: a new
+ * registration is made only after an explicit act of the user has removed the stored one. The message carries no secret
+ * and no issuer string (see `label` above).
+ */
+export class DynamicAuthClientRejectedError extends Error {
+	override readonly name = 'DynamicAuthClientRejectedError';
+	constructor(label: string) {
+		super(nls.localize('dynamicAuthClientRejected', "The authorization server rejected the stored client registration of '{0}'; it is kept. Remove it with the command 'Authentication: Remove Dynamic Authentication Providers' ({1}), then sign in again.", label, REMOVE_DYNAMIC_AUTH_PROVIDERS_COMMAND_ID));
+	}
+}
+
+/**
+ * Changed sessions could not be saved to secret storage (for example encryption is unavailable). The change is kept as
+ * pending in this window and saved by the next operation, which reports success only once it is saved; until then the
+ * stored sessions are the previous ones. No completed-change event is published for it. The message carries no token.
+ */
+export class DynamicAuthSessionPersistError extends Error {
+	override readonly name = 'DynamicAuthSessionPersistError';
+	/** `failure` is the fixed {@link SESSION_PERSIST_FAILURE} text, never text of the storage's error. */
+	constructor(count: number, failure: typeof SESSION_PERSIST_FAILURE) {
+		super(nls.localize('dynamicAuthSessionPersistFailed', "{0} session(s) could not be saved to secret storage ({1}); the change is kept in this window and saved by the next sign-in operation. Until then it is lost on restart.", count, failure));
+	}
+}
+
+/**
+ * The category of a failed session save, for a log line and {@link DynamicAuthSessionPersistError}. The save is a call to
+ * another process: the error it rejects with is reconstructed from that process's text, so its name, message, stack and
+ * cause are all foreign text, and none of them is repeated or used to choose this text.
+ */
+const SESSION_PERSIST_FAILURE = 'the secret storage did not accept the write';
+
 export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	readonly id: string;
 	readonly label: string;
 
 	private _onDidChangeSessions = new Emitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>();
 	readonly onDidChangeSessions = this._onDidChangeSessions.event;
-
-	private readonly _onDidChangeClientId = new Emitter<void>();
-	readonly onDidChangeClientId = this._onDidChangeClientId.event;
 
 	private readonly _tokenStore: TokenStore;
 
@@ -390,6 +486,13 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	}>;
 
 	protected readonly _logger: ILogger;
+	/**
+	 * The provider's name in an error message: the issuer's host (and port) alone. Never the server-provided resource name,
+	 * and never the issuer's user info, path or query, any of which can hold a credential.
+	 */
+	protected readonly _errorLabel: string;
+	/** The provider's identity in a log line and its logger id ({@link authProviderIdForDiagnostics}); {@link id} is never one. */
+	readonly diagnosticId: string;
 	private readonly _disposable: DisposableStore;
 
 	constructor(
@@ -412,10 +515,19 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		this.id = _resourceMetadata?.resource
 			? stringifiedServer + ' ' + _resourceMetadata?.resource
 			: stringifiedServer;
-		// Auth Provider label is just the resource name if provided, otherwise the authority of the authorization server.
-		this.label = _resourceMetadata?.resource_name ?? this.authorizationServer.authority;
+		// The id is the protocol and storage identity only. A diagnostic names the provider by an opaque id and the issuer's
+		// host: the issuer string can hold a credential in its user info, path or query.
+		const authority = this.authorizationServer.authority;
+		const host = authority.slice(authority.lastIndexOf('@') + 1);
+		this.diagnosticId = authProviderIdForDiagnostics(this.id);
+		// The label is shown to the user: the resource name if provided (RFC 9728 names it for display to the end user),
+		// otherwise the issuer's host, never its user info. It is not a diagnostic: no log line, logger or error carries it.
+		this.label = _resourceMetadata?.resource_name ?? host;
+		this._errorLabel = host;
 
-		this._logger = loggerService.createLogger(this.id, { name: `Auth: ${this.label}` });
+		// The logger's id becomes its file name and its name the output channel's: neither carries the issuer string or the
+		// server-provided resource name.
+		this._logger = loggerService.createLogger(this.diagnosticId, { name: `Auth: ${host} (${this.diagnosticId})` });
 		this._disposable = new DisposableStore();
 		this._disposable.add(this._onDidChangeSessions);
 		const scopedEvent = Event.chain(onDidDynamicAuthProviderTokensChange.event, $ => $
@@ -450,7 +562,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 	}
 
 	async getSessions(scopes: readonly string[] | undefined, _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession[]> {
-		this._logger.info(`Getting sessions for scopes: ${scopes?.join(' ') ?? 'all'}`);
+		// Scope counts only, never values: a scope can come from a server (an MCP challenge or the resource metadata).
+		this._logger.info(scopes ? `Getting sessions for ${scopeCountText(scopes)}` : 'Getting sessions for all scopes');
+		// A change that could not be saved earlier is saved first: no read reports success over an unsaved credential.
+		await this._tokenStore.savePending();
 		if (!scopes) {
 			return this._tokenStore.sessions;
 		}
@@ -460,10 +575,14 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		const sortedScopes = [...scopes].sort();
 		const scopeStr = scopes.join(' ');
 		let sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
-		this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
+		this._logger.info(`Found ${sessions.length} sessions for ${scopeCountText(scopes)}`);
 		if (sessions.length) {
 			const newTokens: IAuthorizationToken[] = [];
 			const removedTokens: IAuthorizationToken[] = [];
+			const refreshedTokens = new Set<IAuthorizationToken>();
+			const expiredTokens: IAuthorizationToken[] = [];
+			// invalid_client: the stored client registration was rejected. Every refresh uses it, so none is tried after.
+			let clientRejected = false;
 			const tokenMap = new Map<string, IAuthorizationToken>(this._tokenStore.tokens.map(token => [token.access_token, token]));
 			for (const session of sessions) {
 				const token = tokenMap.get(session.accessToken);
@@ -472,15 +591,23 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					const expiresInMS = token.expires_in * 1000;
 					// Check if the token is about to expire in 5 minutes or if it is expired
 					if (now > token.created_at + expiresInMS - (5 * 60 * 1000)) {
-						this._logger.info(`Token for session ${session.id} is about to expire, refreshing...`);
-						removedTokens.push(token);
 						if (!token.refresh_token) {
-							// No refresh token available, cannot refresh
-							this._logger.warn(`No refresh token available for scopes ${session.scopes.join(' ')}. Throwing away token.`);
+							// No refresh token: a token that has not expired yet stays usable. An expired one stays stored (only an
+							// explicit act of the user removes it) and this operation rejects, naming that act.
+							if (now >= token.created_at + expiresInMS) {
+								this._logger.warn(`Token for session ${session.id} has expired and has no refresh token; it is kept.`);
+								expiredTokens.push(token);
+							}
 							continue;
 						}
+						this._logger.info(`Token for session ${session.id} is about to expire, refreshing...`);
+						removedTokens.push(token);
 						try {
 							const newToken = await this.exchangeRefreshTokenForToken(token.refresh_token);
+							// RFC 6749 section 6: the server may keep the refresh token and not return it. The stored one stays in use.
+							if (newToken.refresh_token === undefined) {
+								newToken.refresh_token = token.refresh_token;
+							}
 							// TODO@TylerLeonhardt: When the core scope handling doesn't care about order, this check should be
 							// updated to not care about order
 							if (newToken.scope !== scopeStr) {
@@ -488,29 +615,53 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 								this._logger.warn('Token scopes do not match the requested scopes. Overwriting token with what was requested...');
 								newToken.scope = scopeStr;
 							}
-							this._logger.info(`Successfully created a new token for scopes ${session.scopes.join(' ')}.`);
+							this._logger.info(`Successfully created a new token for ${scopeCountText(session.scopes)}.`);
 							newTokens.push(newToken);
+							refreshedTokens.add(token);
 						} catch (err) {
+							if (err instanceof DynamicAuthClientRejectedError) {
+								// A fixed diagnosis: the error's own text names the provider and is the caller's.
+								this._logger.error('Failed to refresh token: the authorization server rejected the stored client registration (invalid_client).');
+								clientRejected = true;
+								break;
+							}
 							this._logger.error(`Failed to refresh token: ${describeOAuthFailure(err, 'the refresh failed unexpectedly')}`);
 						}
 
 					}
 				}
 			}
-			if (newTokens.length || removedTokens.length) {
-				this._tokenStore.update({ added: newTokens, removed: removedTokens });
+			// A token whose refresh failed stays stored (a failure may be transient; its refresh token is a credential) and
+			// this operation rejects. Only an explicit act of the user removes it: signing out, or removing the provider.
+			const failedRefreshTokens = removedTokens.filter(t => !refreshedTokens.has(t));
+			const replacedTokens = removedTokens.filter(t => refreshedTokens.has(t));
+			if (newTokens.length || replacedTokens.length) {
+				await this._tokenStore.update({ added: newTokens, removed: replacedTokens });
 				// Since we updated the tokens, we need to re-filter the sessions
 				// to get the latest state
 				sessions = this._tokenStore.sessions.filter(session => arraysEqual([...session.scopes].sort(), sortedScopes));
 			}
-			this._logger.info(`Found ${sessions.length} sessions for scopes: ${scopeStr}`);
+			// The refreshes that succeeded before a rejection are saved above; the rejection is then reported as itself, so it
+			// stays distinguishable from a refresh failure that may be transient.
+			if (clientRejected) {
+				throw new DynamicAuthClientRejectedError(this._errorLabel);
+			}
+			if (failedRefreshTokens.length) {
+				throw new DynamicAuthSessionRefreshError(this._errorLabel, failedRefreshTokens.length);
+			}
+			if (expiredTokens.length) {
+				throw new DynamicAuthSessionExpiredError(this._errorLabel, expiredTokens.length);
+			}
+			this._logger.info(`Found ${sessions.length} sessions for ${scopeCountText(scopes)}`);
 			return sessions;
 		}
 		return [];
 	}
 
 	async createSession(scopes: string[], _options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
-		this._logger.info(`Creating session for scopes: ${scopes.join(' ')}`);
+		this._logger.info(`Creating session for ${scopeCountText(scopes)}`);
+		// Saved before the user is asked to sign in: a storage that cannot save would lose the new session too.
+		await this._tokenStore.savePending();
 		let token: IAuthorizationTokenResponse | undefined;
 		let lastFlowError: unknown;
 		for (let i = 0; i < this._createFlows.length; i++) {
@@ -528,6 +679,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 					break;
 				}
 			} catch (err) {
+				if (err instanceof DynamicAuthClientRejectedError) {
+					// Every flow uses the same client registration: stop, naming the explicit reset.
+					throw err;
+				}
 				lastFlowError = err;
 				const nextMode = this._createFlows[i + 1]?.label;
 				if (!nextMode) {
@@ -568,14 +723,16 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		}
 
 		// Store session for later retrieval
-		this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
+		await this._tokenStore.update({ added: [{ ...token, created_at: Date.now() }], removed: [] });
 		const session = this._tokenStore.sessions.find(t => t.accessToken === token.access_token)!;
-		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for scopes: ${scopes.join(' ')}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
+		this._logger.info(`Created ${token.refresh_token ? 'refreshable' : 'non-refreshable'} session for ${scopeCountText(scopes)}${token.expires_in ? ` that expires in ${token.expires_in} seconds` : ''}`);
 		return session;
 	}
 
 	async removeSession(sessionId: string): Promise<void> {
 		this._logger.info(`Removing session with id: ${sessionId}`);
+		// A sign-out that failed to save is retried here: it reports success only once the removal is stored.
+		await this._tokenStore.savePending();
 		const session = this._tokenStore.sessions.find(session => session.id === sessionId);
 		if (!session) {
 			this._logger.error(`Session with id ${sessionId} not found`);
@@ -586,8 +743,8 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.error(`Failed to retrieve token for removed session: ${session.id}`);
 			return;
 		}
-		this._tokenStore.update({ added: [], removed: [token] });
-		this._logger.info(`Removed token for session: ${session.id} with scopes: ${session.scopes.join(' ')}`);
+		await this._tokenStore.update({ added: [], removed: [token] });
+		this._logger.info(`Removed token for session: ${session.id} with ${scopeCountText(session.scopes)}`);
 	}
 
 	dispose(): void {
@@ -641,7 +798,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 		const promise = this.waitForAuthorizationCode(callbackUri);
 
 		// Open the browser for user authorization
-		this._logger.info(`Opening authorization URL for scopes: ${scopeString}`);
+		this._logger.info(`Opening authorization URL for ${scopeCountText(scopes)}`);
 		let opened: boolean;
 		try {
 			opened = await this._extHostWindow.openUri(authorizationUrl.toString(), {});
@@ -674,7 +831,7 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.error(`Failed to receive authorization code: ${detail}`);
 			throw new OAuthSafeError(`Failed to receive authorization code: ${detail}`);
 		}
-		this._logger.info(`Authorization code received for scopes: ${scopeString}`);
+		this._logger.info(`Authorization code received for ${scopeCountText(scopes)}`);
 
 		// Exchange the authorization code for tokens
 		const tokenResponse = await this.exchangeCodeForToken(code, codeVerifier, redirectUri);
@@ -765,6 +922,10 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			throw error;
 		}
 
+		if (!response.ok && await this._isInvalidClientResponse(response)) {
+			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+			throw new DynamicAuthClientRejectedError(this._errorLabel);
+		}
 		if (!response.ok) {
 			// Status and a vetted OAuth error code only: the body can hold credentials
 			throw await createOAuthHttpError('Token exchange', response);
@@ -775,11 +936,22 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			this._logger.info(`Successfully exchanged authorization code for token.`);
 			return result;
 		} else if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
-			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
-			await this._generateNewClientId();
-			throw new OAuthSafeError('Client ID was invalid, generated a new one. Please try again.');
+			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+			throw new DynamicAuthClientRejectedError(this._errorLabel);
 		}
 		throw createOAuthInvalidResponseError('authorization token', response, result);
+	}
+
+	/**
+	 * Whether an unsuccessful response is the OAuth error `invalid_client` (RFC 6749 section 5.2), which servers send with
+	 * HTTP 400 or 401. It reads a clone, so the caller can still read the response, and it logs nothing of the body.
+	 * The clone is read by {@link readOAuthErrorBody}, which keeps no part of a read or parser error (either can quote a
+	 * credential): a body that cannot be read or is not JSON is not `invalid_client`, and the caller's own reading of the
+	 * response names that outcome in its failure.
+	 */
+	protected async _isInvalidClientResponse(response: Response): Promise<boolean> {
+		const outcome = await readOAuthErrorBody(response.clone());
+		return outcome.kind === 'json' && isAuthorizationErrorResponse(outcome.body) && outcome.body.error === AuthorizationErrorType.InvalidClient;
 	}
 
 	protected async exchangeRefreshTokenForToken(refreshToken: string): Promise<IAuthorizationToken> {
@@ -836,48 +1008,13 @@ export class DynamicAuthProvider implements vscode.AuthenticationProvider {
 			}
 		}
 		if (isAuthorizationErrorResponse(result) && result.error === AuthorizationErrorType.InvalidClient) {
-			this._logger.warn(`Client ID (${this._clientId}) was invalid, generated a new one.`);
-			await this._generateNewClientId();
-			throw new OAuthSafeError('Client ID was invalid, generated a new one. Please try again.');
+			this._logger.warn(`Client ID (${this._clientId}) was rejected as invalid; the stored client registration is kept.`);
+			throw new DynamicAuthClientRejectedError(this._errorLabel);
 		}
 		if (failure) {
 			throw new OAuthSafeError(formatOAuthHttpFailure('Token refresh', response, failure));
 		}
 		throw createOAuthInvalidResponseError('authorization token', response, result);
-	}
-
-	protected async _generateNewClientId(): Promise<void> {
-		try {
-			const registration = await fetchDynamicRegistration(this._serverMetadata, this._initData.environment.appName, this._resourceMetadata?.scopes_supported);
-			this._clientId = registration.client_id;
-			this._clientSecret = registration.client_secret;
-			this._onDidChangeClientId.fire();
-		} catch (err) {
-			// When DCR fails, try to prompt the user for a client ID and client secret
-			// The issuer string is supplied by the server and can carry credentials: it is not logged
-			const registrationFailure = describeOAuthFailure(err, 'the registration request failed unexpectedly');
-			this._logger.info(`Dynamic registration failed: ${registrationFailure}. Prompting user for client ID and client secret.`);
-
-			try {
-				const clientDetails = await this._proxy.$promptForClientRegistration(this.authorizationServer.toString());
-				if (!clientDetails) {
-					throw new Error('User did not provide client details');
-				}
-				this._clientId = clientDetails.clientId;
-				this._clientSecret = clientDetails.clientSecret;
-				this._logger.info('User provided client ID');
-				if (clientDetails.clientSecret) {
-					this._logger.info('User provided client secret');
-				} else {
-					this._logger.info('User did not provide client secret (optional)');
-				}
-
-				this._onDidChangeClientId.fire();
-			} catch (promptErr) {
-				this._logger.error(`Failed to fetch new client ID and user did not provide one: ${registrationFailure}`);
-				throw new OAuthSafeError(`Failed to fetch new client ID and user did not provide one: ${registrationFailure}`);
-			}
-		}
 	}
 }
 
@@ -889,6 +1026,10 @@ type IAuthorizationToken = IAuthorizationTokenResponse & {
 };
 
 class TokenStore implements Disposable {
+	/** The tokens this window uses. They may hold a change that is not saved yet ({@link _pending}). */
+	private _tokens: IAuthorizationToken[];
+	private _pending = false;
+	/** The tokens known to be saved: completed-change events are published from these only. */
 	private readonly _tokensObservable: ISettableObservable<IAuthorizationToken[]>;
 	private readonly _sessionsObservable: IObservable<vscode.AuthenticationSession[]>;
 
@@ -898,35 +1039,48 @@ class TokenStore implements Disposable {
 	private readonly _disposable: DisposableStore;
 
 	constructor(
-		private readonly _persistence: { onDidChange: Event<IAuthorizationToken[]>; set: (tokens: IAuthorizationToken[]) => void },
+		private readonly _persistence: { onDidChange: Event<IAuthorizationToken[]>; set: (tokens: IAuthorizationToken[]) => Promise<void> },
 		initialTokens: IAuthorizationToken[],
 		private readonly _logger: ILogger
 	) {
 		this._disposable = new DisposableStore();
+		this._tokens = initialTokens;
 		this._tokensObservable = observableValue<IAuthorizationToken[]>('tokens', initialTokens);
 		this._sessionsObservable = derivedOpts(
 			{ equalsFn: (a, b) => arraysEqual(a, b, (a, b) => a.accessToken === b.accessToken) },
 			(reader) => this._tokensObservable.read(reader).map(t => this._getSessionFromToken(t))
 		);
 		this._disposable.add(this._registerChangeEventAutorun());
-		this._disposable.add(this._persistence.onDidChange((tokens) => this._tokensObservable.set(tokens, undefined)));
+		this._disposable.add(this._persistence.onDidChange((tokens) => {
+			this._tokensObservable.set(tokens, undefined);
+			if (this._pending) {
+				// The unsaved change may hold a rotated refresh token: it is kept, and saved by the next operation.
+				this._logger.warn('The stored sessions changed while a change here is not saved yet; the change here is kept and saved by the next operation.');
+			} else {
+				this._tokens = tokens;
+			}
+		}));
 	}
 
 	get tokens(): IAuthorizationToken[] {
-		return this._tokensObservable.get();
+		return this._tokens;
 	}
 
 	get sessions(): vscode.AuthenticationSession[] {
-		return this._sessionsObservable.get();
+		return this._tokens.map(t => this._getSessionFromToken(t));
 	}
 
 	dispose() {
 		this._disposable.dispose();
 	}
 
-	update({ added, removed }: { added: IAuthorizationToken[]; removed: IAuthorizationToken[] }): void {
+	/**
+	 * Applies the change here and saves it. When it cannot be saved this rejects with {@link DynamicAuthSessionPersistError}
+	 * (after one error line) and the change stays pending: {@link savePending} saves it before a later operation succeeds.
+	 */
+	async update({ added, removed }: { added: IAuthorizationToken[]; removed: IAuthorizationToken[] }): Promise<void> {
 		this._logger.trace(`Updating tokens: added ${added.length}, removed ${removed.length}`);
-		const currentTokens = [...this._tokensObservable.get()];
+		const currentTokens = [...this._tokens];
 		for (const token of removed) {
 			const index = currentTokens.findIndex(t => t.access_token === token.access_token);
 			if (index !== -1) {
@@ -942,10 +1096,34 @@ class TokenStore implements Disposable {
 			}
 		}
 		if (added.length || removed.length) {
-			this._tokensObservable.set(currentTokens, undefined);
-			void this._persistence.set(currentTokens);
+			this._tokens = currentTokens;
+			this._pending = true;
 		}
+		await this.savePending();
 		this._logger.trace(`Tokens updated: ${currentTokens.length} tokens stored.`);
+	}
+
+	/**
+	 * Saves a change that is not saved yet; nothing to do otherwise. Once saved, the completed-change event is published.
+	 * Rejects with {@link DynamicAuthSessionPersistError} after one error line, leaving the change pending.
+	 */
+	async savePending(): Promise<void> {
+		if (!this._pending) {
+			return;
+		}
+		const tokens = this._tokens;
+		try {
+			await this._persistence.set(tokens);
+		} catch {
+			// The tokens are credentials, and the storage error is foreign text (its name included): only the count and a
+			// fixed category are logged and carried (no cause).
+			this._logger.error(`Failed to save ${tokens.length} token(s) to secret storage: ${SESSION_PERSIST_FAILURE}`);
+			throw new DynamicAuthSessionPersistError(tokens.length, SESSION_PERSIST_FAILURE);
+		}
+		if (this._tokens === tokens) {
+			this._pending = false;
+		}
+		this._tokensObservable.set(tokens, undefined);
 	}
 
 	private _registerChangeEventAutorun(): IDisposable {

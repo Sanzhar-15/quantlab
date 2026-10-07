@@ -39,17 +39,23 @@ export class NativeSecretStorageService extends BaseSecretStorageService {
 	}
 
 	override set(key: string, value: string): Promise<void> {
-		this._sequencer.queue(key, async () => {
-			await this.resolvedStorageService;
-
-			if (this.type !== 'persisted' && !this._environmentService.useInMemorySecretStorage) {
-				this._logService.trace('[NativeSecretStorageService] Notifying user that secrets are not being stored on disk.');
-				await this.notifyOfNoEncryptionOnce();
-			}
-
+		// One sequenced operation: the notification, then the write. A choice made in the notification (such as "Use
+		// weaker encryption", which reinitializes) applies to this write; a failed notification aborts it, so a rejected
+		// set never writes. When encryption stays unavailable the write rejects with SecretStorageUnavailableError.
+		return this._sequencer.queue(key, async () => {
+			await this.notifyIfEncryptionUnavailable();
+			await this.writeUnqueued(key, value);
 		});
+	}
 
-		return super.set(key, value);
+	private async notifyIfEncryptionUnavailable(): Promise<void> {
+		if (this._environmentService.useInMemorySecretStorage || this.type === 'persisted') {
+			return;
+		}
+		if (!await this._encryptionService.isEncryptionAvailable()) {
+			this._logService.trace('[NativeSecretStorageService] Notifying user that secrets cannot be stored: encryption is not available.');
+			await this.notifyOfNoEncryptionOnce();
+		}
 	}
 
 	private notifyOfNoEncryptionOnce = createSingleCallFunction(() => this.notifyOfNoEncryption());

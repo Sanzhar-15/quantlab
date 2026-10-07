@@ -198,7 +198,11 @@ suite('Authentication - stored secrets that cannot be read', () => {
 		test('storing sessions logs no token text at any level', async () => {
 			const logService = new RecordingLogService();
 			const service = store.add(new DynamicAuthenticationProviderStorageService(store.add(new TestStorageService()), new TestSecretStorageService(), logService));
+			// As in production: sessions are saved only for a registered provider (an extension-host provider is installed
+			// only after its registration is stored, under the same id and client ID).
+			await service.storeClientRegistration('p1', 'https://as.example', 'c1', undefined, 'Label', 0);
 			await service.setSessionsForDynamicAuthProvider('p1', 'c1', [{ access_token: 'tok-secret-text', refresh_token: 'refresh-secret-text', token_type: 'Bearer', created_at: 1 }]);
+			assert.deepStrictEqual((await service.getSessionsForDynamicAuthProvider('p1', 'c1'))?.map(t => t.access_token), ['tok-secret-text'], 'the sessions are saved');
 			assert.ok(logService.logged.length > 0);
 			assert.ok(logService.logged.every(line => !line.includes('tok-secret-text') && !line.includes('refresh-secret-text')), logService.logged.join(' | '));
 		});

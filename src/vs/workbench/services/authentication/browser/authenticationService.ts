@@ -23,6 +23,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { IAuthorizationProtectedResourceMetadata, IAuthorizationServerMetadata, parseWWWAuthenticateHeader } from '../../../../base/common/oauth.js';
 import { raceCancellation, raceTimeout } from '../../../../base/common/async.js';
 import { CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { authProviderIdForDiagnostics } from './dynamicAuthenticationProviderStorageService.js';
 
 export function getAuthenticationProviderActivationEvent(id: string): string { return `onAuthenticationRequest:${id}`; }
 
@@ -177,9 +178,9 @@ export class AuthenticationService extends Disposable implements IAuthentication
 
 					if (!this.declaredProviders.some(p => p.id === provider.id)) {
 						this.registerDeclaredAuthenticationProvider(provider);
-						this._logService.debug(`Declared authentication provider: ${provider.id}`);
+						this._logService.debug(`Declared authentication provider: ${authProviderIdForDiagnostics(provider.id)}`);
 					} else {
-						point.collector.error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", provider.id));
+						point.collector.error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", authProviderIdForDiagnostics(provider.id)));
 					}
 				}
 			});
@@ -189,7 +190,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				const provider = this.declaredProviders.find(provider => provider.id === point.id);
 				if (provider) {
 					this.unregisterDeclaredAuthenticationProvider(provider.id);
-					this._logService.debug(`Undeclared authentication provider: ${provider.id}`);
+					this._logService.debug(`Undeclared authentication provider: ${authProviderIdForDiagnostics(provider.id)}`);
 				}
 			});
 		}));
@@ -203,7 +204,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 			throw new Error(localize('authentication.missingLabel', 'An authentication contribution must specify a label.'));
 		}
 		if (this.declaredProviders.some(p => p.id === provider.id)) {
-			throw new Error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", provider.id));
+			throw new Error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", authProviderIdForDiagnostics(provider.id)));
 		}
 		this._declaredProviders.push(provider);
 		this._onDidChangeDeclaredProviders.fire();
@@ -263,7 +264,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 		if (this._authenticationProviders.has(id)) {
 			return this._authenticationProviders.get(id)!;
 		}
-		throw new Error(`No authentication provider '${id}' is currently registered.`);
+		throw new Error(`No authentication provider '${authProviderIdForDiagnostics(id)}' is currently registered.`);
 	}
 
 	async getAccounts(id: string): Promise<ReadonlyArray<AuthenticationSessionAccount>> {
@@ -293,12 +294,13 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				// Skip the resource server check since the auth provider id contains a specific resource server
 				// TODO@TylerLeonhardt: this can change when we have providers that support multiple resource servers
 				if (!this.matchesProvider(authProvider, server)) {
-					throw new Error(`The authentication provider '${id}' does not support the authorization server '${server.toString(true)}'.`);
+					// Neither id nor server is shown as it is: an issuer string can hold a credential in its user info, path or query.
+					throw new Error(`The authentication provider '${authProviderIdForDiagnostics(id)}' does not support the requested authorization server.`);
 				}
 			}
 			if (isAuthenticationWwwAuthenticateRequest(scopeListOrRequest)) {
 				if (!authProvider.getSessionsFromChallenges) {
-					throw new Error(`The authentication provider '${id}' does not support getting sessions from challenges.`);
+					throw new Error(`The authentication provider '${authProviderIdForDiagnostics(id)}' does not support getting sessions from challenges.`);
 				}
 				return await authProvider.getSessionsFromChallenges(
 					{ challenges: parseWWWAuthenticateHeader(scopeListOrRequest.wwwAuthenticate), fallbackScopes: scopeListOrRequest.fallbackScopes },
@@ -307,7 +309,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 			}
 			return await authProvider.getSessions(scopeListOrRequest ? [...scopeListOrRequest] : undefined, { ...options });
 		} else {
-			throw new Error(`No authentication provider '${id}' is currently registered.`);
+			throw new Error(`No authentication provider '${authProviderIdForDiagnostics(id)}' is currently registered.`);
 		}
 	}
 
@@ -320,7 +322,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 		if (authProvider) {
 			if (isAuthenticationWwwAuthenticateRequest(scopeListOrRequest)) {
 				if (!authProvider.createSessionFromChallenges) {
-					throw new Error(`The authentication provider '${id}' does not support creating sessions from challenges.`);
+					throw new Error(`The authentication provider '${authProviderIdForDiagnostics(id)}' does not support creating sessions from challenges.`);
 				}
 				return await authProvider.createSessionFromChallenges(
 					{ challenges: parseWWWAuthenticateHeader(scopeListOrRequest.wwwAuthenticate), fallbackScopes: scopeListOrRequest.fallbackScopes },
@@ -329,7 +331,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 			}
 			return await authProvider.createSession([...scopeListOrRequest], { ...options });
 		} else {
-			throw new Error(`No authentication provider '${id}' is currently registered.`);
+			throw new Error(`No authentication provider '${authProviderIdForDiagnostics(id)}' is currently registered.`);
 		}
 	}
 
@@ -342,7 +344,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 		if (authProvider) {
 			return authProvider.removeSession(sessionId);
 		} else {
-			throw new Error(`No authentication provider '${id}' is currently registered.`);
+			throw new Error(`No authentication provider '${authProviderIdForDiagnostics(id)}' is currently registered.`);
 		}
 	}
 
@@ -379,11 +381,12 @@ export class AuthenticationService extends Disposable implements IAuthentication
 		const providerId = await delegate.create(authorizationServer, serverMetadata, resource);
 		const provider = this._authenticationProviders.get(providerId);
 		if (provider) {
-			this._logService.debug(`Created dynamic authentication provider: ${providerId}`);
+			// The provider id is the issuer string, which can hold a credential: the diagnostic identity is logged.
+			this._logService.debug(`Created dynamic authentication provider: ${authProviderIdForDiagnostics(providerId)}`);
 			this._dynamicAuthenticationProviderIds.add(providerId);
 			return provider;
 		}
-		this._logService.error(`Failed to create dynamic authentication provider: ${providerId}`);
+		this._logService.error(`Failed to create dynamic authentication provider: ${authProviderIdForDiagnostics(providerId)}`);
 		return undefined;
 	}
 
@@ -456,9 +459,9 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				return provider;
 			}
 			if (!result) {
-				throw new Error(`Timed out waiting for authentication provider '${providerId}' to register.`);
+				throw new Error(`Timed out waiting for authentication provider '${authProviderIdForDiagnostics(providerId)}' to register.`);
 			}
-			throw new Error(`No authentication provider '${providerId}' is currently registered.`);
+			throw new Error(`No authentication provider '${authProviderIdForDiagnostics(providerId)}' is currently registered.`);
 		} finally {
 			store.dispose();
 		}
