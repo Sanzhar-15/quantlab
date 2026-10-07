@@ -135,5 +135,6 @@
 		"https://open-vsx.org"
 	],
 	"quantlab.qicEnabled": false,
-	"quantlab.quantbookEnabled": false
+	"quantlab.quantbookEnabled": false,
+	"extensionSignatureVerification": false
 }
