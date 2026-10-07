@@ -117,28 +117,29 @@ class CSVLoader:
         return None
 
     def _parse_date(self, date_str: str) -> datetime:
-        """Parse date string, auto-detecting format if needed."""
+        """Parse a date string. The format is detected on the first row and then holds for the whole file:
+        a later row in another format is a named error, never re-detected (a file mixing %m/%d and %d/%m
+        would otherwise be read with two meanings)."""
         date_str = date_str.strip()
 
-        # Check for Unix epoch timestamp (integer or float)
+        # A format detected on an earlier row (Unix epoch seconds or a strptime format) holds for every row.
         if self._detected_date_format == "__epoch__":
             return datetime.fromtimestamp(float(date_str), tz=timezone.utc)
-
-        try:
-            epoch = float(date_str)
-            # Heuristic: if it looks like a Unix timestamp (> year 2000 in seconds)
-            if epoch > 946684800 and date_str.replace(".", "").replace("-", "").isdigit():
-                self._detected_date_format = "__epoch__"
-                return datetime.fromtimestamp(epoch, tz=timezone.utc)
-        except (ValueError, OverflowError):
-            pass
-
-        # Use detected format if available
         if self._detected_date_format:
             try:
                 return _utc(datetime.strptime(date_str, self._detected_date_format))
-            except ValueError:
-                pass  # Fall through to auto-detect
+            except ValueError as e:
+                raise CSVLoaderError(f"date {date_str!r} does not match the format {self._detected_date_format} of the earlier rows") from e
+
+        if not self.date_format:
+            try:
+                epoch = float(date_str)
+                # Heuristic: if it looks like a Unix timestamp (> year 2000 in seconds)
+                if epoch > 946684800 and date_str.replace(".", "").replace("-", "").isdigit():
+                    self._detected_date_format = "__epoch__"
+                    return datetime.fromtimestamp(epoch, tz=timezone.utc)
+            except (ValueError, OverflowError):
+                pass  # not a number: a text date, detected below
 
         # Use specified format
         if self.date_format:
@@ -156,19 +157,23 @@ class CSVLoader:
         raise CSVLoaderError(f"Could not parse date: {date_str}")
 
     def _parse_decimal(self, value: str) -> Decimal:
-        """Parse string to Decimal, handling common formats."""
-        value = value.strip().replace(",", "")
-        if not value or value.lower() in ("nan", "null", ""):
-            return Decimal("0")
-        return Decimal(value)
+        """Parse a price cell (thousands commas allowed). An empty, null or non-finite cell is a ValueError:
+        it never becomes a number (iter_bars names the row)."""
+        cell = value.strip().replace(",", "")
+        if not cell or cell.lower() in ("nan", "null"):
+            raise ValueError(f"empty or not-a-number cell {value!r}")
+        result = Decimal(cell)
+        if not result.is_finite():
+            raise ValueError(f"non-finite cell {value!r}")
+        return result
 
     def _parse_int(self, value: str) -> int:
-        """Parse string to int, handling common formats."""
-        value = value.strip().replace(",", "")
-        if not value or value.lower() in ("nan", "null", ""):
-            return 0
-        # Handle float strings like "1000000.0"
-        return int(float(value))
+        """Parse a volume cell; "1000000.0" is accepted, a fractional volume is not. An empty, null or
+        non-finite cell is a ValueError, never 0."""
+        number = self._parse_decimal(value)
+        if number != number.to_integral_value():
+            raise ValueError(f"fractional volume {value!r}")
+        return int(number)
 
     def load_bars(
         self,

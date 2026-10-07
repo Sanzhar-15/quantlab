@@ -53,7 +53,7 @@ def test_epoch_and_text_timestamps_are_the_same_kind(tmp_path):
 
 def test_an_unreadable_date_is_a_named_error_not_a_dropped_row(tmp_path):
     path = write(tmp_path, daily(3) + "not-a-date,1,1,1,1,1\n" + "2025-01-05,1,1,1,1,1\n")
-    with pytest.raises(CSVLoaderError, match=r"row 5 cannot be read \(Could not parse date: not-a-date\).*'not-a-date'"):
+    with pytest.raises(CSVLoaderError, match=r"row 5 cannot be read \(date 'not-a-date' does not match the format %Y-%m-%d of the earlier rows\).*'not-a-date'"):
         CSVLoader(path).load_bars("BARS")
 
 
@@ -67,3 +67,31 @@ def test_a_short_row_is_a_named_error_and_a_blank_line_is_not_a_row(tmp_path):
     assert len(CSVLoader(write(tmp_path, daily(2) + "\n" + "2025-01-04,1,1,1,1,1\n", "blank.csv")).load_bars("B")) == 3
     with pytest.raises(CSVLoaderError, match=r"row 3 has 5 cells, 6 needed"):
         CSVLoader(write(tmp_path, daily(1) + "2025-01-02,1,1,1,1\n", "short.csv")).load_bars("B")
+
+
+@pytest.mark.parametrize("cell, where", [("", "close"), ("nan", "close"), ("NULL", "open"), ("inf", "high"), ("", "volume"), ("nan", "volume"), ("12.5", "volume")])
+def test_an_empty_or_non_numeric_cell_never_becomes_a_number(tmp_path, cell, where):
+    cells = {"open": "1", "high": "1", "low": "1", "close": "1", "volume": "100"}
+    cells[where] = cell
+    path = write(tmp_path, daily(1) + f"2025-01-02,{cells['open']},{cells['high']},{cells['low']},{cells['close']},{cells['volume']}\n")
+    with pytest.raises(CSVLoaderError, match=r"row 3 cannot be read"):
+        CSVLoader(path).load_bars("BARS")
+
+
+def test_volume_with_a_zero_fraction_and_thousands_commas_still_reads(tmp_path):
+    path = write(tmp_path, '2025-01-01,"1,000.5",1001,999,1000,1000000.0\n')
+    bar = CSVLoader(path).load_bars("BARS")[0]
+    assert (str(bar.open), bar.volume) == ("1000.5", 1000000)
+
+
+def test_a_row_in_another_date_format_is_a_named_error_not_re_detected(tmp_path):
+    # %Y-%m-%d is detected on row 2; row 4 in %m/%d/%Y must not be re-detected (it could as well be %d/%m/%Y).
+    path = write(tmp_path, daily(2) + "01/03/2025,1,1,1,1,1\n")
+    with pytest.raises(CSVLoaderError, match=r"row 4 cannot be read \(date '01/03/2025' does not match the format %Y-%m-%d of the earlier rows\)"):
+        CSVLoader(path).load_bars("BARS")
+
+
+def test_an_epoch_number_after_text_dates_is_a_named_error(tmp_path):
+    path = write(tmp_path, daily(1) + "1735776000,1,1,1,1,1\n")
+    with pytest.raises(CSVLoaderError, match=r"row 3 cannot be read \(date '1735776000' does not match the format %Y-%m-%d"):
+        CSVLoader(path).load_bars("BARS")
