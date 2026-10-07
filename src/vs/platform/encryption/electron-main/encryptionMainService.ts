@@ -64,17 +64,51 @@ export class EncryptionKeychainError extends Error {
 export class EncryptionMainServiceWithElectron implements IEncryptionMainService {
 	_serviceBrand: undefined;
 
+	// QuantLab host (review c1 M8): the terminal host's start owns the launch's first Keychain calls (its token store and launch
+	// cookie), made behind its painted Keychain waiting window. `safeStorage` is synchronous: a call from here before that
+	// phase settled could block the main thread on a Keychain prompt with no window on screen. Every Keychain operation of this
+	// service therefore waits until the app reports the phase settled (`terminalHostKeychainPhaseSettled`). A start that fails
+	// or is cancelled never reports it: no Keychain call is made for a launch that is ending.
+	private readonly terminalHostKeychainPhase: Promise<void>;
+	private readonly releaseTerminalHostKeychainPhase: () => void;
+	private terminalHostKeychainPhaseReported = false;
+
 	constructor(
 		private readonly safeStorage: IEncryptionSafeStorage,
 		private readonly app: IEncryptionApp,
 		private readonly logService: ILogService
 	) {
+		let release!: () => void;
+		this.terminalHostKeychainPhase = new Promise<void>(resolve => { release = resolve; });
+		this.releaseTerminalHostKeychainPhase = release;
+
 		// if this commandLine switch is set, the user has opted in to using basic text encryption
 		if (this.app.commandLine.getSwitchValue('password-store') === PasswordStoreCLIOption.basic) {
 			this.logService.trace('[EncryptionMainService] setting usePlainTextEncryption to true...');
 			this.safeStorage.setUsePlainTextEncryption?.(true);
 			this.logService.trace('[EncryptionMainService] set usePlainTextEncryption to true');
 		}
+	}
+
+	/**
+	 * QuantLab host (review c1 M8): the app calls this once, from the terminal host's `onBeforeShow` port, i.e. after the
+	 * start's Keychain phase settled and its waiting window closed. A second report throws: it would be a second start.
+	 */
+	terminalHostKeychainPhaseSettled(): void {
+		if (this.terminalHostKeychainPhaseReported) {
+			throw new Error('[EncryptionMainService] keychain: the terminal host Keychain phase was already reported settled');
+		}
+		this.terminalHostKeychainPhaseReported = true;
+		this.logService.info('[EncryptionMainService] keychain: the terminal host Keychain phase settled; Keychain operations may run');
+		this.releaseTerminalHostKeychainPhase();
+	}
+
+	/** Resolves once the terminal host's Keychain phase settled; a call that has to wait says so in the log first. */
+	private async afterTerminalHostKeychainPhase(operation: KeychainOperation): Promise<void> {
+		if (!this.terminalHostKeychainPhaseReported) {
+			this.logService.info(`[EncryptionMainService] keychain: ${operation} waits for the terminal host Keychain phase`);
+		}
+		await this.terminalHostKeychainPhase;
 	}
 
 	/**
@@ -99,6 +133,7 @@ export class EncryptionMainServiceWithElectron implements IEncryptionMainService
 	}
 
 	async encrypt(value: string): Promise<string> {
+		await this.afterTerminalHostKeychainPhase('encryptString');
 		const encryptedBuffer = this.keychainCall('encryptString', () => this.safeStorage.encryptString(value), () => 'ok');
 		return JSON.stringify(encryptedBuffer);
 	}
@@ -118,12 +153,13 @@ export class EncryptionMainServiceWithElectron implements IEncryptionMainService
 			this.logService.error(`[EncryptionMainService] Invalid encrypted value (${errorClass})`);
 			throw new Error(`[EncryptionMainService] Invalid encrypted value (${errorClass})`);
 		}
+		await this.afterTerminalHostKeychainPhase('decryptString');
 		return this.keychainCall('decryptString', () => this.safeStorage.decryptString(bufferToDecrypt), () => 'ok');
 	}
 
-	isEncryptionAvailable(): Promise<boolean> {
-		const available = this.keychainCall('isEncryptionAvailable', () => this.safeStorage.isEncryptionAvailable(), outcome => `available=${outcome}`);
-		return Promise.resolve(available);
+	async isEncryptionAvailable(): Promise<boolean> {
+		await this.afterTerminalHostKeychainPhase('isEncryptionAvailable');
+		return this.keychainCall('isEncryptionAvailable', () => this.safeStorage.isEncryptionAvailable(), outcome => `available=${outcome}`);
 	}
 
 	getKeyStorageProvider(): Promise<KnownStorageProvider> {

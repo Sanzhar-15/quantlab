@@ -1302,6 +1302,7 @@ export class CodeApplication extends Disposable {
 		this.auxiliaryWindowsMainService = accessor.get(IAuxiliaryWindowsMainService);
 		const instantiationService = accessor.get(IInstantiationService);
 		const dialogMainService = accessor.get(IDialogMainService);
+		const encryptionMainService = this.requireQlEncryptionMainService(accessor.get(IEncryptionMainService));
 
 		// QuantLab host (U6): the chrome seed, first of all: before the terminal host starts and so before the gate, a launch request or
 		// a key can open a workbench window that reads the default profile's settings. A failure to create or read the file is not
@@ -1350,7 +1351,12 @@ export class CodeApplication extends Disposable {
 			// QuantLab host (review c1 M7): the workbench host takes over the window's close (the quit handshake runs through the
 			// lifecycle before the window goes), the toggle key and the gate's requests while the window is still hidden and nothing
 			// is loaded: no key at the first did-finish-load and no close during the start reaches a host without them
-			onBeforeShow: started => qlWorkbenchHost.attach(started)
+			// QuantLab host (review c1 M8): the start's Keychain phase (token store, launch cookie; behind its painted waiting window
+			// on macOS) has settled by now: only from here may the fork's own encryption service make its synchronous safeStorage calls
+			onBeforeShow: started => {
+				qlWorkbenchHost.attach(started);
+				encryptionMainService.terminalHostKeychainPhaseSettled();
+			}
 		};
 
 		// QuantLab host (review c1 M7, package K1-1): a quit during the start waits for the start to settle. A TERM destroys the
@@ -1498,6 +1504,16 @@ export class CodeApplication extends Disposable {
 	private requireQlDialogMainService(service: IDialogMainService): QlDialogMainService {
 		if (!(service instanceof QlDialogMainService)) {
 			throw new Error('QuantLab host (U5): IDialogMainService is not the QlDialogMainService (initServices)');
+		}
+
+		return service;
+	}
+
+	// QuantLab host (review c1 M8): `initServices` registered the `EncryptionMainService`; the host needs it as itself to
+	// report the terminal host's Keychain phase to it
+	private requireQlEncryptionMainService(service: IEncryptionMainService): EncryptionMainService {
+		if (!(service instanceof EncryptionMainService)) {
+			throw new Error('QuantLab host (M8): IEncryptionMainService is not the EncryptionMainService (initServices)');
 		}
 
 		return service;

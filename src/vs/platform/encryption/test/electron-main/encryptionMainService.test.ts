@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { timeout } from '../../../../base/common/async.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
 import { isMacintosh, isWindows } from '../../../../base/common/platform.js';
@@ -88,6 +89,44 @@ suite('EncryptionMainService (F-PACK-13 keychain lines, LOG-1)', () => {
 		logService = new RecordingLogService();
 		safeStorage = new StubSafeStorage(logService.events);
 		service = new EncryptionMainServiceWithElectron(safeStorage, stubApp, logService);
+		// M8: the tests below are about a launch whose terminal host Keychain phase has settled; the report's own line is dropped
+		service.terminalHostKeychainPhaseSettled();
+		logService.events.length = 0;
+		logService.lines.length = 0;
+	});
+
+	test('M8: no Keychain call before the terminal host Keychain phase settled; the report releases the waiting calls in order', async () => {
+		const held = new EncryptionMainServiceWithElectron(safeStorage, stubApp, logService);
+		const available = held.isEncryptionAvailable();
+		const encrypted = held.encrypt(PLANTED_PLAINTEXT);
+		const decrypted = held.decrypt(STORED_VALUE);
+		await timeout(0);
+		assert.deepStrictEqual(logService.events, [
+			'info: [EncryptionMainService] keychain: isEncryptionAvailable waits for the terminal host Keychain phase',
+			'info: [EncryptionMainService] keychain: encryptString waits for the terminal host Keychain phase',
+			'info: [EncryptionMainService] keychain: decryptString waits for the terminal host Keychain phase',
+		]);
+		held.terminalHostKeychainPhaseSettled();
+		assert.strictEqual(await available, true);
+		assert.strictEqual(await encrypted, STORED_VALUE);
+		assert.strictEqual(await decrypted, PLANTED_PLAINTEXT);
+		assert.deepStrictEqual(logService.events.slice(3), [
+			'info: [EncryptionMainService] keychain: the terminal host Keychain phase settled; Keychain operations may run',
+			`info: [EncryptionMainService] keychain: isEncryptionAvailable ${ITEM} start`,
+			'call: isEncryptionAvailable',
+			`info: [EncryptionMainService] keychain: isEncryptionAvailable ${ITEM} available=true`,
+			`info: [EncryptionMainService] keychain: encryptString ${ITEM} start`,
+			'call: encryptString',
+			`info: [EncryptionMainService] keychain: encryptString ${ITEM} ok`,
+			`info: [EncryptionMainService] keychain: decryptString ${ITEM} start`,
+			'call: decryptString',
+			`info: [EncryptionMainService] keychain: decryptString ${ITEM} ok`,
+		]);
+		assertNoPlantedValueLogged();
+	});
+
+	test('M8: a second report of the settled terminal host Keychain phase throws by name', () => {
+		assert.throws(() => service.terminalHostKeychainPhaseSettled(), /the terminal host Keychain phase was already reported settled/);
 	});
 
 	function assertNoPlantedValueLogged(...extraPlanted: string[]): void {
@@ -214,10 +253,10 @@ suite('EncryptionMainService (F-PACK-13 keychain lines, LOG-1)', () => {
 		assertNoPlantedValueLogged(PLANTED_CREDENTIAL);
 	});
 
-	test('isEncryptionAvailable failure is bracketed and throws a sanitized error, not the original', () => {
+	test('isEncryptionAvailable failure is bracketed and throws a sanitized error, not the original', async () => {
 		const denied = credentialBearing();
 		safeStorage.failWith = denied;
-		assert.throws(() => service.isEncryptionAvailable(), (error: unknown) => assertSanitized(error, denied, 'isEncryptionAvailable'));
+		await assert.rejects(service.isEncryptionAvailable(), (error: unknown) => assertSanitized(error, denied, 'isEncryptionAvailable'));
 		assert.deepStrictEqual(logService.events.slice(0, 4), [
 			`info: [EncryptionMainService] keychain: isEncryptionAvailable ${ITEM} start`,
 			'call: isEncryptionAvailable',
