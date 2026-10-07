@@ -25,7 +25,8 @@ import { IUserDataProfileService } from '../../userDataProfile/common/userDataPr
 import { IRemoteUserDataProfilesService } from '../../userDataProfile/common/remoteUserDataProfiles.js';
 import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uriIdentity.js';
 import { areApiProposalsCompatible } from '../../../../platform/extensions/common/extensionValidator.js';
-import { isBoolean, isUndefined } from '../../../../base/common/types.js';
+import { isUndefined } from '../../../../base/common/types.js';
+import { isExtensionSignatureVerificationOn } from '../../../../platform/extensionManagement/common/extensionSignatureVerificationPolicy.js';
 
 export class NativeRemoteExtensionManagementService extends RemoteExtensionManagementService {
 
@@ -55,8 +56,8 @@ export class NativeRemoteExtensionManagementService extends RemoteExtensionManag
 
 	override async installFromGallery(extension: IGalleryExtension, installOptions: InstallOptions = {}): Promise<ILocalExtension> {
 		if (isUndefined(installOptions.donotVerifySignature)) {
-			const value = this.configurationService.getValue(VerifyExtensionSignatureConfigKey);
-			installOptions.donotVerifySignature = isBoolean(value) ? !value : undefined;
+			// the product policy first: when it turns verification off the user setting is not read
+			installOptions.donotVerifySignature = !isExtensionSignatureVerificationOn(this.productService, () => this.configurationService.getValue(VerifyExtensionSignatureConfigKey));
 		}
 		const local = await this.doInstallFromGallery(extension, installOptions);
 		await this.installUIDependenciesAndPackedExtensions(local);

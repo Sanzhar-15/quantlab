@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { isExtensionSignatureVerificationOn } from '../../node/extensionSignatureVerificationPolicy.js';
+import { extensionSignatureVerificationOffMessage, extensionSignatureVerificationOffReason, isExtensionSignatureVerificationOn } from '../../common/extensionSignatureVerificationPolicy.js';
 
 suite('ExtensionSignatureVerificationPolicy Tests', () => {
 
@@ -25,6 +25,30 @@ suite('ExtensionSignatureVerificationPolicy Tests', () => {
 		assert.strictEqual(isExtensionSignatureVerificationOn(product, () => true), true);
 		assert.strictEqual(isExtensionSignatureVerificationOn(product, () => false), false);
 		assert.strictEqual(isExtensionSignatureVerificationOn(product, () => 'false'), true);
+	});
+
+	test('off reason: product false is the product policy and the throwing setting reader is not called', () => {
+		assert.strictEqual(extensionSignatureVerificationOffReason({ extensionSignatureVerification: false }, settingMustNotBeRead), 'product');
+	});
+
+	test('off reason: product true and setting false is the user setting, never the product policy', () => {
+		const reason = extensionSignatureVerificationOffReason({ extensionSignatureVerification: true }, () => false);
+		assert.ok(reason !== undefined);
+		assert.strictEqual(reason, 'setting');
+		const message = extensionSignatureVerificationOffMessage(reason, 'extensions.verifySignature');
+		assert.ok(!message.includes('extensionSignatureVerification=false'), message);
+		assert.ok(message.includes('extensions.verifySignature=false') && message.includes('extensionSignatureVerification=true'), message);
+	});
+
+	test('off reason: product true and setting on or unset is on', () => {
+		const product = { extensionSignatureVerification: true };
+		assert.strictEqual(extensionSignatureVerificationOffReason(product, () => true), undefined);
+		assert.strictEqual(extensionSignatureVerificationOffReason(product, () => undefined), undefined);
+		assert.strictEqual(extensionSignatureVerificationOffReason(product, () => 'false'), undefined);
+	});
+
+	test('off message: the product reason names the product key as false', () => {
+		assert.strictEqual(extensionSignatureVerificationOffMessage('product', 'extensions.verifySignature'), 'extension signature verification is off in this build (product.extensionSignatureVerification=false)');
 	});
 
 	test('product key absent: throws naming the key', () => {
