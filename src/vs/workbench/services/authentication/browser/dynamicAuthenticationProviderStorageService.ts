@@ -5,7 +5,7 @@
 
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
-import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderInfo, DynamicAuthenticationProviderTokensChangeEvent } from '../common/dynamicAuthenticationProviderStorage.js';
+import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderCleanupInfo, DynamicAuthenticationProviderInfo, DynamicAuthenticationProviderTokensChangeEvent } from '../common/dynamicAuthenticationProviderStorage.js';
 import { InvalidStoredSecretError, ISecretStorageService, SecretDecryptionError, SecretStorageUnavailableError } from '../../../../platform/secrets/common/secrets.js';
 import { IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../../../../base/common/oauth.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
@@ -83,6 +83,10 @@ const invalidStoredProviderListReasons = {
 		reason: `entry ${index} field ${field} is not a string (${valueType})`,
 		localizedReason: localize({ key: 'dynamicAuthProviders.invalidList.fieldNotString', comment: ['{1} is a field name such as clientId and is not translated'] }, "entry {0} field {1} is not a string ({2})", index, field, valueType),
 	}),
+	fieldNotStringList: (index: number, field: string, valueType: string): InvalidStoredProviderListReason => ({
+		reason: `entry ${index} field ${field} is not a list of strings (${valueType})`,
+		localizedReason: localize({ key: 'dynamicAuthProviders.invalidList.fieldNotStringList', comment: ['{1} is a field name such as clientIds and is not translated'] }, "entry {0} field {1} is not a list of strings ({2})", index, field, valueType),
+	}),
 	noAuthorizationServer: (index: number): InvalidStoredProviderListReason => ({
 		reason: `entry ${index} has no authorizationServer and no legacy issuer`,
 		localizedReason: localize({ key: 'dynamicAuthProviders.invalidList.noAuthorizationServer', comment: ['authorizationServer and issuer are field names and are not translated'] }, "entry {0} has no authorizationServer and no legacy issuer", index),
@@ -115,6 +119,18 @@ export class DynamicAuthProviderNotRegisteredError extends Error {
 }
 
 /**
+ * A client registration was not saved because the provider was removed (the explicit reset) after the registration began:
+ * what the registration carries (a client ID, sessions read before the removal) is not restored. Signing in again begins a
+ * new registration. Its message is fixed: no provider ID, no client ID.
+ */
+export class DynamicAuthProviderRemovedError extends Error {
+	constructor() {
+		super(localize('dynamicAuthProviders.removedDuringRegistration', "The dynamic authentication provider was not registered: it was removed while its registration was in progress. Sign in again to register it anew."));
+		this.name = 'DynamicAuthProviderRemovedError';
+	}
+}
+
+/**
  * A client registration was written but the provider list could not be committed, and the previous stored client
  * registration could not be restored either. Its message is fixed and names the explicit reset; it carries no cause.
  */
@@ -130,6 +146,27 @@ type StoredProviderInfo = { providerId: string; clientId: string; label: string;
 
 const REQUIRED_STRING_FIELDS = ['providerId', 'clientId', 'label'] as const;
 const OPTIONAL_STRING_FIELDS = ['authorizationServer', 'issuer'] as const;
+
+/**
+ * One entry of the cleanup index: a provider whose client registration or sessions may be stored, and every client ID its
+ * sessions may be stored under. Identifiers and the display label only, never a client secret or a token.
+ */
+type CleanupIndexEntry = { providerId: string; label: string; clientIds: string[] };
+
+const CLEANUP_INDEX_STRING_FIELDS = ['providerId', 'label'] as const;
+
+/** The label a list entry gets (the inherited rule, review-c1 O9): the given label, else the existing entry's, else the provider ID. */
+function entryLabel(providerId: string, label: string | undefined, existing: DynamicAuthenticationProviderInfo | undefined): string {
+	if (label) {
+		return label;
+	}
+	return existing ? existing.label : providerId;
+}
+
+/** `ids` without repeats, in first-seen order. */
+function distinct(ids: readonly string[]): string[] {
+	return [...new Set(ids)];
+}
 
 /** The JSON type of a stored value, for a diagnostic; never the value itself. */
 function describeType(value: unknown): string {
@@ -172,6 +209,17 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 	declare readonly _serviceBrand: undefined;
 
 	private static readonly PROVIDERS_STORAGE_KEY = 'dynamicAuthProviders';
+
+	/**
+	 * The cleanup index ({@link CleanupIndexEntry}): written before a provider's client registration, and an entry is removed
+	 * only by a removal that has deleted every secret it names. The provider list is the commit record of a registration; this
+	 * index is what the explicit reset finds a provider by when a write or a restore after it failed, and it keeps every client
+	 * ID a provider was registered under, so sessions stored under a replaced client ID are deleted too.
+	 */
+	private static readonly CLEANUP_INDEX_STORAGE_KEY = 'dynamicAuthProviderCleanupIndex';
+
+	/** Per provider, the number of removals that have completed in this window ({@link getRemovalCount}). */
+	private readonly _removalCounts = new Map<string, number>();
 
 	/**
 	 * Every operation that changes one provider's stored registration or sessions runs in this per-provider order, so a
@@ -246,18 +294,44 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return provider?.clientId;
 	}
 
+	getRemovalCount(providerId: string): number {
+		const count = this._removalCounts.get(providerId);
+		// No entry: no removal of the provider has completed in this window.
+		return count === undefined ? 0 : count;
+	}
+
 	/**
-	 * Staged: the stored list is validated and the previous client registration read before anything is written; the
-	 * client registration is written next; the provider list, which is the commit record and the index removal finds the
-	 * provider by, names the new registration last. When the list cannot be committed, the previous client registration
-	 * is restored before this rejects, so the stored list and client registration stay one consistent identity.
+	 * Staged: a registration begun before a removal of the provider completed (`removalCount` is {@link getRemovalCount} when
+	 * it began) is refused before anything is read or written, so the removal stays complete. The stored list and cleanup
+	 * index are validated and the previous client registration read before anything is written. Write-ahead: the cleanup
+	 * index names the provider and every client ID it may have secrets under (the new one, the list entry's and the previous
+	 * client registration's) before the client registration is written. The provider list, the commit record, names the new
+	 * registration last. When the list cannot be committed, the previous client registration is restored before this
+	 * rejects; when that restore fails too, the cleanup index still names every identity, so the explicit reset finds them.
 	 */
-	storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string): Promise<void> {
+	storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret: string | undefined, label: string | undefined, removalCount: number): Promise<void> {
 		return this._providerOperations.queue(providerId, async () => {
-			// Stage: a stored list that cannot be read rejects here, before any write.
-			this._getStoredProviders();
+			if (this.getRemovalCount(providerId) !== removalCount) {
+				throw new DynamicAuthProviderRemovedError();
+			}
+			// Stage: a stored list or cleanup index that cannot be read rejects here, before any write.
+			const existing = this._getStoredProviders().find(p => p.providerId === providerId);
+			this._getCleanupIndex();
 			const credentialsKey = this._credentialsKey(providerId);
 			const previousCredentials = await this.secretStorageService.get(credentialsKey);
+
+			// Write-ahead: a rejected index write leaves everything as it was; nothing else has been written.
+			const clientIds = [clientId];
+			if (existing) {
+				clientIds.push(existing.clientId);
+			}
+			if (previousCredentials !== undefined) {
+				const previousClientId = this._storedClientId(previousCredentials, 'The stored client registration being replaced is not readable; it is overwritten, and its sessions are found by the list entry and the cleanup index only.');
+				if (previousClientId !== undefined) {
+					clientIds.push(previousClientId);
+				}
+			}
+			this._recordCleanupIdentity(providerId, entryLabel(providerId, label, existing), clientIds);
 
 			// A rejected write leaves the previous registration in place: the list has not been touched.
 			await this.secretStorageService.set(credentialsKey, JSON.stringify({ clientId, clientSecret }));
@@ -295,7 +369,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return JSON.stringify({ isDynamicAuthProvider: true, authProviderId, clientId });
 	}
 
-	private _trackProvider(providerId: string, authorizationServer: string, clientId: string, label?: string): void {
+	private _trackProvider(providerId: string, authorizationServer: string, clientId: string, label: string | undefined): void {
 		const providers = this._getStoredProviders();
 
 		// Check if provider already exists
@@ -304,7 +378,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 			// Add new provider with provided or default info
 			const newProvider: DynamicAuthenticationProviderInfo = {
 				providerId,
-				label: label || providerId, // Use provided label or providerId as default
+				label: entryLabel(providerId, label, undefined),
 				authorizationServer,
 				clientId
 			};
@@ -315,7 +389,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 			// Create new provider object with updated info
 			const updatedProvider: DynamicAuthenticationProviderInfo = {
 				providerId,
-				label: label || existingProvider.label,
+				label: entryLabel(providerId, label, existingProvider),
 				authorizationServer,
 				clientId
 			};
@@ -385,6 +459,77 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return providerInfos as DynamicAuthenticationProviderInfo[];
 	}
 
+	/**
+	 * Reads the cleanup index. An absent key is an empty index: a provider registered before the index existed is found by
+	 * its list entry. A present value that is not a JSON array of {@link CleanupIndexEntry} is logged (key and structural
+	 * reason only) and thrown as {@link InvalidStoredProviderListError}, so no caller writes over it.
+	 */
+	private _getCleanupIndex(): CleanupIndexEntry[] {
+		const storageKey = DynamicAuthenticationProviderStorageService.CLEANUP_INDEX_STORAGE_KEY;
+		const stored = this.storageService.get(storageKey, StorageScope.APPLICATION);
+		if (stored === undefined) {
+			return [];
+		}
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(stored);
+		} catch (error) {
+			// The parse message quotes its input, so only the error class is carried.
+			const errorClass = error instanceof Error ? error.name : typeof error;
+			throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.notJson(errorClass));
+		}
+		if (!Array.isArray(parsed)) {
+			throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.notArray(describeType(parsed)));
+		}
+		for (let index = 0; index < parsed.length; index++) {
+			const entry: unknown = parsed[index];
+			if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+				throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.entryNotObject(index, describeType(entry)));
+			}
+			const fields = entry as Record<string, unknown>;
+			for (const field of CLEANUP_INDEX_STRING_FIELDS) {
+				if (typeof fields[field] !== 'string') {
+					throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.fieldNotString(index, field, describeType(fields[field])));
+				}
+			}
+			const clientIds = fields.clientIds;
+			if (!Array.isArray(clientIds) || !clientIds.every(id => typeof id === 'string')) {
+				throw this._invalidStoredProviders(storageKey, invalidStoredProviderListReasons.fieldNotStringList(index, 'clientIds', describeType(clientIds)));
+			}
+		}
+		return parsed as CleanupIndexEntry[];
+	}
+
+	/**
+	 * Adds `clientIds` to the provider's cleanup index entry (created if absent) and sets its label; stored only when that
+	 * changes the index. The index is read again, so a change made for another provider meanwhile is kept.
+	 */
+	private _recordCleanupIdentity(providerId: string, label: string, clientIds: readonly string[]): void {
+		const index = this._getCleanupIndex();
+		const position = index.findIndex(e => e.providerId === providerId);
+		if (position === -1) {
+			index.push({ providerId, label, clientIds: distinct(clientIds) });
+		} else {
+			const entry = index[position];
+			const recorded = distinct([...entry.clientIds, ...clientIds]);
+			if (recorded.length === entry.clientIds.length && entry.label === label) {
+				return;
+			}
+			index[position] = { providerId, label, clientIds: recorded };
+		}
+		this._storeCleanupIndex(index);
+	}
+
+	private _storeCleanupIndex(index: CleanupIndexEntry[]): void {
+		this.storageService.store(
+			DynamicAuthenticationProviderStorageService.CLEANUP_INDEX_STORAGE_KEY,
+			JSON.stringify(index),
+			StorageScope.APPLICATION,
+			StorageTarget.MACHINE
+		);
+	}
+
 	private _invalidStoredProviders(storageKey: string, reason: InvalidStoredProviderListReason): InvalidStoredProviderListError {
 		const error = new InvalidStoredProviderListError(storageKey, reason);
 		// Logs stay in English whatever the display language: the stable reason, not the localized message.
@@ -405,28 +550,52 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 		return this._getStoredProviders();
 	}
 
+	getRemovableProviders(): ReadonlyArray<DynamicAuthenticationProviderCleanupInfo> {
+		const providers = this._getStoredProviders();
+		const index = this._getCleanupIndex();
+		const removable: DynamicAuthenticationProviderCleanupInfo[] = providers.map(provider => {
+			const entry = index.find(e => e.providerId === provider.providerId);
+			const clientIds = entry ? distinct([provider.clientId, ...entry.clientIds]) : [provider.clientId];
+			return { providerId: provider.providerId, label: provider.label, clientIds };
+		});
+		// A provider the index names and the list does not: a registration whose commit (and restore) failed.
+		for (const entry of index) {
+			if (!providers.some(p => p.providerId === entry.providerId)) {
+				removable.push({ providerId: entry.providerId, label: entry.label, clientIds: entry.clientIds });
+			}
+		}
+		return removable;
+	}
+
 	/**
-	 * Removes the provider's sessions and client registration, then its list entry. The list entry (the cleanup identity)
-	 * is removed last: a deletion that rejects leaves it in place, so a retried removal finds every stored session again.
-	 * Sessions are deleted under every client ID the provider is known by: the list entry's and the stored client
-	 * registration's. Runs in the provider's operation order, so no session write interleaves with it; once it has
-	 * completed, a session write for the provider is rejected ({@link setSessionsForDynamicAuthProvider}).
+	 * Removes the provider's sessions and client registration, then its list entry, then its cleanup index entry. The
+	 * cleanup identities are removed last: a deletion that rejects leaves them in place, so a retried removal finds every
+	 * stored session again. Sessions are deleted under every client ID the provider is known by: the list entry's, the
+	 * cleanup index entry's and the stored client registration's. Runs in the provider's operation order, so no session
+	 * write interleaves with it; once it has completed, a session write for the provider is rejected
+	 * ({@link setSessionsForDynamicAuthProvider}), and so is a registration begun before it ({@link storeClientRegistration}).
 	 */
 	removeDynamicProvider(providerId: string): Promise<void> {
 		return this._providerOperations.queue(providerId, async () => {
-			// A stored list that cannot be read rejects here, before any deletion.
+			// A stored list or cleanup index that cannot be read rejects here, before any deletion.
 			const providerInfo = this._getStoredProviders().find(p => p.providerId === providerId);
+			const indexEntry = this._getCleanupIndex().find(e => e.providerId === providerId);
 			const credentialsKey = this._credentialsKey(providerId);
 
 			const clientIds = new Set<string>();
 			if (providerInfo) {
 				clientIds.add(providerInfo.clientId);
 			}
+			if (indexEntry) {
+				for (const clientId of indexEntry.clientIds) {
+					clientIds.add(clientId);
+				}
+			}
 			const storedCredentials = await this.secretStorageService.get(credentialsKey);
 			if (storedCredentials !== undefined) {
-				const registration = this._parseCredentialsForRemoval(storedCredentials);
-				if (registration) {
-					clientIds.add(registration.clientId);
+				const storedClientId = this._storedClientId(storedCredentials, 'The stored client registration being removed is not readable; it is deleted with the provider, and its sessions are found by the list entry and the cleanup index only.');
+				if (storedClientId !== undefined) {
+					clientIds.add(storedClientId);
 				}
 			}
 
@@ -442,15 +611,21 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 			if (filteredProviders.length !== remaining.length) {
 				this._storeProviders(filteredProviders);
 			}
+			// The cleanup index entry goes last: until it is removed, the explicit reset finds the provider again.
+			const index = this._getCleanupIndex();
+			const filteredIndex = index.filter(e => e.providerId !== providerId);
+			if (filteredIndex.length !== index.length) {
+				this._storeCleanupIndex(filteredIndex);
+			}
+			this._removalCounts.set(providerId, this.getRemovalCount(providerId) + 1);
 		});
 	}
 
 	/**
-	 * The client ID of a stored registration that is being removed. An unreadable one names no client ID: it is deleted
-	 * by the removal (the user's act) all the same, and the fact is logged with fixed text (never the stored value).
+	 * The client ID of a stored registration that is being removed or replaced. An unreadable one names no client ID: it is
+	 * deleted or overwritten all the same, and `unreadable` (fixed text, never the stored value) is logged.
 	 */
-	private _parseCredentialsForRemoval(storedCredentials: string): { clientId: string } | undefined {
-		const unreadable = 'The stored client registration being removed is not readable; it is deleted with the provider, and its sessions are found by the list entry only.';
+	private _storedClientId(storedCredentials: string, unreadable: string): string | undefined {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(storedCredentials);
@@ -463,7 +638,7 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 			this.logService.warn(unreadable);
 			return undefined;
 		}
-		return parsed;
+		return parsed.clientId;
 	}
 
 	async getSessionsForDynamicAuthProvider(authProviderId: string, clientId: string): Promise<(IAuthorizationTokenResponse & { created_at: number })[] | undefined> {

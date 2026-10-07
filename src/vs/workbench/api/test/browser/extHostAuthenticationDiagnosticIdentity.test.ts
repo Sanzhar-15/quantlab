@@ -173,7 +173,7 @@ suite('QL-G-LOGIN-SECRETS c1 M3: a dynamic provider\'s identity reaches no diagn
 		);
 		const registered: string[] = [];
 		const register = async (resource: IAuthorizationProtectedResourceMetadata | undefined, clientId: string | undefined, tokens: StoredToken[]) => {
-			const id = await host.$registerDynamicAuthProvider(URI.parse(ISSUER).toJSON(), SERVER_METADATA, resource, clientId, undefined, tokens);
+			const id = await host.$registerDynamicAuthProvider(URI.parse(ISSUER).toJSON(), SERVER_METADATA, resource, clientId, undefined, tokens, 0);
 			registered.push(id);
 			return id;
 		};

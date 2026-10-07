@@ -49,7 +49,7 @@ suite('RemoveDynamicAuthenticationProvidersAction - storage before unregistratio
 			new NullLogService()
 		));
 		for (const [id, clientId] of [['provider-a', 'client-a'], ['provider-b', 'client-b']]) {
-			await dynamicStorage.storeClientRegistration(id, `https://${id}.example.com`, clientId, `${clientId}-secret`, id);
+			await dynamicStorage.storeClientRegistration(id, `https://${id}.example.com`, clientId, `${clientId}-secret`, id, 0);
 			await dynamicStorage.setSessionsForDynamicAuthProvider(id, clientId, [{ access_token: `${id}-token`, token_type: 'Bearer', created_at: 1 }]);
 			const onDidChangeSessions = store.add(new Emitter<AuthenticationSessionsChangeEvent>());
 			authenticationService.registerAuthenticationProvider(id, {
@@ -130,5 +130,67 @@ suite('RemoveDynamicAuthenticationProvidersAction - storage before unregistratio
 		assert.deepStrictEqual(world.dynamicStorage.getInteractedProviders().map(p => p.providerId), ['provider-b']);
 		assert.deepStrictEqual((await world.secrets.keys()).sort(), keptKeys.slice().sort(), 'only provider-b secrets remain');
 		assert.deepStrictEqual(await Promise.all(keptKeys.map(key => world.secrets.get(key))), keptBefore, 'provider-b is byte-identical');
+	});
+
+	// review-c2 M1: a first registration whose list commit fails, and whose rollback deletion of the new client registration
+	// fails too, leaves the client registration stored with no list entry. The command still finds the provider, and its
+	// removal leaves no secret.
+	test('a first registration whose commit and rollback both fail: the command finds it, and its removal leaves no secret', async () => {
+		class RefusingStorageService extends TestStorageService {
+			refuseListStore = false;
+			override store(...args: Parameters<TestStorageService['store']>): void {
+				if (this.refuseListStore && args[0] === LIST_KEY) {
+					throw new Error('store refused');
+				}
+				super.store(...args);
+			}
+		}
+		class RefusingSecretStorageService extends TestSecretStorageService {
+			readonly refuseDelete = new Set<string>();
+			override async delete(key: string): Promise<void> {
+				if (this.refuseDelete.has(key)) {
+					throw new Error('delete refused');
+				}
+				return super.delete(key);
+			}
+		}
+		const storageService = store.add(new RefusingStorageService());
+		const secrets = store.add(new RefusingSecretStorageService());
+		const dynamicStorage = store.add(new DynamicAuthenticationProviderStorageService(storageService, secrets, new NullLogService()));
+		const authenticationService = store.add(new AuthenticationService(
+			{} as IExtensionService,
+			{ onDidChangeExtensionSessionAccess: Event.None } as unknown as IAuthenticationAccessService,
+			{ options: undefined } as unknown as IBrowserWorkbenchEnvironmentService,
+			new NullLogService()
+		));
+		const offered: string[][] = [];
+		const infos: string[] = [];
+		const services = new Map<unknown, unknown>([
+			[IQuickInputService, { pick: async (items: { provider: { providerId: string } }[]) => { offered.push(items.map(i => i.provider.providerId)); return items; } }],
+			[IDynamicAuthenticationProviderStorageService, dynamicStorage],
+			[IAuthenticationService, authenticationService],
+			[IDialogService, { confirm: async () => ({ confirmed: true }), info: async (message: string) => { infos.push(message); } }],
+		]);
+		const accessor = { get: (id: unknown) => services.get(id) } as unknown as ServicesAccessor;
+		storageService.refuseListStore = true;
+		secrets.refuseDelete.add(registrationKey('provider-c'));
+
+		await assert.rejects(
+			dynamicStorage.storeClientRegistration('provider-c', 'https://provider-c.example.com', 'client-c', 'client-c-secret', 'provider-c', 0),
+			(e: unknown) => e instanceof Error && e.name === 'DynamicAuthRegistrationRecoveryError'
+		);
+		assert.deepStrictEqual(await secrets.keys(), [registrationKey('provider-c')], 'the client registration is stored');
+		assert.strictEqual(storageService.get(LIST_KEY, StorageScope.APPLICATION), undefined, 'the provider list has no entry');
+
+		storageService.refuseListStore = false;
+		secrets.refuseDelete.clear();
+		await new RemoveDynamicAuthenticationProvidersAction().run(accessor);
+
+		assert.deepStrictEqual({ offered, infos }, { offered: [['provider-c']], infos: [] }, 'the command offers the provider');
+		assert.deepStrictEqual(await secrets.keys(), [], 'its removal leaves no secret');
+
+		// Nothing is left to find.
+		await new RemoveDynamicAuthenticationProvidersAction().run(accessor);
+		assert.deepStrictEqual(infos, ['No dynamic authentication providers']);
 	});
 });

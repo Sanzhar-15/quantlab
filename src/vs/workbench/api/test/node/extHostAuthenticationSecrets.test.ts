@@ -1243,7 +1243,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 					fetchQueue.push(rejectTransport(ACCESS_TOKEN));
 					const issuer = { scheme: 'https', authority: 'auth.example.com', path: '', query: '', fragment: '' };
 					const metadata: IAuthorizationServerMetadata = { issuer: AUTH_SERVER, token_endpoint: TOKEN_ENDPOINT, registration_endpoint: REGISTRATION_ENDPOINT, response_types_supported: ['code'] };
-					return { error: await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuer, metadata, undefined, undefined, undefined, undefined)), logger };
+					return { error: await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuer, metadata, undefined, undefined, undefined, undefined, 0)), logger };
 				}
 			},
 			{
@@ -1481,7 +1481,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			const extHostAuthentication = createExtHostAuthentication(logger, proxy);
 			fetchQueue.push(rejectTransport(ACCESS_TOKEN));
 
-			const id = await extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined);
+			const id = await extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined, 0);
 			await extHostAuthentication.$onDidUnregisterAuthenticationProvider(id);
 
 			assert.ok(logger.messages('warn').some(message => message.startsWith('Dynamic registration failed: Dynamic client registration failed: the request could not be completed')), logger.messages('warn').join('\n'));
@@ -1494,7 +1494,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 			const extHostAuthentication = createExtHostAuthentication(logger, new TestProxy());
 			fetchQueue.push(respondJson(400, { error: 'invalid_client_metadata' }));
 
-			const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+			const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined, 0));
 
 			assert.ok(logger.records.length >= 2);
 			assert.deepStrictEqual(findMarkers(logger.records), []);
@@ -1512,7 +1512,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 				const extHostAuthentication = createExtHostAuthentication(logger, proxy);
 				fetchQueue.push(responder());
 
-				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined, 0));
 
 				assert.deepStrictEqual(fetchCalls.map(call => call.url), [REGISTRATION_ENDPOINT]);
 				assert.strictEqual(proxy.registrationPrompts, 1);
@@ -1544,7 +1544,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 				const extHostAuthentication = createExtHostAuthentication(logger, proxy);
 				fetchQueue.push(rejectTransport(ACCESS_TOKEN));
 
-				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined, 0));
 
 				assert.strictEqual(proxy.registrationPrompts, 1);
 				assert.strictEqual(error.message, 'Failed to prompt for client registration details');
@@ -1561,7 +1561,7 @@ suite('Dynamic OAuth credentials never reach a log or an error', () => {
 				const extHostAuthentication = createExtHostAuthentication(logger, proxy);
 				fetchQueue.push(rejectTransport(ACCESS_TOKEN));
 
-				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined));
+				const error = await rejection(extHostAuthentication.$registerDynamicAuthProvider(issuerComponents, serverMetadata, undefined, undefined, undefined, undefined, 0));
 
 				assert.ok(isCancellationError(error), `expected a cancellation, got ${error.message}`);
 			});

@@ -20,6 +20,17 @@ export interface DynamicAuthenticationProviderInfo {
 	readonly clientId: string;
 }
 
+/**
+ * A dynamic authentication provider the explicit reset can find: one whose client registration or sessions may be stored,
+ * whether or not its registration was committed to the provider list. Identifiers and the display label only.
+ */
+export interface DynamicAuthenticationProviderCleanupInfo {
+	readonly providerId: string;
+	readonly label: string;
+	/** Every client ID the provider's sessions may be stored under. */
+	readonly clientIds: readonly string[];
+}
+
 export interface DynamicAuthenticationProviderTokensChangeEvent {
 	readonly authProviderId: string;
 	readonly clientId: string;
@@ -45,20 +56,35 @@ export interface IDynamicAuthenticationProviderStorageService {
 	getClientRegistration(providerId: string): Promise<{ clientId?: string; clientSecret?: string } | undefined>;
 
 	/**
+	 * The number of removals of the provider ({@link removeDynamicProvider}) that have completed in this window. A
+	 * registration reads it when it begins, before it reads anything stored, and passes it to {@link storeClientRegistration}.
+	 * @param providerId The provider ID.
+	 */
+	getRemovalCount(providerId: string): number;
+
+	/**
 	 * Store both client ID and client secret for a dynamic authentication provider.
 	 * @param providerId The provider ID or authorization server URL.
 	 * @param authorizationServer The authorization server URL for the provider.
 	 * @param clientId The client ID to store.
-	 * @param clientSecret Optional client secret to store.
-	 * @param label Optional label for the provider.
+	 * @param clientSecret The client secret to store, if the registration has one.
+	 * @param label The label for the provider, if known.
+	 * @param removalCount {@link getRemovalCount} when the registration began: once a later removal of the provider has
+	 * completed, the registration is refused (DynamicAuthProviderRemovedError) and nothing is stored.
 	 */
-	storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret?: string, label?: string): Promise<void>;
+	storeClientRegistration(providerId: string, authorizationServer: string, clientId: string, clientSecret: string | undefined, label: string | undefined, removalCount: number): Promise<void>;
 
 	/**
 	 * Get all dynamic authentication providers that have been interacted with.
 	 * @returns Array of provider information.
 	 */
 	getInteractedProviders(): ReadonlyArray<DynamicAuthenticationProviderInfo>;
+
+	/**
+	 * Every dynamic authentication provider whose stored data the explicit reset can remove: those in the provider list and
+	 * those whose registration was written but not committed to it.
+	 */
+	getRemovableProviders(): ReadonlyArray<DynamicAuthenticationProviderCleanupInfo>;
 
 	/**
 	 * Remove a dynamic authentication provider and its stored data.

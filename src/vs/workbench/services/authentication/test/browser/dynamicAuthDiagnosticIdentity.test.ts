@@ -120,7 +120,7 @@ suite('QL-G-LOGIN-SECRETS c1 M3: a dynamic provider\'s identity reaches no rende
 
 	test('storage service: the session save trace carries no marker', async () => {
 		const { logService, service } = createStorage();
-		await service.storeClientRegistration(PROVIDER_ID, ISSUER, 'client-1', undefined, 'issuer.example');
+		await service.storeClientRegistration(PROVIDER_ID, ISSUER, 'client-1', undefined, 'issuer.example', 0);
 		await service.setSessionsForDynamicAuthProvider(PROVIDER_ID, 'client-1', [{ access_token: 'at', token_type: 'Bearer', created_at: 1 }]);
 		assertNoMarker('the storage service log', logService.args);
 		assert.ok(logService.args.some(args => args[0] === `Set 1 session(s) for ${authProviderIdForDiagnostics(PROVIDER_ID)} in secret storage`), JSON.stringify(logService.args));

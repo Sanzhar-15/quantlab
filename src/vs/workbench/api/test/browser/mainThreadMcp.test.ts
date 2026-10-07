@@ -26,7 +26,7 @@ suite('MainThreadMcp - stored dynamic registrations are kept', () => {
 		const storageService = store.add(new TestStorageService());
 		const secrets = store.add(new TestSecretStorageService());
 		const dynamicStorage = store.add(new DynamicAuthenticationProviderStorageService(storageService, secrets, new NullLogService()));
-		await dynamicStorage.storeClientRegistration(PROVIDER_ID, PROVIDER_ID, 'client-1', 'client-secret-1', 'Example');
+		await dynamicStorage.storeClientRegistration(PROVIDER_ID, PROVIDER_ID, 'client-1', 'client-secret-1', 'Example', 0);
 		await dynamicStorage.setSessionsForDynamicAuthProvider(PROVIDER_ID, 'client-1', [{ access_token: 'stored-token', token_type: 'Bearer', created_at: 1 }]);
 		const unregistered: string[] = [];
 		const created: string[] = [];

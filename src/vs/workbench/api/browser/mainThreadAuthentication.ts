@@ -26,7 +26,7 @@ import { IURLService } from '../../../platform/url/common/url.js';
 import { DeferredPromise, raceTimeout } from '../../../base/common/async.js';
 import { IAuthorizationTokenResponse } from '../../../base/common/oauth.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
-import { authProviderIdForDiagnostics } from '../../services/authentication/browser/dynamicAuthenticationProviderStorageService.js';
+import { authProviderIdForDiagnostics, DynamicAuthProviderRemovedError } from '../../services/authentication/browser/dynamicAuthenticationProviderStorageService.js';
 import { IClipboardService } from '../../../platform/clipboard/common/clipboardService.js';
 import { IQuickInputService } from '../../../platform/quickinput/common/quickInput.js';
 import { IProductService } from '../../../platform/product/common/productService.js';
@@ -158,6 +158,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			create: async (authorizationServer, serverMetadata, resource) => {
 				// Auth Provider Id is a combination of the authorization server and the resource, if provided.
 				const authProviderId = resource ? `${authorizationServer.toString(true)} ${resource.resource}` : authorizationServer.toString(true);
+				// Read before anything stored: a removal that completes after this refuses the registration when it is saved.
+				const removalCount = this.dynamicAuthProviderStorageService.getRemovalCount(authProviderId);
 				const clientDetails = await this.dynamicAuthProviderStorageService.getClientRegistration(authProviderId);
 				let clientId = clientDetails?.clientId;
 				const clientSecret = clientDetails?.clientSecret;
@@ -175,7 +177,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 					resource,
 					clientId,
 					clientSecret,
-					initialTokens
+					initialTokens,
+					removalCount
 				);
 			}
 		}));
@@ -293,7 +296,12 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 	async $registerDynamicAuthenticationProvider(details: IRegisterDynamicAuthenticationProviderDetails): Promise<void> {
 		// Validated and saved before it is published: a stored list that cannot be read, or a registration that cannot be
 		// saved, rejects here, and no provider is registered. The extension host publishes its side only after this resolves.
-		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label);
+		// A registration begun before a removal of the provider completed is refused by the save; one whose save completed
+		// before a removal that has completed since is refused here, so a removed provider is not published.
+		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label, details.removalCount);
+		if (this.dynamicAuthProviderStorageService.getRemovalCount(details.id) !== details.removalCount) {
+			throw new DynamicAuthProviderRemovedError();
+		}
 		await this.$registerAuthenticationProvider({
 			id: details.id,
 			label: details.label,

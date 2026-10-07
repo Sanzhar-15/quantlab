@@ -24,7 +24,10 @@ import { IExtHostWindow } from '../../common/extHostWindow.js';
 import { IAuthenticationAccessService } from '../../../services/authentication/browser/authenticationAccessService.js';
 import { AuthenticationService } from '../../../services/authentication/browser/authenticationService.js';
 import { DynamicAuthenticationProviderStorageService } from '../../../services/authentication/browser/dynamicAuthenticationProviderStorageService.js';
-import { IAuthenticationExtensionsService } from '../../../services/authentication/common/authentication.js';
+import { IAuthenticationExtensionsService, IAuthenticationService } from '../../../services/authentication/common/authentication.js';
+import { IDynamicAuthenticationProviderStorageService } from '../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
+import { RemoveDynamicAuthenticationProvidersAction } from '../../../contrib/authentication/browser/actions/manageDynamicAuthenticationProvidersAction.js';
+import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { IBrowserWorkbenchEnvironmentService } from '../../../services/environment/browser/environmentService.js';
 import { IExtHostContext } from '../../../services/extensions/common/extHostCustomers.js';
 import { ExtensionHostKind } from '../../../services/extensions/common/extensionHostKind.js';
@@ -42,6 +45,7 @@ import { IQuickInputService } from '../../../../platform/quickinput/common/quick
 
 const AUTH_SERVER = 'https://auth.example.com';
 const REGISTRATION_ENDPOINT = `${AUTH_SERVER}/register`;
+const TOKEN_ENDPOINT = `${AUTH_SERVER}/token`;
 const PROVIDER_ID = URI.parse(AUTH_SERVER).toString(true);
 const LIST_KEY = 'dynamicAuthProviders';
 const REGISTRATION_KEY = `dynamicAuthProvider:clientRegistration:${PROVIDER_ID}`;
@@ -52,7 +56,7 @@ const serverMetadata: IAuthorizationServerMetadata = {
 	issuer: AUTH_SERVER,
 	response_types_supported: ['code'],
 	authorization_endpoint: `${AUTH_SERVER}/authorize`,
-	token_endpoint: `${AUTH_SERVER}/token`,
+	token_endpoint: TOKEN_ENDPOINT,
 	registration_endpoint: REGISTRATION_ENDPOINT,
 };
 
@@ -288,5 +292,137 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 
 		await world.cleanUp();
 		assert.deepStrictEqual(createdProviders.map(p => p.disposeCount), [1, 1], 'each is disposed exactly once');
+	});
+
+	// review-c2 M2: the explicit reset coordinates with the extension host's operations that were already queued for the
+	// provider when it ran, a registration included. After it completes, storage and both registries stay empty for the
+	// provider; a registration begun after it succeeds.
+	suite('removal while operations of the provider are queued in the extension host', () => {
+		function deferred<T>() {
+			let resolve!: (value: T) => void;
+			const promise = new Promise<T>(r => { resolve = r; });
+			return { promise, resolve };
+		}
+
+		async function until(condition: () => boolean): Promise<void> {
+			for (let i = 0; i < 100 && !condition(); i++) {
+				await new Promise(resolve => setTimeout(resolve, 0));
+			}
+			assert.ok(condition(), 'the operation did not reach the awaited step');
+		}
+
+		type World = ReturnType<typeof createWorld>;
+
+		/**
+		 * {@link createWorld}, except that the window's stored-token change notifications are recorded, not delivered to the
+		 * extension host: the removal's deletion of the sessions is reported with `undefined` tokens, which the extension
+		 * host's TokenStore does not accept (an inherited defect, routed to F-SECRETS-6). This suite is about registration
+		 * and removal, which do not use that channel.
+		 */
+		function createRemovalWorld() {
+			const world = createWorld();
+			const tokenChanges: { clientId: string; tokens: unknown }[] = [];
+			world.extHost.$onDidChangeDynamicAuthProviderTokens = async (_authProviderId: string, clientId: string, tokens: unknown) => {
+				tokenChanges.push({ clientId, tokens });
+			};
+			return { ...world, tokenChanges };
+		}
+
+		/** The production Remove command, choosing every offered provider and confirming. */
+		function removeCommand(world: World): Promise<void> {
+			const services = new Map<unknown, unknown>([
+				[IQuickInputService, { pick: async (items: unknown[]) => items }],
+				[IDynamicAuthenticationProviderStorageService, world.dynamicStorage],
+				[IAuthenticationService, world.authenticationService],
+				[IDialogService, { confirm: async () => ({ confirmed: true }) }],
+			]);
+			const accessor = { get: (id: unknown) => services.get(id) } as unknown as ServicesAccessor;
+			return new RemoveDynamicAuthenticationProvidersAction().run(accessor);
+		}
+
+		/** What is left of the provider: in storage, in the main thread's registry and in the extension host's. */
+		async function leftOver(world: World) {
+			// Queued behind every extension host operation of the provider that is already queued.
+			const extHostRegistered = await world.extHost.$getSessions(PROVIDER_ID, undefined, {}).then(() => true, (e: unknown) => {
+				assert.ok(e instanceof Error && /Unable to find authentication provider/.test(e.message), `unexpected error ${e}`);
+				return false;
+			});
+			return {
+				storedProviders: world.dynamicStorage.getInteractedProviders().length,
+				secrets: await world.secrets.keys(),
+				mainThreadRegistered: world.authenticationService.isAuthenticationProviderRegistered(PROVIDER_ID),
+				extHostRegistered,
+			};
+		}
+		const nothingLeft = { storedProviders: 0, secrets: [], mainThreadRegistered: false, extHostRegistered: false };
+
+		function outcome(registration: Promise<unknown>): Promise<string> {
+			return registration.then(() => 'registered', (e: unknown) => e instanceof Error ? e.name : `not an error: ${e}`);
+		}
+
+		for (const queued of [1, 2]) {
+			test(`${queued} registration(s) of the same provider and client ID queued behind a pending refresh during the removal: refused; nothing is left; a later registration succeeds`, async () => {
+				const tokenResponse = deferred<Response>();
+				fetchStub.callsFake(async (input: string | URL | Request) => {
+					const url = String(input);
+					if (url === TOKEN_ENDPOINT) {
+						return tokenResponse.promise;
+					}
+					if (url === REGISTRATION_ENDPOINT) {
+						return new Response(JSON.stringify({ client_id: 'client-2', client_secret: 'secret-2' }), { status: 201 });
+					}
+					return new Response('', { status: 404 });
+				});
+				const world = createRemovalWorld();
+				await world.secrets.set(REGISTRATION_KEY, JSON.stringify({ clientId: 'client-1', clientSecret: 'secret-1' }));
+				await world.secrets.set(SESSIONS_KEY, JSON.stringify([{ access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', scope: 'read', expires_in: 3600, created_at: 1 }]));
+				assert.ok(await world.create());
+
+				// 1. A refresh is held in the extension host.
+				const refresh = world.extHost.$getSessions(PROVIDER_ID, ['read'], {});
+				await until(() => fetchStub.getCalls().some(c => String(c.args[0]) === TOKEN_ENDPOINT));
+				// 2. Registrations of the same provider and client ID are queued behind it.
+				const registrations: Promise<unknown>[] = [];
+				for (let i = 0; i < queued; i++) {
+					registrations.push(world.create());
+					await until(() => createdProviders.length === 2 + i);
+				}
+				assert.deepStrictEqual(createdProviders.slice(1).map(p => p.clientId), registrations.map(() => 'client-1'));
+				// 3. The Remove command completes: storage is empty; the unregistration is queued behind the registrations.
+				await removeCommand(world);
+				assert.deepStrictEqual(await world.secrets.keys(), []);
+				// 4. The refresh is released: its stale write is rejected.
+				tokenResponse.resolve(new Response(JSON.stringify({ access_token: 'at-2', refresh_token: 'rt-2', token_type: 'Bearer', scope: 'read', expires_in: 3600 }), { status: 200 }));
+				await assert.rejects(refresh, (e: unknown) => e instanceof Error && e.name === 'DynamicAuthSessionPersistError');
+
+				const outcomes = await Promise.all(registrations.map(outcome));
+				assert.deepStrictEqual(await leftOver(world), nothingLeft, 'storage and both registries are empty for the provider');
+				assert.deepStrictEqual(outcomes, registrations.map(() => 'DynamicAuthProviderRemovedError'));
+				assert.ok(createdProviders.every(p => p.disposed), 'every provider of the removed registration is disposed');
+
+				// 5. A registration begun after the removal succeeds, with a new client registration, on both sides.
+				assert.ok(await world.create());
+				assert.deepStrictEqual(world.dynamicStorage.getInteractedProviders().map(p => [p.providerId, p.clientId]), [[PROVIDER_ID, 'client-2']]);
+				assert.strictEqual(world.authenticationService.isAuthenticationProviderRegistered(PROVIDER_ID), true);
+				assert.deepStrictEqual(await world.extHost.$getSessions(PROVIDER_ID, undefined, {}), []);
+				await world.cleanUp();
+			});
+		}
+
+		test('a removal that completes after a registration is saved and before it is published: it is not published; nothing is left', async () => {
+			const world = createRemovalWorld();
+			await world.seedStoredClient();
+			const save = world.dynamicStorage.storeClientRegistration.bind(world.dynamicStorage);
+			world.dynamicStorage.storeClientRegistration = async (...args: Parameters<typeof save>) => {
+				await save(...args);
+				await removeCommand(world);
+			};
+
+			const result = await outcome(world.create());
+
+			assert.deepStrictEqual(await leftOver(world), nothingLeft);
+			assert.strictEqual(result, 'DynamicAuthProviderRemovedError');
+			assert.ok(createdProviders.every(p => p.disposed));
+		});
 	});
 });

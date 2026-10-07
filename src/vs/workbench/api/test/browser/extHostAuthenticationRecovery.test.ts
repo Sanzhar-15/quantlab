@@ -137,7 +137,7 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 			initialTokens,
 		);
 		store.add({ dispose: () => provider.dispose() });
-		await dynamicStorage.storeClientRegistration(provider.id, AUTH_SERVER, 'client-1', 'client-secret-1', 'Example');
+		await dynamicStorage.storeClientRegistration(provider.id, AUTH_SERVER, 'client-1', 'client-secret-1', 'Example', 0);
 		await dynamicStorage.setSessionsForDynamicAuthProvider(provider.id, 'client-1', initialTokens);
 		const events: { added: string[]; removed: string[] }[] = [];
 		store.add(provider.onDidChangeSessions(e => events.push({ added: (e.added ?? []).map(s => s.accessToken), removed: (e.removed ?? []).map(s => s.accessToken) })));
@@ -413,7 +413,7 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		);
 		const serverMetadata: IAuthorizationServerMetadata = { issuer: AUTH_SERVER, response_types_supported: ['code'], registration_endpoint: REGISTRATION_ENDPOINT };
 
-		await assert.rejects(auth.$registerDynamicAuthProvider(URI.parse(AUTH_SERVER).toJSON(), serverMetadata, undefined, undefined, undefined, undefined), /User did not provide client details/);
+		await assert.rejects(auth.$registerDynamicAuthProvider(URI.parse(AUTH_SERVER).toJSON(), serverMetadata, undefined, undefined, undefined, undefined, 0), /User did not provide client details/);
 
 		assert.ok(lines.some(l => l.includes('Dynamic registration failed')), lines.join('\n'));
 		for (const line of lines) {
@@ -426,7 +426,7 @@ suite('ExtHostAuthentication - dynamic auth recovery keeps stored credentials', 
 		const secrets = store.add(new TestSecretStorageService());
 		const dynamicStorage = store.add(new DynamicAuthenticationProviderStorageService(storageService, secrets, new NullLogService()));
 		for (const [id, clientId] of [['provider-a', 'client-a'], ['provider-b', 'client-b']]) {
-			await dynamicStorage.storeClientRegistration(id, `https://${id}.example.com`, clientId, `${clientId}-secret`, id);
+			await dynamicStorage.storeClientRegistration(id, `https://${id}.example.com`, clientId, `${clientId}-secret`, id, 0);
 			await dynamicStorage.setSessionsForDynamicAuthProvider(id, clientId, [{ access_token: `${id}-token`, token_type: 'Bearer', created_at: 1 }]);
 		}
 		const keptKeys = [`dynamicAuthProvider:clientRegistration:provider-b`, JSON.stringify({ isDynamicAuthProvider: true, authProviderId: 'provider-b', clientId: 'client-b' })];

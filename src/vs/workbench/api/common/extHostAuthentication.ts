@@ -289,7 +289,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 		resourceMetadata: IAuthorizationProtectedResourceMetadata | undefined,
 		clientId: string | undefined,
 		clientSecret: string | undefined,
-		initialTokens: IAuthorizationToken[] | undefined
+		initialTokens: IAuthorizationToken[] | undefined,
+		removalCount: number
 	): Promise<string> {
 		if (!clientId) {
 			const authorizationServer = URI.revive(authorizationServerComponents);
@@ -351,7 +352,10 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 		try {
 			await this._providerOperations.queue(provider.id, async () => {
 				// The main thread validates and saves the registration before it publishes the provider; it is installed here
-				// only after that resolves. A rejection leaves an entry already registered under this id untouched.
+				// only after that resolves. A rejection leaves an entry already registered under this id untouched. The main
+				// thread refuses a registration it began before a removal of the provider completed (`removalCount`): such a
+				// registration may be queued here behind an operation that was pending during the removal, and carries the
+				// client ID and sessions read before it.
 				await this._proxy.$registerDynamicAuthenticationProvider({
 					id: provider.id,
 					label: provider.label,
@@ -359,7 +363,8 @@ export class ExtHostAuthentication implements ExtHostAuthenticationShape {
 					authorizationServer: authorizationServerComponents,
 					resourceServer: resourceMetadata ? URI.parse(resourceMetadata.resource) : undefined,
 					clientId: provider.clientId,
-					clientSecret: provider.clientSecret
+					clientSecret: provider.clientSecret,
+					removalCount
 				});
 
 				const replaced = this._authenticationProviders.get(provider.id);
