@@ -574,8 +574,10 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 	 * cleanup index entry's and the stored client registration's. Runs in the provider's operation order, so no session
 	 * write interleaves with it; once it has completed, a session write for the provider is rejected
 	 * ({@link setSessionsForDynamicAuthProvider}), and so is a registration begun before it ({@link storeClientRegistration}).
+	 * Its completion is one boundary: the count advance and `unregister` run in one synchronous step, so no registration
+	 * reads the new count before the unregistration is dispatched.
 	 */
-	removeDynamicProvider(providerId: string): Promise<void> {
+	removeDynamicProvider(providerId: string, unregister: () => void): Promise<void> {
 		return this._providerOperations.queue(providerId, async () => {
 			// A stored list or cleanup index that cannot be read rejects here, before any deletion.
 			const providerInfo = this._getStoredProviders().find(p => p.providerId === providerId);
@@ -617,7 +619,10 @@ export class DynamicAuthenticationProviderStorageService extends Disposable impl
 			if (filteredIndex.length !== index.length) {
 				this._storeCleanupIndex(filteredIndex);
 			}
+			// The removal's boundary: a registration begun before it is refused by the count; one begun after it is a new
+			// registration, and the unregistration dispatched here (before any such registration can begin) never removes it.
 			this._removalCounts.set(providerId, this.getRemovalCount(providerId) + 1);
+			unregister();
 		});
 	}
 

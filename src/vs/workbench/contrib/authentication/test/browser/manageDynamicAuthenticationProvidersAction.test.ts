@@ -99,11 +99,11 @@ suite('RemoveDynamicAuthenticationProvidersAction - storage before unregistratio
 		const world = await createWorld(() => { }, ['provider-a', 'provider-b']);
 		const removeDynamicProvider = world.dynamicStorage.removeDynamicProvider.bind(world.dynamicStorage);
 		let removals = 0;
-		world.dynamicStorage.removeDynamicProvider = async (providerId: string) => {
+		world.dynamicStorage.removeDynamicProvider = async (providerId: string, unregister: () => void) => {
 			if (removals++ === 1) {
 				world.corruptList();
 			}
-			return removeDynamicProvider(providerId);
+			return removeDynamicProvider(providerId, unregister);
 		};
 
 		await assert.rejects(new RemoveDynamicAuthenticationProvidersAction().run(world.accessor), (e: unknown) => e instanceof Error && e.name === 'InvalidStoredProviderListError');

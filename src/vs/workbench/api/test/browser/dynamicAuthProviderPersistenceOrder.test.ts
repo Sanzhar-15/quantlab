@@ -51,6 +51,8 @@ const LIST_KEY = 'dynamicAuthProviders';
 const REGISTRATION_KEY = `dynamicAuthProvider:clientRegistration:${PROVIDER_ID}`;
 const SESSIONS_KEY = JSON.stringify({ isDynamicAuthProvider: true, authProviderId: PROVIDER_ID, clientId: 'client-1' });
 const INVALID_LIST = 'not json {"providerId":';
+const CLEANUP_INDEX_KEY = 'dynamicAuthProviderCleanupIndex';
+const CLIENT_ID_METADATA_URL = 'https://client.example.com/metadata.json';
 
 const serverMetadata: IAuthorizationServerMetadata = {
 	issuer: AUTH_SERVER,
@@ -162,7 +164,7 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 		} as unknown as IExtHostContext;
 		const mainThread: MainThreadAuthentication = store.add(new MainThreadAuthentication(
 			extHostContext,
-			{} as IProductService,
+			{ authClientIdMetadataUrl: CLIENT_ID_METADATA_URL } as IProductService,
 			authenticationService,
 			{ onDidChangeAccountPreference: Event.None } as unknown as IAuthenticationExtensionsService,
 			{} as IAuthenticationAccessService,
@@ -201,12 +203,14 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 		};
 		const corruptList = () => storageService.store(LIST_KEY, INVALID_LIST, StorageScope.APPLICATION, StorageTarget.MACHINE);
 		const create = () => authenticationService.createDynamicAuthenticationProvider(URI.parse(AUTH_SERVER), serverMetadata, undefined);
+		/** A registration whose server supports the client ID metadata flow: with no stored client ID, the product's metadata URL is the client ID. */
+		const createWithClientIdMetadata = () => authenticationService.createDynamicAuthenticationProvider(URI.parse(AUTH_SERVER), { ...serverMetadata, client_id_metadata_document_supported: true }, undefined);
 		/** Unregisters on both sides, so each test leaves nothing registered. */
 		const cleanUp = async () => {
 			await extHost!.$onDidUnregisterAuthenticationProvider(PROVIDER_ID);
 			await mainThread.$unregisterAuthenticationProvider(PROVIDER_ID);
 		};
-		return { extHost, mainThread, authenticationService, dynamicStorage, storageService, secrets, calls, registeredEvents, snapshot, seedStoredClient, corruptList, create, cleanUp };
+		return { extHost, mainThread, authenticationService, dynamicStorage, storageService, secrets, calls, registeredEvents, snapshot, seedStoredClient, corruptList, create, createWithClientIdMetadata, cleanUp };
 	}
 
 	test('registration with an invalid stored list rejects, named, and publishes nothing on either side; storage is unchanged', async () => {
@@ -423,6 +427,51 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 			assert.deepStrictEqual(await leftOver(world), nothingLeft);
 			assert.strictEqual(result, 'DynamicAuthProviderRemovedError');
 			assert.ok(createdProviders.every(p => p.disposed));
+		});
+
+		// review-c3 M2: a registration that begins while the removal commits reads the removal's new count, so no count check
+		// refuses it. The removal's unregistration is dispatched at the same boundary as the count, so it reaches the
+		// extension host before that registration and never deletes it: the registration is a fresh one, present on both sides.
+		test('a registration begun as the removal commits, while a refresh is pending: it is stored and registered on both sides; the stale refresh write is refused', async () => {
+			const tokenResponse = deferred<Response>();
+			fetchStub.callsFake(async (input: string | URL | Request) => {
+				if (String(input) === TOKEN_ENDPOINT) {
+					return tokenResponse.promise;
+				}
+				return new Response('', { status: 404 });
+			});
+			const world = createRemovalWorld();
+			await world.secrets.set(REGISTRATION_KEY, JSON.stringify({ clientId: 'client-1', clientSecret: 'secret-1' }));
+			await world.secrets.set(SESSIONS_KEY, JSON.stringify([{ access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', scope: 'read', expires_in: 3600, created_at: 1 }]));
+			assert.ok(await world.create());
+
+			// 1. A refresh is held in the extension host.
+			const refresh = world.extHost.$getSessions(PROVIDER_ID, ['read'], {});
+			await until(() => fetchStub.getCalls().some(c => String(c.args[0]) === TOKEN_ENDPOINT));
+			// 2. When the removal deletes the provider's cleanup index entry, a registration is scheduled: it begins once the
+			// removal's commit step has run, with the client ID the client ID metadata flow supplies.
+			const storeValue = world.storageService.store.bind(world.storageService);
+			const atCommit: Promise<unknown>[] = [];
+			world.storageService.store = (...args: Parameters<typeof storeValue>) => {
+				storeValue(...args);
+				if (atCommit.length === 0 && args[0] === CLEANUP_INDEX_KEY) {
+					atCommit.push(Promise.resolve().then(() => world.createWithClientIdMetadata()));
+				}
+			};
+			// 3. The Remove command completes.
+			await removeCommand(world);
+			assert.strictEqual(atCommit.length, 1, 'the removal deleted the cleanup index entry');
+			await until(() => createdProviders.length === 2);
+			assert.strictEqual(createdProviders[1].clientId, CLIENT_ID_METADATA_URL);
+			// 4. The refresh is released: its stale write is refused.
+			tokenResponse.resolve(new Response(JSON.stringify({ access_token: 'at-2', refresh_token: 'rt-2', token_type: 'Bearer', scope: 'read', expires_in: 3600 }), { status: 200 }));
+			await assert.rejects(refresh, (e: unknown) => e instanceof Error && e.name === 'DynamicAuthSessionPersistError');
+
+			assert.strictEqual(await outcome(atCommit[0]), 'registered');
+			assert.deepStrictEqual(await leftOver(world), { storedProviders: 1, secrets: [REGISTRATION_KEY], mainThreadRegistered: true, extHostRegistered: true }, 'stored, and registered on both sides');
+			assert.deepStrictEqual(world.dynamicStorage.getInteractedProviders().map(p => [p.providerId, p.clientId]), [[PROVIDER_ID, CLIENT_ID_METADATA_URL]]);
+			assert.deepStrictEqual(createdProviders.map(p => p.disposed), [true, false], 'the removed provider is disposed; the new one is installed');
+			await world.cleanUp();
 		});
 	});
 });

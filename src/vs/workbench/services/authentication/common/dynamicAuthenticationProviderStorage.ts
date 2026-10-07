@@ -89,8 +89,12 @@ export interface IDynamicAuthenticationProviderStorageService {
 	/**
 	 * Remove a dynamic authentication provider and its stored data.
 	 * @param providerId The provider ID to remove.
+	 * @param unregister Unregisters the provider from the window. Called once its stored data is removed, in the same
+	 * synchronous step that completes the removal (advances {@link getRemovalCount}), and not at all when the removal
+	 * rejects before that. A registration that reads the new count therefore begins after the unregistration was
+	 * dispatched, so the unregistration never removes it.
 	 */
-	removeDynamicProvider(providerId: string): Promise<void>;
+	removeDynamicProvider(providerId: string, unregister: () => void): Promise<void>;
 
 	/**
 	 * Get sessions for a dynamic authentication provider from secret storage.
