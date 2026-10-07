@@ -36,10 +36,6 @@ import { IEditorService } from '../../../services/editor/common/editorService.js
 import { IExtensionService } from '../../../services/extensions/common/extensions.js';
 import { createKeybindingCommandQuery } from '../../../services/preferences/browser/keybindingsEditorModel.js';
 import { IPreferencesService } from '../../../services/preferences/common/preferences.js';
-import { CHAT_OPEN_ACTION_ID } from '../../chat/browser/actions/chatActions.js';
-import { ASK_QUICK_QUESTION_ACTION_ID } from '../../chat/browser/actions/chatQuickInputActions.js';
-import { IChatAgentService } from '../../chat/common/participants/chatAgents.js';
-import { ChatAgentLocation } from '../../chat/common/constants.js';
 
 export class CommandsQuickAccessProvider extends AbstractEditorCommandsQuickAccessProvider {
 
@@ -78,7 +74,6 @@ export class CommandsQuickAccessProvider extends AbstractEditorCommandsQuickAcce
 		@IPreferencesService private readonly preferencesService: IPreferencesService,
 		@IProductService private readonly productService: IProductService,
 		@IAiRelatedInformationService private readonly aiRelatedInformationService: IAiRelatedInformationService,
-		@IChatAgentService private readonly chatAgentService: IChatAgentService,
 	) {
 		super({
 			showAlias: !Language.isDefaultVariant(),
@@ -98,7 +93,6 @@ export class CommandsQuickAccessProvider extends AbstractEditorCommandsQuickAcce
 
 		return {
 			preserveInput: commandPaletteConfig.preserveInput,
-			showAskInChat: commandPaletteConfig.showAskInChat,
 			experimental: commandPaletteConfig.experimental
 		};
 	}
@@ -165,33 +159,7 @@ export class CommandsQuickAccessProvider extends AbstractEditorCommandsQuickAcce
 			await timeout(CommandsQuickAccessProvider.AI_RELATED_INFORMATION_DEBOUNCE, token);
 			additionalPicks = await this.getRelatedInformationPicks(allPicks, picksSoFar, filter, token);
 		} catch (e) {
-			// Ignore and continue to add "Ask in Chat" option
-		}
-
-		// If enabled in settings, add "Ask in Chat" option after a separator (if needed).
-		if (this.configuration.showAskInChat) {
-			const defaultAgent = this.chatAgentService.getDefaultAgent(ChatAgentLocation.Chat);
-			if (defaultAgent) {
-				if (picksSoFar.length || additionalPicks.length) {
-					additionalPicks.push({
-						type: 'separator'
-					});
-				}
-
-				additionalPicks.push({
-					label: localize('commandsQuickAccess.askInChat', "Ask in Chat: {0}", filter),
-					commandId: this.configuration.experimental.askChatLocation === 'quickChat' ? ASK_QUICK_QUESTION_ACTION_ID : CHAT_OPEN_ACTION_ID,
-					args: [filter],
-					buttons: [{
-						iconClass: ThemeIcon.asClassName(Codicon.gear),
-						tooltip: localize('commandsQuickAccess.configureAskInChatSetting', "Configure visibility"),
-					}],
-					trigger: () => {
-						void this.preferencesService.openSettings({ jsonEditor: false, query: 'workbench.commandPalette.showAskInChat' });
-						return TriggerAction.CLOSE_PICKER;
-					},
-				});
-			}
+			// Ignore related-information failures and return what we have
 		}
 
 		return additionalPicks;

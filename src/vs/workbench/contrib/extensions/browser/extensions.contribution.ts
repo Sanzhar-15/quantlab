@@ -1543,54 +1543,6 @@ class ExtensionsContributions extends Disposable implements IWorkbenchContributi
 		});
 
 		this.registerExtensionAction({
-			id: 'workbench.extensions.action.installAndDonotSync',
-			title: localize('install installAndDonotSync', "Install (Do not Sync)"),
-			menu: {
-				id: MenuId.ExtensionContext,
-				group: '0_install',
-				when: ContextKeyExpr.and(ContextKeyExpr.equals('extensionStatus', 'uninstalled'), ContextKeyExpr.has('isGalleryExtension'), ContextKeyExpr.has('isExtensionAllowed'), ContextKeyExpr.not('extensionDisallowInstall'), CONTEXT_SYNC_ENABLEMENT),
-				order: 1
-			},
-			run: async (accessor: ServicesAccessor, extensionId: string) => {
-				const instantiationService = accessor.get(IInstantiationService);
-				const extension = this.extensionsWorkbenchService.local.filter(e => areSameExtensions(e.identifier, { id: extensionId }))[0]
-					|| (await this.extensionsWorkbenchService.getExtensions([{ id: extensionId }], CancellationToken.None))[0];
-				if (extension) {
-					const action = instantiationService.createInstance(InstallAction, {
-						installPreReleaseVersion: this.extensionManagementService.preferPreReleases,
-						isMachineScoped: true,
-					});
-					action.extension = extension;
-					return action.run();
-				}
-			}
-		});
-
-		this.registerExtensionAction({
-			id: 'workbench.extensions.action.installPrereleaseAndDonotSync',
-			title: localize('installPrereleaseAndDonotSync', "Install Pre-Release (Do not Sync)"),
-			menu: {
-				id: MenuId.ExtensionContext,
-				group: '0_install',
-				when: ContextKeyExpr.and(ContextKeyExpr.equals('extensionStatus', 'uninstalled'), ContextKeyExpr.has('isGalleryExtension'), ContextKeyExpr.has('extensionHasPreReleaseVersion'), ContextKeyExpr.has('isPreReleaseExtensionAllowed'), ContextKeyExpr.not('extensionDisallowInstall'), CONTEXT_SYNC_ENABLEMENT),
-				order: 2
-			},
-			run: async (accessor: ServicesAccessor, extensionId: string) => {
-				const instantiationService = accessor.get(IInstantiationService);
-				const extension = this.extensionsWorkbenchService.local.filter(e => areSameExtensions(e.identifier, { id: extensionId }))[0]
-					|| (await this.extensionsWorkbenchService.getExtensions([{ id: extensionId }], CancellationToken.None))[0];
-				if (extension) {
-					const action = instantiationService.createInstance(InstallAction, {
-						isMachineScoped: true,
-						preRelease: true
-					});
-					action.extension = extension;
-					return action.run();
-				}
-			}
-		});
-
-		this.registerExtensionAction({
 			id: InstallAnotherVersionAction.ID,
 			title: InstallAnotherVersionAction.LABEL,
 			menu: {

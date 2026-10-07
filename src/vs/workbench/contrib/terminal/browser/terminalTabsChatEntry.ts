@@ -8,7 +8,6 @@ import { Codicon } from '../../../../base/common/codicons.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { $ } from '../../../../base/browser/dom.js';
 import { localize } from '../../../../nls.js';
-import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { ITerminalChatService } from './terminal.js';
 import * as dom from '../../../../base/browser/dom.js';
 
@@ -26,33 +25,17 @@ export class TerminalTabsChatEntry extends Disposable {
 	constructor(
 		container: HTMLElement,
 		private readonly _tabContainer: HTMLElement,
-		@ICommandService private readonly _commandService: ICommandService,
 		@ITerminalChatService private readonly _terminalChatService: ITerminalChatService,
 	) {
 		super();
 
 		this._entry = dom.append(container, $('.terminal-tabs-chat-entry'));
-		this._entry.tabIndex = 0;
-		this._entry.setAttribute('role', 'button');
 
 		const entry = dom.append(this._entry, $('.terminal-tabs-entry'));
 		const icon = dom.append(entry, $('.terminal-tabs-chat-entry-icon'));
 		icon.classList.add(...ThemeIcon.asClassNameArray(Codicon.commentDiscussionSparkle));
 		this._label = dom.append(entry, $('.terminal-tabs-chat-entry-label'));
 
-		const runChatTerminalsCommand = () => {
-			void this._commandService.executeCommand('workbench.action.terminal.chat.viewHiddenChatTerminals');
-		};
-		this._register(dom.addDisposableListener(this._entry, dom.EventType.CLICK, e => {
-			e.preventDefault();
-			runChatTerminalsCommand();
-		}));
-		this._register(dom.addDisposableListener(this._entry, dom.EventType.KEY_DOWN, e => {
-			if (e.key === 'Enter' || e.key === ' ') {
-				e.preventDefault();
-				runChatTerminalsCommand();
-			}
-		}));
 		this.update();
 	}
 

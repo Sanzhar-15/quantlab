@@ -22,9 +22,7 @@ registerWorkbenchContribution2(TerminalChatEnabler.Id, TerminalChatEnabler, Work
 
 // #endregion
 
-// #region Actions
-
-import './terminalChatActions.js';
+// #region Imports
 import { AccessibleViewRegistry } from '../../../../../platform/accessibility/browser/accessibleViewRegistry.js';
 import { TerminalChatAccessibilityHelp } from './terminalChatAccessibilityHelp.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../../common/contributions.js';

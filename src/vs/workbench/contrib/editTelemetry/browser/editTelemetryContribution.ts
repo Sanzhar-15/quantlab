@@ -12,8 +12,7 @@ import { ITelemetryService, TelemetryLevel, telemetryLevelEnabled } from '../../
 import { AnnotatedDocuments } from './helpers/annotatedDocuments.js';
 import { EditTrackingFeature } from './telemetry/editSourceTrackingFeature.js';
 import { VSCodeWorkspace } from './helpers/vscodeObservableWorkspace.js';
-import { AiStatsFeature } from './editStats/aiStatsFeature.js';
-import { EDIT_TELEMETRY_SETTING_ID, AI_STATS_SETTING_ID } from './settingIds.js';
+import { EDIT_TELEMETRY_SETTING_ID } from './settingIds.js';
 
 export class EditTelemetryContribution extends Disposable {
 	constructor(
@@ -33,16 +32,6 @@ export class EditTelemetryContribution extends Disposable {
 				return;
 			}
 			r.store.add(this._instantiationService.createInstance(EditTrackingFeature, workspace.read(r), annotatedDocuments.read(r)));
-		}));
-
-		const aiStatsEnabled = observableConfigValue(AI_STATS_SETTING_ID, true, this._configurationService);
-		this._register(autorun(r => {
-			const enabled = aiStatsEnabled.read(r);
-			if (!enabled) {
-				return;
-			}
-
-			r.store.add(this._instantiationService.createInstance(AiStatsFeature, annotatedDocuments.read(r)));
 		}));
 	}
 }

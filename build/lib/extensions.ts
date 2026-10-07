@@ -329,6 +329,7 @@ const excludedExtensions = [
 	'tunnel-forwarding',
 	'github-authentication',
 	'microsoft-authentication',
+	'mermaid-chat-features',
 	'theme-abyss',
 	'theme-kimbie-dark',
 	'theme-monokai-dimmed',
