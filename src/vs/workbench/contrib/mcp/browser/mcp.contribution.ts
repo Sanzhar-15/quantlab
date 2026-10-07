@@ -6,9 +6,7 @@
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import * as jsonContributionRegistry from '../../../../platform/jsonschemas/common/jsonContributionRegistry.js';
-import { mcpAccessConfig, McpAccessValue } from '../../../../platform/mcp/common/mcpManagement.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
-import { IConfigurationMigrationRegistry, Extensions as ConfigurationMigrationExtensions, ConfigurationKeyValuePairs } from '../../../common/configuration.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { mcpSchemaId } from '../../../services/configuration/common/configuration.js';
 import { ExtensionMcpDiscovery } from '../common/discovery/extensionMcpDiscovery.js';
@@ -28,16 +26,14 @@ import { McpService } from '../common/mcpService.js';
 import { IMcpElicitationService, IMcpSamplingService, IMcpService, IMcpWorkbenchService } from '../common/mcpTypes.js';
 import { McpAddContextContribution } from './mcpAddContextContribution.js';
 import { MCPServerActionRendering } from './mcpCommands.js';
-import { McpDiscovery } from './mcpDiscovery.js';
 import { McpElicitationService } from './mcpElicitationService.js';
-import { McpLanguageFeatures } from './mcpLanguageFeatures.js';
-import { McpConfigMigrationContribution } from './mcpMigration.js';
 import { McpServersViewsContribution } from './mcpServersView.js';
-import { MCPContextsInitialisation, McpWorkbenchService } from './mcpWorkbenchService.js';
+import { McpWorkbenchService } from './mcpWorkbenchService.js';
 
 registerSingleton(IMcpRegistry, McpRegistry, InstantiationType.Delayed);
 registerSingleton(IMcpService, McpService, InstantiationType.Delayed);
-registerSingleton(IMcpWorkbenchService, McpWorkbenchService, InstantiationType.Eager);
+// Delayed, not Eager (QL-STRIP c1 M2): eager start synced the installed servers with the MCP gallery and took the install URL handler.
+registerSingleton(IMcpWorkbenchService, McpWorkbenchService, InstantiationType.Delayed);
 registerSingleton(IMcpDevModeDebugging, McpDevModeDebugging, InstantiationType.Delayed);
 registerSingleton(IMcpSamplingService, McpSamplingService, InstantiationType.Delayed);
 registerSingleton(IMcpElicitationService, McpElicitationService, InstantiationType.Delayed);
@@ -47,33 +43,20 @@ mcpDiscoveryRegistry.register(new SyncDescriptor(InstalledMcpServersDiscovery));
 mcpDiscoveryRegistry.register(new SyncDescriptor(ExtensionMcpDiscovery));
 mcpDiscoveryRegistry.register(new SyncDescriptor(CursorWorkspaceMcpDiscoveryAdapter));
 
-registerWorkbenchContribution2('mcpDiscovery', McpDiscovery, WorkbenchPhase.AfterRestored);
+// Not registered (QL-STRIP c1 M2), each could start or offer removed MCP functionality from saved configuration:
+//  - McpDiscovery (mcpDiscovery.ts): starts every discovery above (installed servers, native Claude/Cursor/Windsurf files, workspace .cursor/mcp.json, extensions)
+//  - McpLanguageFeatures (mcpLanguageFeatures.ts): inert, but constructing it created the MCP workbench service
+//  - MCPContextsInitialisation (mcpWorkbenchService.ts): queried the installed servers at startup for context keys that nothing reads
+//  - McpConfigMigrationContribution (mcpMigration.ts): migrated mcp servers out of user settings and prompted about them
 registerWorkbenchContribution2('mcpContextKeys', McpContextKeysController, WorkbenchPhase.BlockRestore);
-registerWorkbenchContribution2('mcpLanguageFeatures', McpLanguageFeatures, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2('mcpResourceFilesystem', McpResourceFilesystem, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(McpLanguageModelToolContribution.ID, McpLanguageModelToolContribution, WorkbenchPhase.AfterRestored);
 
 registerWorkbenchContribution2('mcpActionRendering', MCPServerActionRendering, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2('mcpAddContext', McpAddContextContribution, WorkbenchPhase.Eventually);
-registerWorkbenchContribution2(MCPContextsInitialisation.ID, MCPContextsInitialisation, WorkbenchPhase.AfterRestored);
-registerWorkbenchContribution2(McpConfigMigrationContribution.ID, McpConfigMigrationContribution, WorkbenchPhase.Eventually);
 registerWorkbenchContribution2(McpServersViewsContribution.ID, McpServersViewsContribution, WorkbenchPhase.AfterRestored);
 
 const jsonRegistry = <jsonContributionRegistry.IJSONContributionRegistry>Registry.as(jsonContributionRegistry.Extensions.JSONContribution);
 jsonRegistry.registerSchema(mcpSchemaId, mcpServerSchema);
 
-
-Registry.as<IConfigurationMigrationRegistry>(ConfigurationMigrationExtensions.ConfigurationMigration)
-	.registerConfigurationMigrations([{
-		key: 'chat.mcp.enabled',
-		migrateFn: (value, accessor) => {
-			const result: ConfigurationKeyValuePairs = [['chat.mcp.enabled', { value: undefined }]];
-			if (value === true) {
-				result.push([mcpAccessConfig, { value: McpAccessValue.All }]);
-			}
-			if (value === false) {
-				result.push([mcpAccessConfig, { value: McpAccessValue.None }]);
-			}
-			return result;
-		}
-	}]);
+// The `chat.mcp.enabled` -> `chat.mcp.access` settings migration is not registered (QL-STRIP c1 M2): it rewrote the user's settings for a removed area.
