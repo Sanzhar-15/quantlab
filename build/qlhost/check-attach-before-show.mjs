@@ -9,6 +9,8 @@
 // Run from the fork root: `node build/qlhost/check-attach-before-show.mjs src/vs`; rc 0 = GREEN.
 // Row 3: a start rejected because the window was closed (`isQuitDuringStart`) is a quit: no `app.exit` in that branch, and
 // `lifecycleMainService.quit()` only when no quit is already under way; any other rejection still exits 1.
+// Row 4 (package K1-1): the start is a shutdown joiner (`onWillShutdown` -> `join('qlTerminalHostStart', …)`) registered before
+// it is awaited, so the lifecycle's final quit cannot end the process under the start's unwind. 34d1cd4f968's app.ts -> rows 1, 4 RED.
 // Negatives: cfd0c72398f's app.ts (attach after startTerminalHost resolved) -> row 1 RED (row 2 stays GREEN: one attach there
 // too); c7401d0b279's app.ts (every rejection exits 1) -> row 3 RED.
 import { readFileSync } from 'node:fs';
@@ -33,7 +35,7 @@ const portsStart = app.indexOf('const ports: Ports = {');
 const portsEnd = portsStart < 0 ? -1 : app.indexOf('\n\t\t};', portsStart);
 const ports = portsStart < 0 || portsEnd < 0 ? '' : app.slice(portsStart, portsEnd);
 const hook = /onBeforeShow: started => qlWorkbenchHost\.attach\(started\)/.test(ports);
-const started = app.indexOf('await startTerminalHost(ports)');
+const started = app.indexOf('const starting = startTerminalHost(ports);');
 row('1 the ports handed to startTerminalHost attach the workbench host in onBeforeShow', hook && started > portsEnd,
 	`ports literal ${ports ? 'found' : 'MISSING'}, onBeforeShow -> attach ${hook}, startTerminalHost(ports) after it ${started > portsEnd}`);
 
@@ -52,6 +54,11 @@ const returns = /return false;\s*\}\s*$/.test(quitBranch.trimEnd().replace(/this
 row('3 a quit during the start is not an exit 1: lifecycle quit only when none is under way, no app.exit/app.quit in it, then return',
 	quitAt >= 0 && exit1At > quitAt && guarded && !exitInQuit && returns,
 	`quit branch ${quitAt >= 0 ? 'found' : 'MISSING'} before app.exit(1) ${exit1At > quitAt}, guarded lifecycle quit ${guarded}, app.exit/quit inside ${exitInQuit}, returns ${returns}`);
+
+const joinAt = app.indexOf(`this.lifecycleMainService.onWillShutdown)(e => e.join('qlTerminalHostStart', starting.then(`);
+const awaitAt = app.indexOf('terminalHost = await starting;');
+row('4 the start is a shutdown joiner before it is awaited (a quit waits for the unwind)', started >= 0 && joinAt > started && awaitAt > joinAt,
+	`start taken as a promise ${started >= 0}, joined on will-shutdown ${joinAt > started}, awaited after the join ${awaitAt > joinAt}`);
 
 console.log(rows.join('\n'));
 if (problems.length) {

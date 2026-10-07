@@ -1353,10 +1353,18 @@ export class CodeApplication extends Disposable {
 			onBeforeShow: started => qlWorkbenchHost.attach(started)
 		};
 
+		// QuantLab host (review c1 M7, package K1-1): a quit during the start waits for the start to settle. A TERM destroys the
+		// window, the lifecycle's shutdown joiners settle in milliseconds and its final quit ended the process while the rejected
+		// start was still unwinding (exit 133, SIGTRAP in the isolate's disposal, no `exit 0`). The start is a shutdown joiner
+		// until it settles; the joiner only waits: the rejection itself is handled by the catch below.
+		const starting = startTerminalHost(ports);
+		const startJoiner = Event.once(this.lifecycleMainService.onWillShutdown)(e => e.join('qlTerminalHostStart', starting.then(() => undefined, () => undefined)));
 		let terminalHost: TerminalHost;
 		try {
-			terminalHost = await startTerminalHost(ports);
+			terminalHost = await starting;
 		} catch (error) {
+			startJoiner.dispose();
+
 			// QuantLab host (review c1 M7): the window was closed during the start (a close, Cmd+Q, a TERM, an update restart): a
 			// quit, not a failure (the client logged `quit during start` and `exit 0`). A quit already under way ends on its own: a
 			// second `app.quit()` during the lifecycle's prevented `will-quit` ends the process under its joiners
@@ -1378,6 +1386,7 @@ export class CodeApplication extends Disposable {
 
 			return false;
 		}
+		startJoiner.dispose();
 		this.qlTerminalHost = terminalHost;
 
 		// QuantLab updater (PACK, folds/HOST/PACK-UPDATER-HUNK.md): the ONE updater, electron-updater injected into the client
