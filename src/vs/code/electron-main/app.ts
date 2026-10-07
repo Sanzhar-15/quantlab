@@ -127,7 +127,7 @@ import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetr
 // electron-updater is CommonJS with getter-defined exports: node's ESM loader finds no named export (`autoUpdater`), and
 // out/main.js is ESM, so a named import throws SyntaxError before `ready` (package 5, folds/HOST/U5-LAUNCH-1.md). Default import.
 import electronUpdater from 'electron-updater';
-import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
+import { bakedBuildValues, createUpdater, isQuitDuringStart, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
 // QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
@@ -1357,6 +1357,22 @@ export class CodeApplication extends Disposable {
 		try {
 			terminalHost = await startTerminalHost(ports);
 		} catch (error) {
+			// QuantLab host (review c1 M7): the window was closed during the start (a close, Cmd+Q, a TERM, an update restart): a
+			// quit, not a failure (the client logged `quit during start` and `exit 0`). A quit already under way ends on its own: a
+			// second `app.quit()` during the lifecycle's prevented `will-quit` ends the process under its joiners
+			// (folds/HOST/QUIT-EXIT-FIX.md). A close that started no quit (macOS: closing the only window) quits through the lifecycle.
+			if (isQuitDuringStart(error)) {
+				this.logService.info('QuantLab host: the window was closed during the terminal host start; the app quits', error);
+				if (!this.lifecycleMainService.quitRequested) {
+					this.lifecycleMainService.quit().then(
+						veto => veto && this.logService.error('QuantLab host: the quit after a close during the start was vetoed'),
+						quitError => this.logService.error('QuantLab host: the quit after a close during the start failed', quitError)
+					);
+				}
+
+				return false;
+			}
+
 			this.logService.error(error);
 			app.exit(1);
 

@@ -7,7 +7,10 @@
 // placeholder) from the terminal host's `onBeforeShow` port, i.e. while the window is hidden and before the first load
 // (the client's start.dtest proves the port's order), and nowhere else.
 // Run from the fork root: `node build/qlhost/check-attach-before-show.mjs src/vs`; rc 0 = GREEN.
-// Negative: cfd0c72398f's app.ts (attach after startTerminalHost resolved) -> row 1 RED (row 2 stays GREEN: one attach there too).
+// Row 3: a start rejected because the window was closed (`isQuitDuringStart`) is a quit: no `app.exit` in that branch, and
+// `lifecycleMainService.quit()` only when no quit is already under way; any other rejection still exits 1.
+// Negatives: cfd0c72398f's app.ts (attach after startTerminalHost resolved) -> row 1 RED (row 2 stays GREEN: one attach there
+// too); c7401d0b279's app.ts (every rejection exits 1) -> row 3 RED.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -36,6 +39,19 @@ row('1 the ports handed to startTerminalHost attach the workbench host in onBefo
 
 const attaches = app.match(/qlWorkbenchHost\.attach\(/g)?.length ?? 0;
 row('2 no other attach (none after the start resolved)', attaches === 1, `${attaches} call(s) of qlWorkbenchHost.attach`);
+
+const catchStart = app.indexOf('catch (error)', started);
+const catchEnd = catchStart < 0 ? -1 : app.indexOf('this.qlTerminalHost = terminalHost;', catchStart);
+const handler = catchStart < 0 || catchEnd < 0 ? '' : app.slice(catchStart, catchEnd);
+const quitAt = handler.indexOf('if (isQuitDuringStart(error)) {');
+const exit1At = handler.indexOf('app.exit(1);');
+const quitBranch = quitAt < 0 || exit1At < 0 ? '' : handler.slice(quitAt, exit1At);
+const guarded = /if \(!this\.lifecycleMainService\.quitRequested\) \{\s*this\.lifecycleMainService\.quit\(\)/.test(quitBranch);
+const exitInQuit = /app\.(exit|quit)\(/.test(quitBranch);
+const returns = /return false;\s*\}\s*$/.test(quitBranch.trimEnd().replace(/this\.logService\.error\(error\);$/, '').trimEnd());
+row('3 a quit during the start is not an exit 1: lifecycle quit only when none is under way, no app.exit/app.quit in it, then return',
+	quitAt >= 0 && exit1At > quitAt && guarded && !exitInQuit && returns,
+	`quit branch ${quitAt >= 0 ? 'found' : 'MISSING'} before app.exit(1) ${exit1At > quitAt}, guarded lifecycle quit ${guarded}, app.exit/quit inside ${exitInQuit}, returns ${returns}`);
 
 console.log(rows.join('\n'));
 if (problems.length) {
