@@ -41,6 +41,7 @@ import { ParameterPanel } from '../../webview/chart/parameterPanel';
 import { ChartViewProvider } from '../views/chart/ChartViewProvider';
 import { DebuggerService } from '../views/chart/DebuggerService';
 import { parseChartInboundMessage } from '../views/chart/chartInboundValidation';
+import { validateVisualizationCommands } from '../../webview/chart/dataValidation';
 // Type-only: puts the webview entry into the tsc program so out/ has it; the suite requires it after its globals exist.
 import type {} from '../../webview/chart/index';
 
@@ -993,5 +994,19 @@ suite('ChartViewProvider.reloadData: timeframe flow and announcement (F-CHARTS-F
 			await quiet.reload();
 			assert.deepStrictEqual(quiet.banners, [['data', '', undefined]], 'the data banner is cleared, nothing announced');
 		}
+	});
+});
+
+// The validators are the first layer that names an unknown message type or visualization command; the provider's and the
+// chart's own switches name it again. Each validator is held directly here, so removing its throw fails a test on its own.
+suite('the validators name an unknown type themselves (F-CHARTS-FB2 c1 M2, M3)', () => {
+	test('parseChartInboundMessage names a typed message of no known type', () => {
+		assert.throws(() => parseChartInboundMessage({ type: 'bogus' }),
+			new Error('quantlab chart: unknown webview message type (bogus)'));
+	});
+
+	test('validateVisualizationCommands names a command of no known type', () => {
+		assert.throws(() => validateVisualizationCommands([{ type: 'zigzag' }]),
+			new Error('chart: unknown visualization command (zigzag)'));
 	});
 });
