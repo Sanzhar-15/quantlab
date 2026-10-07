@@ -14,6 +14,18 @@ import type {
 	ThemeTokensInput
 } from '@charts-plus/chart-core';
 import { formatCompactVolume, formatPrice } from './formatters';
+import {
+	isChartTimeframe,
+	CHART_TIMEFRAMES,
+	type ChartTimeframe,
+	resolveDash,
+	validateBars,
+	validateEquity,
+	validatePaneHeight,
+	validateSignal,
+	validateSignals,
+	validateVisualizationCommands
+} from './dataValidation';
 
 export interface OhlcvBar {
 	t: number;
@@ -154,13 +166,6 @@ export class ChartThemeReader {
 		}
 		return this.probe;
 	}
-}
-
-/** The host's timeframes (src/types/market.ts `Timeframe`); a message carrying any other value is a named error. */
-const CHART_TIMEFRAMES = ['1m', '5m', '15m', '30m', '1H', '4H', '1D', '1W', '1M'] as const;
-type ChartTimeframe = typeof CHART_TIMEFRAMES[number];
-function isChartTimeframe(value: string): value is ChartTimeframe {
-	return (CHART_TIMEFRAMES as readonly string[]).includes(value);
 }
 
 const ORD_STEP_MS = 86_400_000; // 1 day -- universal step for ordinal spacing
@@ -330,6 +335,9 @@ export class ChartClient {
 	}
 
 	async setData(data: OhlcvBar[]): Promise<void> {
+		// The data boundary: finite time and OHLC, finite volume when present (an absent volume is legitimate). A bad
+		// bar is a named error before the chart changes; the axis and legend formatters never see a NaN.
+		validateBars(data);
 		await this.ensureChart();
 		if (!this.candleSeries) {
 			return;
@@ -338,10 +346,6 @@ export class ChartClient {
 		// Build ordinal map from real timestamps and remap bars. No bars is a defined empty chart: the state before
 		// the first setData, with no ordinal map (an empty map has no real time to show for an axis position).
 		const realTimes = data.map(bar => bar.t);
-		const badTime = data.findIndex(bar => !Number.isFinite(bar.t));
-		if (badTime !== -1) {
-			throw new Error(`chart: bar ${badTime} has no finite time (t = ${data[badTime].t})`);
-		}
 		this.ordinalMap = data.length > 0 ? new OrdinalTimeMap(realTimes) : null;
 		const remapped = data.map((bar, i) => ({ ...bar, t: i * ORD_STEP_MS }));
 
@@ -409,6 +413,7 @@ export class ChartClient {
 	}
 
 	async setEquityCurve(data: EquityPoint[]): Promise<void> {
+		validateEquity(data, 'setEquityCurve');
 		await this.ensureChart();
 		if (!this.chart) {
 			return;
@@ -438,6 +443,7 @@ export class ChartClient {
 	}
 
 	async setSignals(signals: SignalPoint[]): Promise<void> {
+		validateSignals(signals, 'setSignals');
 		await this.ensureChart();
 		this.lastSignals = signals;
 		this.signalMarkers = this.buildSignalMarkers(signals);
@@ -450,6 +456,7 @@ export class ChartClient {
 	 * are re-snapped through the ordinal map like every other marker source.
 	 */
 	async addSignal(signal: SignalPoint): Promise<void> {
+		validateSignal(signal, 'addSignal');
 		await this.ensureChart();
 		this.lastSignals = [...this.lastSignals, signal];
 		this.signalMarkers = this.buildSignalMarkers(this.lastSignals);
@@ -469,6 +476,9 @@ export class ChartClient {
 	}
 
 	async applyVisualization(commands: VisualizationCommand[]): Promise<void> {
+		// Every command and option is validated BEFORE any series or pane changes (a present invalid option is named; an
+		// absent optional one is omitted), so a rejected batch leaves the chart as it was.
+		validateVisualizationCommands(commands);
 		await this.ensureChart();
 		if (!this.chart) {
 			return;
@@ -486,7 +496,8 @@ export class ChartClient {
 						this.ensurePane(command.id, command.height);
 						break;
 					case 'plotSeries': {
-						const paneKey = typeof command.options?.paneId === 'string' ? command.options?.paneId : undefined;
+						// validateVisualizationCommands: paneId is absent (the main pane) or a non-empty string.
+						const paneKey = command.options?.paneId as string | undefined;
 						const resolvedPane = paneKey ? this.ensurePane(paneKey) : undefined;
 						const seriesOptions = this.buildSeriesOptions(command.options, resolvedPane);
 						const optionsKey = this.buildSeriesOptionsKey(seriesOptions, command.series);
@@ -657,6 +668,10 @@ export class ChartClient {
 		if (!this.chart) {
 			return key;
 		}
+		// An absent height is no height; a present one must be valid before any pane is created or resized.
+		if (height !== undefined) {
+			validatePaneHeight(height, 'pane');
+		}
 		if (this.isStrategyKey(key)) {
 			this.strategyPaneKeys.add(key);
 		}
@@ -680,9 +695,11 @@ export class ChartClient {
 	}
 
 	private applyPaneHeight(paneId: string, height: number): void {
-		if (!this.chart || !Number.isFinite(height) || height <= 0) {
+		if (!this.chart) {
 			return;
 		}
+		// An invalid height is a named error, never a silent no-op (callers pass validated or constant heights).
+		validatePaneHeight(height, 'pane');
 		const pane = this.chart.getPane(paneId);
 		if (!pane) {
 			return;
@@ -808,7 +825,6 @@ export class ChartClient {
 
 	private buildSignalMarkers(signals: SignalPoint[]): SeriesMarker[] {
 		return signals
-			.filter(signal => typeof signal.t === 'number')
 			.map(signal => {
 				const isEntry = signal.type === 'entry';
 				return {
@@ -1020,6 +1036,10 @@ export class ChartClient {
 		};
 	}
 
+	/**
+	 * The engine options of a plotSeries command. The options were validated (validateSeriesOptions) before any
+	 * series or pane changed: an absent option is omitted here, a present one is valid.
+	 */
 	private buildSeriesOptions(options?: Record<string, unknown>, paneId?: string): Record<string, unknown> {
 		const seriesOptions: Record<string, unknown> = {
 			priceLineVisible: false,
@@ -1034,49 +1054,31 @@ export class ChartClient {
 			return seriesOptions;
 		}
 
-		if (typeof options.color === 'string') {
+		if (options.color !== undefined) {
 			seriesOptions.color = options.color;
 		}
-		if (typeof options.title === 'string') {
+		if (options.title !== undefined) {
 			seriesOptions.title = options.title;
 		}
 		if (options.lineWidth !== undefined) {
-			if (typeof options.lineWidth !== 'number' || !Number.isFinite(options.lineWidth)) {
-				throw new Error(`chart: series option lineWidth must be a finite number (${String(options.lineWidth)})`);
-			}
 			seriesOptions.width = options.lineWidth;
-		} else if (typeof options.width === 'number' && Number.isFinite(options.width)) {
+		} else if (options.width !== undefined) {
 			seriesOptions.width = options.width;
 		}
 		if (options.lineStyle !== undefined) {
-			const dash = this.resolveDash(options.lineStyle);
+			const dash = resolveDash(options.lineStyle);
 			if (dash) {
 				seriesOptions.dash = dash;
 			}
 		}
-		if (typeof options.opacity === 'number') {
+		if (options.opacity !== undefined) {
 			seriesOptions.opacity = options.opacity;
 		}
-		if (typeof options.priceLineVisible === 'boolean') {
+		if (options.priceLineVisible !== undefined) {
 			seriesOptions.priceLineVisible = options.priceLineVisible;
 		}
 
 		return seriesOptions;
-	}
-
-	/** The dash pattern of a lineStyle; undefined means solid, which only 'solid' asks for. */
-	private resolveDash(style: unknown): number[] | undefined {
-		const normalized = typeof style === 'string' ? style.toLowerCase() : style;
-		if (normalized === 'dashed') {
-			return [6, 4];
-		}
-		if (normalized === 'dotted') {
-			return [2, 4];
-		}
-		if (normalized === 'solid') {
-			return undefined;
-		}
-		throw new Error(`chart: unknown series lineStyle (${String(style)}; expected solid, dashed or dotted)`);
 	}
 
 	private buildSeriesOptionsKey(options: Record<string, unknown>, seriesType: string): string {

@@ -457,7 +457,15 @@ const handler = createMessageHandler({
 window.addEventListener('message', event => {
 	const message = event.data as { type?: string; theme?: ThemePayload; mode?: ReducedMotionMode };
 	if (message?.type === 'theme') {
-		applyTheme(message.theme);
+		// The host always sends the whole theme (ThemeProvider.sendTheme); applyTheme ignores an absent one, so check it here.
+		const theme = message.theme;
+		if (typeof theme !== 'object' || theme === null
+			|| (theme.kind !== 'light' && theme.kind !== 'dark' && theme.kind !== 'high-contrast')
+			|| (theme.variant !== 'light' && theme.variant !== 'dark')
+			|| typeof theme.highContrast !== 'boolean') {
+			throw new Error(`chart: malformed theme message (theme ${JSON.stringify(theme)})`);
+		}
+		applyTheme(theme);
 		return;
 	}
 	if (message?.type === 'reducedMotion') {

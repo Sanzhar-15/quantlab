@@ -624,20 +624,21 @@ suite('DebuggerService: loading a debug file (F-CHARTS-FB2 2/n)', () => {
 		return service as unknown as DebuggerService;
 	}
 
-	test('an engine that returns nothing is named (not false); one that returns the file enables the debugger', async () => {
+	test('an engine that returns nothing is named (not false); one that returns the parsed file enables the debugger', async () => {
 		const service = makeService();
 		commands.executeCommand = async () => undefined;
 		await assert.rejects(service.loadDebugFile('/runs/a.debug'),
 			new Error('quantlab debugger: the engine returned no debug data for /runs/a.debug'));
 		assert.strictEqual(service.isEnabled(), false);
-		commands.executeCommand = async () => JSON.stringify(DEBUG_FILE);
+		// The registered command returns the parsed object (extension.ts quantlab.engine.readDebugFile), not a string.
+		commands.executeCommand = async () => DEBUG_FILE;
 		await service.loadDebugFile('/runs/a.debug');
 		assert.strictEqual(service.isEnabled(), true);
 		assert.strictEqual(service.getTotalBars(), 2);
 		assert.deepStrictEqual(service.getTradeBarIndices(), [1]);
 	});
 
-	test('an engine failure is the failure, even for a readable .json file (no second reader); unreadable JSON is named', async () => {
+	test('an engine failure is the failure, even for a readable .json file (no second reader); a text result is named', async () => {
 		const file = path.join(scratch, 'run.json');
 		fs.writeFileSync(file, JSON.stringify(DEBUG_FILE));
 		const service = makeService();
@@ -650,7 +651,7 @@ suite('DebuggerService: loading a debug file (F-CHARTS-FB2 2/n)', () => {
 		assert.strictEqual(service.isEnabled(), false, 'the file was not read behind the engine\'s back');
 		commands.executeCommand = async () => '{not json';
 		await assert.rejects(service.loadDebugFile('/runs/b.debug'),
-			(error: Error) => /^quantlab debugger: the debug data for \/runs\/b\.debug is not valid JSON: /.test(error.message));
+			new Error('quantlab debugger: the debug data for /runs/b.debug is invalid (expected the parsed debug file object, got string)'));
 	});
 });
 

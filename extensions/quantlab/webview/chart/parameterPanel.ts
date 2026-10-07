@@ -174,6 +174,9 @@ export class ParameterPanel {
 			numeric.value = String(value ?? param.default);
 
 			range.addEventListener('input', () => {
+				// The slider always supplies a valid number: it repairs an entry the number box had marked invalid.
+				numeric.removeAttribute('aria-invalid');
+				numeric.setCustomValidity('');
 				numeric.value = range.value;
 				onValueChange(Number(range.value), false);
 			});

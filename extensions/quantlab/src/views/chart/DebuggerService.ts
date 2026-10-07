@@ -80,6 +80,19 @@ export interface DebugBarData {
 	fills: DebugFill[];
 }
 
+/**
+ * What the `quantlab.engine.readDebugFile` command returns: the debug file, already parsed (the command reads the
+ * file and runs JSON.parse itself; it returns null after showing its own error when it could not).
+ */
+export interface DebugFileContents {
+	metadata: DebugMetadata;
+	states: DebugState[];
+	conditions: ConditionCapture[];
+	signals: DebugSignal[];
+	fills: DebugFill[];
+	tradeBarIndices: number[];
+}
+
 /** Debugger state change event */
 export interface DebuggerStateEvent {
 	type: 'enabled' | 'disabled' | 'barChanged' | 'dataLoaded';
@@ -163,7 +176,7 @@ export class DebuggerService implements vscode.Disposable {
 	}
 
 	/**
-	 * Load a debug file. Any failure (engine, empty result, unreadable JSON) rejects with a named error.
+	 * Load a debug file. Any failure (engine, empty result, a result that is not the parsed debug file) rejects with a named error.
 	 */
 	async loadDebugFile(filePath: string): Promise<void> {
 		// Call Python engine to read debug file
@@ -339,20 +352,13 @@ export class DebuggerService implements vscode.Disposable {
 	}
 
 	/**
-	 * Read debug file using Python engine.
+	 * Read debug file using the engine command. The command returns the parsed object (DebugFileContents); one
+	 * route, no second reader, and every shortfall is a named error.
 	 */
-	private async readDebugFile(filePath: string): Promise<{
-		metadata: DebugMetadata;
-		states: DebugState[];
-		conditions: ConditionCapture[];
-		signals: DebugSignal[];
-		fills: DebugFill[];
-		tradeBarIndices: number[];
-	}> {
-		// One route: the engine command. A failure of it is the failure; there is no second reader.
-		let result: string | undefined;
+	private async readDebugFile(filePath: string): Promise<DebugFileContents> {
+		let result: DebugFileContents | null | undefined;
 		try {
-			result = await vscode.commands.executeCommand<string>(
+			result = await vscode.commands.executeCommand<DebugFileContents | null>(
 				'quantlab.engine.readDebugFile',
 				filePath
 			);
@@ -360,15 +366,53 @@ export class DebuggerService implements vscode.Disposable {
 			throw new Error(`quantlab debugger: the engine could not read the debug file ${filePath}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 		}
 
-		if (!result) {
+		if (result === undefined || result === null) {
 			throw new Error(`quantlab debugger: the engine returned no debug data for ${filePath}`);
 		}
 
-		try {
-			return JSON.parse(result);
-		} catch (error) {
-			throw new Error(`quantlab debugger: the debug data for ${filePath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+		return DebuggerService.validateDebugFile(result, filePath);
+	}
+
+	/** The command's result as DebugFileContents, or a named error for the first required field that is missing or invalid. */
+	private static validateDebugFile(result: unknown, filePath: string): DebugFileContents {
+		const invalid = (problem: string) => new Error(`quantlab debugger: the debug data for ${filePath} is invalid (${problem})`);
+		if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+			throw invalid(`expected the parsed debug file object, got ${Array.isArray(result) ? 'an array' : typeof result}`);
 		}
+		const file = result as Record<string, unknown>;
+		const metadata = file.metadata;
+		if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+			throw invalid('metadata is missing');
+		}
+		const { barCount, strategyPath } = metadata as Record<string, unknown>;
+		if (typeof barCount !== 'number' || !Number.isInteger(barCount) || barCount < 0) {
+			throw invalid(`metadata.barCount is ${String(barCount)}, not a whole number of bars`);
+		}
+		if (strategyPath !== undefined && typeof strategyPath !== 'string') {
+			throw invalid(`metadata.strategyPath is ${String(strategyPath)}, not a path`);
+		}
+		for (const field of ['states', 'conditions', 'signals', 'fills'] as const) {
+			const entries = file[field];
+			if (!Array.isArray(entries)) {
+				throw invalid(`${field} is missing`);
+			}
+			entries.forEach((entry: unknown, i) => {
+				const barIndex = typeof entry === 'object' && entry !== null ? (entry as Record<string, unknown>).barIndex : undefined;
+				if (typeof barIndex !== 'number' || !Number.isInteger(barIndex) || barIndex < 0) {
+					throw invalid(`${field}[${i}] has no whole barIndex (${String(barIndex)})`);
+				}
+			});
+		}
+		const trades = file.tradeBarIndices;
+		if (!Array.isArray(trades)) {
+			throw invalid('tradeBarIndices is missing');
+		}
+		trades.forEach((index: unknown, i) => {
+			if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
+				throw invalid(`tradeBarIndices[${i}] is ${String(index)}, not a bar index`);
+			}
+		});
+		return result as DebugFileContents;
 	}
 
 	/**

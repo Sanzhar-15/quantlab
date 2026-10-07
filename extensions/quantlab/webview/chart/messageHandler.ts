@@ -5,6 +5,25 @@
 
 import type { ChartClient, EquityPoint, OhlcvBar, SignalPoint, VisualizationCommand } from './chartApi';
 import type { ParameterPanel, ParameterDefinition } from './parameterPanel';
+import {
+	describeValue,
+	malformed,
+	validateBars,
+	validateBinaryBars,
+	validateComplexity,
+	validateDataSource,
+	validateEquity,
+	validateErrorActions,
+	validateOverrides,
+	validateParameters,
+	validateRequestId,
+	validateSignal,
+	validateSignals,
+	validateTheme,
+	validateToolbar,
+	validateVisualizationCommands,
+	BINARY_BAR_STRIDE
+} from './dataValidation';
 
 interface ComplexityInfo {
 	level: 'safe' | 'partial' | 'viewOnly';
@@ -281,10 +300,8 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 	};
 
 	const updateToolbar = (toolbar: ChartToolbarState) => {
+		// The caller validated the toolbar (validateToolbar) before any state changed: the mode is 'data' or 'strategy'.
 		const mode = toolbar.mode;
-		if (mode !== 'data' && mode !== 'strategy') {
-			throw new Error(`chart: the toolbar has no valid mode (${String(mode)})`);
-		}
 		context.applyMode(mode);
 		if (mode === 'data') {
 			const source = toolbar.dataSource;
@@ -342,8 +359,17 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 			throw new Error(`chart: malformed message (${describeValue(message)})`);
 		}
 
+		// Every case validates its whole payload FIRST (a malformed one is a named error and changes no state), then
+		// handles a request id that is valid but older than one already handled: that is the one deliberate ignore.
 		switch (data.type) {
 			case 'init':
+				if (!data.payload || typeof data.payload !== 'object') {
+					throw malformed('init', `payload ${describeValue(data.payload)}`);
+				}
+				validateTheme(data.payload.theme, 'init');
+				validateToolbar(data.payload.toolbar, 'init');
+				validateParameters(data.payload.parameters, 'init');
+				validateOverrides(data.payload.overrides, 'init');
 				parameters = data.payload.parameters;
 				overrides = data.payload.overrides;
 				updateToolbar(data.payload.toolbar);
@@ -352,17 +378,22 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				await context.chart.initialize(data.payload.theme);
 				return;
 			case 'setToolbar':
+				validateToolbar(data.toolbar, 'setToolbar');
 				updateToolbar(data.toolbar);
 				echoTimeframe(data.toolbar.timeframe);
 				return;
 			case 'setRecentSources':
+				if (!Array.isArray(data.sources)) {
+					throw malformed('setRecentSources', `sources ${describeValue(data.sources)}`);
+				}
+				data.sources.forEach((source, i) => validateDataSource(source, 'setRecentSources', `sources[${i}]`));
 				populateDropdown(data.sources);
 				return;
 			case 'setData':
-				if (typeof data.requestId !== 'number' || data.requestId < lastDataRequestId) {
-					return;
-				}
-				if (!Array.isArray(data.data)) {
+				validateRequestId('setData', data.requestId);
+				validateBars(data.data, 'setData');
+				if (data.requestId < lastDataRequestId) {
+					// A valid request older than the data already rendered: superseded, deliberately ignored.
 					return;
 				}
 				lastDataRequestId = data.requestId;
@@ -374,26 +405,28 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				await context.chart.setData(data.data);
 				return;
 			case 'setDataBinary': {
-				if (typeof data.requestId !== 'number' || data.requestId < lastDataRequestId) {
+				validateRequestId('setDataBinary', data.requestId);
+				validateBinaryBars(data.buffer, data.count);
+				const decoded = decodeOhlcvBuffer(data.buffer, data.count);
+				validateBars(decoded, 'setDataBinary');
+				if (data.requestId < lastDataRequestId) {
+					// A valid request older than the data already rendered: superseded, deliberately ignored.
 					return;
-				}
-				if (!(data.buffer instanceof ArrayBuffer) || typeof data.count !== 'number' || data.count < 0) {
-					throw new Error(`chart: malformed setDataBinary message (buffer ${describeValue(data.buffer)}, count ${String(data.count)})`);
 				}
 				lastDataRequestId = data.requestId;
 				clearError();
 				setLoading(false);
 				setEmptyState(false);
-				const decoded = decodeOhlcvBuffer(data.buffer, data.count);
 				context.marketHeader.updateFromBars(decoded);
 				context.legend.setBars(decoded);
 				await context.chart.setData(decoded);
 				return;
 			}
 			case 'showLoading':
-				// H17: visible fetch feedback. A stale id (older than data we
-				// already rendered) must not re-arm the pill.
-				if (typeof data.requestId !== 'number' || data.requestId < lastDataRequestId) {
+				// H17: visible fetch feedback.
+				validateRequestId('showLoading', data.requestId);
+				if (data.requestId < lastDataRequestId) {
+					// A valid id older than data we already rendered must not re-arm the pill: superseded, deliberately ignored.
 					return;
 				}
 				setLoading(true);
@@ -408,45 +441,72 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 				return;
 			case 'addSignal':
 				// H15: live trade fill markers appended without replacing the set.
-				if (!data.signal || typeof data.signal.t !== 'number') {
-					throw new Error(`chart: malformed addSignal message (signal ${describeValue(data.signal)})`);
-				}
+				validateSignal(data.signal, 'addSignal');
 				await context.chart.addSignal(data.signal);
 				return;
 			case 'setSignals':
+				validateRequestId('setSignals', data.requestId);
+				validateSignals(data.signals, 'setSignals');
 				await context.chart.setSignals(data.signals);
 				return;
 			case 'setEquityCurve':
+				validateRequestId('setEquityCurve', data.requestId);
+				validateEquity(data.equity, 'setEquityCurve');
 				await context.chart.setEquityCurve(data.equity);
 				return;
 			case 'setVisualization':
+				validateRequestId('setVisualization', data.requestId);
+				validateVisualizationCommands(data.commands);
 				if (data.requestId < lastVizRequestId) {
+					// A valid request older than the visualization already applied: superseded, deliberately ignored.
 					return;
 				}
 				lastVizRequestId = data.requestId;
 				await context.chart.applyVisualization(data.commands);
 				return;
 			case 'setParameters':
+				validateParameters(data.parameters, 'setParameters');
 				parameters = data.parameters;
 				context.parameterPanel.render(parameters, overrides);
 				return;
 			case 'setOverrides':
+				validateOverrides(data.overrides, 'setOverrides');
 				overrides = data.overrides;
 				context.parameterPanel.setOverrides(overrides);
 				return;
 			case 'setComplexity':
+				validateComplexity(data.complexity, 'setComplexity');
 				setComplexity(data.complexity);
 				return;
 			case 'setTheme':
+				validateTheme(data.theme, 'setTheme');
 				context.chart.setTheme(data.theme);
 				return;
 			case 'toggleParameters':
+				if (typeof data.collapsed !== 'boolean') {
+					throw malformed('toggleParameters', `collapsed ${describeValue(data.collapsed)}`);
+				}
 				context.panelRoot.classList.toggle('params-collapsed', data.collapsed);
 				return;
 			case 'showBanner':
+				if (typeof data.message !== 'string') {
+					throw malformed('showBanner', `message ${describeValue(data.message)}`);
+				}
+				if (data.tone !== undefined && data.tone !== 'info' && data.tone !== 'warning') {
+					throw malformed('showBanner', `tone ${describeValue(data.tone)}`);
+				}
 				setBanner(data.message, data.tone);
 				return;
 			case 'showError':
+				if (typeof data.message !== 'string') {
+					throw malformed('showError', `message ${describeValue(data.message)}`);
+				}
+				if (data.detail !== undefined && typeof data.detail !== 'string') {
+					throw malformed('showError', `detail ${describeValue(data.detail)}`);
+				}
+				if (data.actions !== undefined) {
+					validateErrorActions(data.actions, 'showError');
+				}
 				renderError(data.message, data.actions, data.detail);
 				return;
 			default:
@@ -456,19 +516,11 @@ export function createMessageHandler(context: MessageHandlerContext): (message: 
 	};
 }
 
-/** A short, safe rendering of an unexpected value for an error message. */
-function describeValue(value: unknown): string {
-	if (value instanceof ArrayBuffer) {
-		return `ArrayBuffer of ${value.byteLength} bytes`;
-	}
-	const json = JSON.stringify(value);
-	return json === undefined ? String(value) : json;
-}
-
+/** Decodes a buffer validateBinaryBars accepted: exactly `count` bars of six doubles. */
 function decodeOhlcvBuffer(buffer: ArrayBuffer, count: number): OhlcvBar[] {
 	const view = new Float64Array(buffer);
 	const bars: OhlcvBar[] = [];
-	const stride = 6;
+	const stride = BINARY_BAR_STRIDE;
 
 	for (let i = 0; i < count; i++) {
 		const offset = i * stride;

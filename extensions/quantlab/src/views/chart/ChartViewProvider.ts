@@ -23,20 +23,14 @@ import { ChartState } from '../../types/views';
 import { ChartStateStore } from './ChartStateStore';
 import { ChartWebview } from './ChartWebview';
 import { fireChartDrawn } from './chartDrawn';
+import { parseChartInboundMessage } from './chartInboundValidation';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
 import { ReducedMotion } from '../../ui/accessibility/ReducedMotion';
 import { FeatureDiscovery } from '../../ui/onboarding/FeatureDiscovery';
 
 type BannerKind = 'viewOnly' | 'run' | 'data';
 
-// Runtime guard for webview-posted timeframe overrides (M30): the message
-// payload is untrusted, so an unknown value must surface as an error, not
-// silently reach the server as a malformed bars request.
-const VALID_TIMEFRAMES: ReadonlySet<string> = new Set<Timeframe>(['1m', '5m', '15m', '30m', '1H', '4H', '1D', '1W', '1M']);
-
-function isValidTimeframe(value: unknown): value is Timeframe {
-	return typeof value === 'string' && VALID_TIMEFRAMES.has(value);
-}
+// Webview-posted timeframe overrides (M30) are validated with every other inbound message (chartInboundValidation.ts).
 
 interface BannerMessage {
 	message: string;
@@ -254,12 +248,15 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	}
 
 	private async onMessage(session: ChartSession, message: unknown): Promise<void> {
-		if (!message || typeof message !== 'object') {
-			this.showChartError(`quantlab chart: malformed webview message (${ChartViewProvider.describeValue(message)})`);
+		// The whole message is validated before any state changes (the webview's payloads are untrusted, M30/M2): a
+		// malformed or unknown one is shown to the user by name and handled no further.
+		let payload: ChartInboundMessage;
+		try {
+			payload = parseChartInboundMessage(message);
+		} catch (error) {
+			this.showChartError(error instanceof Error ? error.message : String(error));
 			return;
 		}
-
-		const payload = message as ChartInboundMessage;
 		switch (payload.type) {
 			case 'ready':
 				session.webview.markReady();
@@ -297,11 +294,7 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				this.updateChartOverride(session, { dateRange: payload.range });
 				return;
 			case 'overrideTimeframe':
-				// M30: per-tab bar-interval override from the market header.
-				if (!isValidTimeframe(payload.timeframe)) {
-					void vscode.window.showErrorMessage(`Chart: invalid timeframe override '${String((payload as { timeframe?: unknown }).timeframe)}'.`);
-					return;
-				}
+				// M30: per-tab bar-interval override from the market header (parseChartInboundMessage checked the timeframe).
 				this.updateChartOverride(session, { timeframe: payload.timeframe });
 				return;
 			case 'refresh':
@@ -333,17 +326,20 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				return;
 			case 'dropFile': {
 				const dropped = payload.filePath;
-				if (dropped && (dropped.endsWith('.csv') || dropped.endsWith('.parquet'))) {
-					const source: DataSourceDescriptor = {
-						kind: 'localFile',
-						filePath: dropped,
-						displayName: path.basename(dropped)
-					};
-					// Set global state only - refreshFromGlobal will propagate to tabs without overrides
-					this.globalState.setDataSource(source);
-					this.refreshToolbar(session);
-					this.executeWithErrorBoundary(() => this.reloadData(session), 'reloadData');
+				if (!dropped.endsWith('.csv') && !dropped.endsWith('.parquet')) {
+					// A drop the chart cannot load is said, not ignored.
+					this.showChartError(`quantlab chart: only .csv and .parquet files can be dropped on the chart (${path.basename(dropped)})`);
+					return;
 				}
+				const source: DataSourceDescriptor = {
+					kind: 'localFile',
+					filePath: dropped,
+					displayName: path.basename(dropped)
+				};
+				// Set global state only - refreshFromGlobal will propagate to tabs without overrides
+				this.globalState.setDataSource(source);
+				this.refreshToolbar(session);
+				this.executeWithErrorBoundary(() => this.reloadData(session), 'reloadData');
 				return;
 			}
 			case 'dropRun':
@@ -359,12 +355,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 				return;
 			}
 		}
-	}
-
-	/** A short, safe rendering of an unexpected value for an error message. */
-	private static describeValue(value: unknown): string {
-		const json = JSON.stringify(value);
-		return json === undefined ? String(value) : json;
 	}
 
 	/** The provider's user-visible error path for a webview-side or host-side contract break. */
@@ -476,9 +466,13 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		}
 	}
 
-	private refreshToolbar(session: ChartSession): void {
+	/**
+	 * Sends the toolbar. `timeframe` is the timeframe of bars about to be sent (a local file's is inferred from its
+	 * bars): the webview formats its time axis with it, so it must arrive before those bars, never after.
+	 */
+	private refreshToolbar(session: ChartSession, timeframe?: Timeframe): void {
 		const toolbar = this.buildToolbarState(session);
-		session.webview.postMessage({ type: 'setToolbar', toolbar });
+		session.webview.postMessage({ type: 'setToolbar', toolbar: timeframe === undefined ? toolbar : { ...toolbar, timeframe } });
 	}
 
 	private refreshAnalysis(session: ChartSession): void {
@@ -719,8 +713,13 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 		try {
 			const { data, effectiveTimeframe, dsKey, warning } = await this.loadBars(toolbar.dataSource, toolbar, token);
-			if (warning) {
-				this.setBanner(session, 'data', warning, 'warning');
+			// An explicitly requested interval the server cannot serve is announced (the header shows what is drawn).
+			const timeframeNotice = isServerSource(toolbar.dataSource)
+				? ChartViewProvider.serverTimeframeNotice(this.requestedTimeframe(session), toolbar.dataSource.assetClass, toolbar.dataSource.symbol)
+				: undefined;
+			const bannerText = [warning, timeframeNotice].filter(text => text).join(' ');
+			if (bannerText) {
+				this.setBanner(session, 'data', bannerText, 'warning');
 			} else {
 				this.setBanner(session, 'data', '');
 			}
@@ -767,6 +766,10 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 
 			const { buffer, count } = encodeOhlcvBars(data);
 
+			// The toolbar with the timeframe of these bars goes BEFORE the bars: the webview's time axis formats with
+			// it (a local file's timeframe is inferred from the data, so no earlier toolbar has it).
+			this.refreshToolbar(session, effectiveTimeframe);
+
 			session.webview.postMessage({
 				type: 'setDataBinary',
 				requestId,
@@ -775,9 +778,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 			});
 
 			this.chartStateStore.setLastDataKey(key, `${dsKey}:${toolbar.dateRange?.start ?? ''}:${toolbar.dateRange?.end ?? ''}`);
-
-			// Refresh toolbar to show inferred timeframe
-			this.refreshToolbar(session);
 
 			await this.refreshVisualization(session, data);
 		} catch (error) {
@@ -859,7 +859,9 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 	 * The clamped value is what the user sees: buildToolbarState puts it in
 	 * toolbar.timeframe, which the webview shows as the active interval
 	 * (marketHeader.setTimeframe -> setActiveTimeframe) and in the toolbar label.
-	 * So the 1D here is a product default, not a hidden substitute.
+	 * No selection yet (undefined) is the default 1D; an explicit selection the
+	 * server cannot serve is replaced by 1D AND announced (serverTimeframeNotice,
+	 * shown as the chart banner by reloadData).
 	 */
 	private static clampServerTimeframe(timeframe: Timeframe | undefined, assetClass: string | undefined): Timeframe {
 		const supported = assetClass?.toLowerCase() === 'crypto'
@@ -868,11 +870,27 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		return timeframe !== undefined && supported.includes(timeframe) ? timeframe : '1D';
 	}
 
+	/** What the user selected: the tab's timeframe, else the global one; undefined when nothing was selected. */
+	private requestedTimeframe(session: ChartSession): Timeframe | undefined {
+		const tabId = session.tabInstanceId;
+		const chartState = tabId ? this.stateManager.getChartState(tabId) : undefined;
+		return chartState?.timeframe ?? this.globalState.getTimeframe();
+	}
+
+	/** The announcement for an explicit timeframe selection that clampServerTimeframe replaced; undefined when nothing was replaced. */
+	private static serverTimeframeNotice(requested: Timeframe | undefined, assetClass: string | undefined, symbol: string): string | undefined {
+		if (requested === undefined) {
+			return undefined;
+		}
+		const shown = ChartViewProvider.clampServerTimeframe(requested, assetClass);
+		return shown === requested ? undefined : `${requested} bars are not available for ${symbol}; showing ${shown}.`;
+	}
+
 	private buildToolbarState(session: ChartSession): ChartToolbarState {
 		const tabId = session.tabInstanceId;
 		const chartState = tabId ? this.stateManager.getChartState(tabId) : undefined;
 		const dataSource = chartState?.dataSource ?? this.globalState.getDataSource();
-		let timeframe = chartState?.timeframe ?? this.globalState.getTimeframe();
+		let timeframe = this.requestedTimeframe(session);
 		if (dataSource && isServerSource(dataSource)) {
 			timeframe = ChartViewProvider.clampServerTimeframe(timeframe, dataSource.assetClass);
 		}

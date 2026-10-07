@@ -42,6 +42,7 @@ import { SettingsPanelProvider } from './panels/settings/SettingsPanelProvider';
 import { GlobalSelectors } from './ui/GlobalSelectors';
 import { updateContextKeys } from './utils/contextKeys';
 import { ChartViewProvider } from './views/chart/ChartViewProvider';
+import type { DebugFileContents } from './views/chart/DebuggerService';
 import { ActionViewProvider } from './views/action/ActionViewProvider';
 import { StatsViewProvider } from './views/stats/StatsViewProvider';
 import { VisualiseDataProvider } from './views/visualise/VisualiseDataProvider';
@@ -416,7 +417,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(
 		vscode.commands.registerCommand(
 			'quantlab.engine.readDebugFile',
-			async (filePath: string) => {
+			async (filePath: string): Promise<DebugFileContents | null> => {
 				try {
 					const content = await fs.promises.readFile(filePath, 'utf-8');
 					return JSON.parse(content);
