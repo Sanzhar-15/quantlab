@@ -19,7 +19,6 @@ import { IDiagnosticInfoOptions, IRemoteDiagnosticInfo } from '../../../../platf
 import { INativeWorkbenchEnvironmentService } from '../../../services/environment/electron-browser/environmentService.js';
 import { PersistentConnectionEventType } from '../../../../platform/remote/common/remoteAgentConnection.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
-import { IConfigurationRegistry, Extensions as ConfigurationExtensions } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { IRemoteAuthorityResolverService } from '../../../../platform/remote/common/remoteAuthorityResolver.js';
 import { IWorkspaceContextService, WorkbenchState } from '../../../../platform/workspace/common/workspace.js';
 import { TELEMETRY_SETTING_ID } from '../../../../platform/telemetry/common/telemetry.js';
@@ -191,20 +190,6 @@ registerWorkbenchContribution2(RemoteEmptyWorkbenchPresentation.ID, RemoteEmptyW
 if (isWindows) {
 	registerWorkbenchContribution2(WSLContextKeyInitializer.ID, WSLContextKeyInitializer, WorkbenchPhase.BlockRestore);
 }
-
-Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration)
-	.registerConfiguration({
-		id: 'remote',
-		title: nls.localize('remote', "Remote"),
-		type: 'object',
-		properties: {
-			'remote.downloadExtensionsLocally': {
-				type: 'boolean',
-				markdownDescription: nls.localize('remote.downloadExtensionsLocally', "When enabled extensions are downloaded locally and installed on remote."),
-				default: false
-			},
-		}
-	});
 
 if (isMacintosh) {
 } else {
