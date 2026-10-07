@@ -29,7 +29,7 @@ export interface IEncryptionApp {
 }
 
 /** The `safeStorage` calls that may read the macOS Keychain (and so may block on a Keychain prompt). */
-type KeychainOperation = 'isEncryptionAvailable' | 'encryptString' | 'decryptString';
+export type KeychainOperation = 'isEncryptionAvailable' | 'encryptString' | 'decryptString';
 
 /** The class of a thrown value, for log lines and messages: never its message, which may quote a secret. */
 function errorClassOf(error: unknown): string {
@@ -37,6 +37,19 @@ function errorClassOf(error: unknown): string {
 		return error.constructor.name;
 	}
 	return `non-Error ${typeof error}`;
+}
+
+/**
+ * What a failed Keychain call throws (F-PACK-13 review c1 MUST-4): the operation and the class of the original error ONLY.
+ * The original error is neither kept nor exposed (no message, no stack, no `cause`): a native safeStorage error message may
+ * quote what failed, and every caller (the secret-storage service's loggers, the IPC channel that carries message and stack
+ * to the renderer) passes this error on as it is.
+ */
+export class EncryptionKeychainError extends Error {
+	constructor(readonly operation: KeychainOperation, readonly errorClass: string) {
+		super(`[EncryptionMainService] keychain: ${operation} failed (${errorClass})`);
+		this.name = 'EncryptionKeychainError';
+	}
 }
 
 /**
@@ -66,7 +79,8 @@ export class EncryptionMainServiceWithElectron implements IEncryptionMainService
 
 	/**
 	 * Runs one Keychain-touching `safeStorage` call between two INFO lines naming the operation and the
-	 * Keychain item, so a Keychain prompt or wait is never a silent stall. Failures log the error class and rethrow.
+	 * Keychain item, so a Keychain prompt or wait is never a silent stall. A failure logs the error class and throws an
+	 * {@link EncryptionKeychainError} (operation and class only) in place of the original error.
 	 */
 	private keychainCall<T>(operation: KeychainOperation, call: () => T, describeOutcome: (outcome: T) => string): T {
 		const item = `'${this.app.getName()} Safe Storage'`;
@@ -78,7 +92,7 @@ export class EncryptionMainServiceWithElectron implements IEncryptionMainService
 			const errorClass = errorClassOf(e);
 			this.logService.info(`[EncryptionMainService] keychain: ${operation} ${item} failed (${errorClass})`);
 			this.logService.error(`[EncryptionMainService] ${operation} failed (${errorClass})`);
-			throw e;
+			throw new EncryptionKeychainError(operation, errorClass);
 		}
 		this.logService.info(`[EncryptionMainService] keychain: ${operation} ${item} ${describeOutcome(outcome)}`);
 		return outcome;
@@ -126,7 +140,8 @@ export class EncryptionMainServiceWithElectron implements IEncryptionMainService
 				this.logService.trace('[EncryptionMainService] Selected storage backend: ', result);
 				return Promise.resolve(result);
 			} catch (e) {
-				this.logService.error(e);
+				// LOG-1: the class only; the caught error's message or stack never reaches a log line (F-PACK-13 check 7).
+				this.logService.error(`[EncryptionMainService] getSelectedStorageBackend failed (${errorClassOf(e)})`);
 			}
 		}
 		return Promise.resolve(KnownStorageProvider.unknown);
