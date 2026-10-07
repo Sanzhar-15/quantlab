@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { Event } from '../../../../../base/common/event.js';
+import { Emitter, Event } from '../../../../../base/common/event.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
@@ -15,6 +15,13 @@ import { IExtensionService } from '../../../extensions/common/extensions.js';
 import { IAuthenticationAccessService } from '../../browser/authenticationAccessService.js';
 import { AuthenticationService } from '../../browser/authenticationService.js';
 import { authProviderIdForDiagnostics, DynamicAuthenticationProviderStorageService } from '../../browser/dynamicAuthenticationProviderStorageService.js';
+import { AuthenticationQueryService } from '../../browser/authenticationQueryService.js';
+import { AuthenticationUsageService, IAuthenticationUsageService } from '../../browser/authenticationUsageService.js';
+import { AuthenticationMcpUsageService, IAuthenticationMcpUsageService } from '../../browser/authenticationMcpUsageService.js';
+import { IAuthenticationMcpAccessService } from '../../browser/authenticationMcpAccessService.js';
+import { IAuthenticationMcpService } from '../../browser/authenticationMcpService.js';
+import { IAuthenticationExtensionsService, IAuthenticationService } from '../../common/authentication.js';
+import { IProductService } from '../../../../../platform/product/common/productService.js';
 
 // review QL-G-LOGIN-SECRETS c1 M3 (renderer side): a dynamic provider's id is its issuer string and resource. Markers in the
 // issuer's user info, path and query and in the resource's path and query reach no log argument and no rejected error of
@@ -26,7 +33,16 @@ const ISSUER_PATH = 'MARK-ISSUER-PATH-6f70';
 const ISSUER_QUERY = 'MARK-ISSUER-QUERY-8192';
 const RESOURCE_PATH = 'MARK-RESOURCE-PATH-a3b4';
 const RESOURCE_QUERY = 'MARK-RESOURCE-QUERY-c5d6';
-const MARKERS = [ISSUER_USERINFO, ISSUER_PATH, ISSUER_QUERY, RESOURCE_PATH, RESOURCE_QUERY];
+const THROWN = 'MARK-THROWN-ERROR-e7f8';
+const MARKERS = [ISSUER_USERINFO, ISSUER_PATH, ISSUER_QUERY, RESOURCE_PATH, RESOURCE_QUERY, THROWN];
+
+/** A failure whose name, message, stack and cause each hold a marker. */
+function thrownError(): Error {
+	const error = new Error(`refused ${THROWN}`, { cause: new Error(THROWN) });
+	error.name = `${THROWN}Error`;
+	error.stack = `${THROWN}\n    at ${THROWN}`;
+	return error;
+}
 const ISSUER = `https://user:${ISSUER_USERINFO}@issuer.example/tenant/${ISSUER_PATH}?key=${ISSUER_QUERY}`;
 const PROVIDER_ID = `${ISSUER} https://mcp.example.com/${RESOURCE_PATH}?k=${RESOURCE_QUERY}`;
 const SESSIONS_KEY = JSON.stringify({ isDynamicAuthProvider: true, authProviderId: PROVIDER_ID, clientId: 'client-1' });
@@ -168,5 +184,47 @@ suite('QL-G-LOGIN-SECRETS c1 M3: a dynamic provider\'s identity reaches no rende
 			assert.ok(error instanceof Error && error.message.includes(authProviderIdForDiagnostics(PROVIDER_ID)), `${error}`);
 		}
 		assertNoMarker('the authentication service log', logService.args);
+	});
+
+	// confirm-contested M3 class: a provider id or a caught value printed by the other authentication services.
+	/** An authentication service whose one provider is the dynamic provider and whose account read fails with a marked error. */
+	function failingAuthenticationService(onDidRegister: Emitter<{ id: string; label: string }>): IAuthenticationService {
+		return {
+			getProviderIds: () => [PROVIDER_ID],
+			getAccounts: async () => { throw thrownError(); },
+			onDidRegisterAuthenticationProvider: onDidRegister.event,
+		} as unknown as IAuthenticationService;
+	}
+
+	test('query service: a failed clear of a dynamic provider\'s data is logged without the provider id or the thrown error', async () => {
+		const logService = new RecordingLogService();
+		const onDidRegister = store.add(new Emitter<{ id: string; label: string }>());
+		const service = store.add(new AuthenticationQueryService(
+			failingAuthenticationService(onDidRegister),
+			{} as IAuthenticationUsageService,
+			{} as IAuthenticationMcpUsageService,
+			{ onDidChangeExtensionSessionAccess: Event.None } as unknown as IAuthenticationAccessService,
+			{ onDidChangeMcpSessionAccess: Event.None } as unknown as IAuthenticationMcpAccessService,
+			{ onDidChangeAccountPreference: Event.None } as unknown as IAuthenticationExtensionsService,
+			{ onDidChangeAccountPreference: Event.None } as unknown as IAuthenticationMcpService,
+			logService,
+		));
+		await service.clearAllData('CLEAR_ALL_AUTH_DATA');
+		assertNoMarker('the query service log', logService.args);
+		assert.ok(logService.args.some(args => args.length === 1 && args[0] === `Error clearing data for provider ${authProviderIdForDiagnostics(PROVIDER_ID)}: the accounts could not be read (details not logged)`), JSON.stringify(logService.args));
+	});
+
+	test('usage services: a failed account read while filling the usage cache is logged without the provider id or the thrown error', async () => {
+		const logService = new RecordingLogService();
+		const onDidRegister = store.add(new Emitter<{ id: string; label: string }>());
+		const authenticationService = failingAuthenticationService(onDidRegister);
+		const product = { trustedExtensionAuthAccess: undefined } as unknown as IProductService;
+		const usage = store.add(new AuthenticationUsageService(store.add(new TestStorageService()), authenticationService, logService, product));
+		const mcpUsage = store.add(new AuthenticationMcpUsageService(store.add(new TestStorageService()), authenticationService, logService, product));
+		await usage.initializeExtensionUsageCache();
+		await mcpUsage.initializeUsageCache();
+		assertNoMarker('the usage services log', logService.args);
+		const expected = `Could not read the accounts of provider ${authProviderIdForDiagnostics(PROVIDER_ID)} for the usage cache (details not logged)`;
+		assert.strictEqual(logService.args.filter(args => args.length === 1 && args[0] === expected).length, 2, JSON.stringify(logService.args));
 	});
 });

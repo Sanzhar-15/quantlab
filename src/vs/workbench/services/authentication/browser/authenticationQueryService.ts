@@ -7,6 +7,7 @@ import { Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { authProviderIdForDiagnostics } from './dynamicAuthenticationProviderStorageService.js';
 import { AuthenticationSessionAccount, IAuthenticationService, IAuthenticationExtensionsService, INTERNAL_AUTH_PROVIDER_PREFIX } from '../common/authentication.js';
 import {
 	IAuthenticationQueryService,
@@ -894,8 +895,10 @@ export class AuthenticationQueryService extends Disposable implements IAuthentic
 					this.authenticationMcpAccessService.removeAllowedMcpServers(providerId, account.label);
 					this.authenticationMcpUsageService.removeAccountUsage(providerId, account.label);
 				}
-			} catch (error) {
-				this.logService.error(`Error clearing data for provider ${providerId}:`, error);
+			} catch {
+				// Neither the id (a dynamic provider's id is its issuer string, which can hold a credential) nor the caught value
+				// (foreign text) is logged: the diagnostic identity and a fixed category.
+				this.logService.error(`Error clearing data for provider ${authProviderIdForDiagnostics(providerId)}: the accounts could not be read (details not logged)`);
 			}
 		}
 

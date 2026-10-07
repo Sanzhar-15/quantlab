@@ -178,9 +178,9 @@ export class AuthenticationService extends Disposable implements IAuthentication
 
 					if (!this.declaredProviders.some(p => p.id === provider.id)) {
 						this.registerDeclaredAuthenticationProvider(provider);
-						this._logService.debug(`Declared authentication provider: ${provider.id}`);
+						this._logService.debug(`Declared authentication provider: ${authProviderIdForDiagnostics(provider.id)}`);
 					} else {
-						point.collector.error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", provider.id));
+						point.collector.error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", authProviderIdForDiagnostics(provider.id)));
 					}
 				}
 			});
@@ -190,7 +190,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				const provider = this.declaredProviders.find(provider => provider.id === point.id);
 				if (provider) {
 					this.unregisterDeclaredAuthenticationProvider(provider.id);
-					this._logService.debug(`Undeclared authentication provider: ${provider.id}`);
+					this._logService.debug(`Undeclared authentication provider: ${authProviderIdForDiagnostics(provider.id)}`);
 				}
 			});
 		}));
@@ -204,7 +204,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 			throw new Error(localize('authentication.missingLabel', 'An authentication contribution must specify a label.'));
 		}
 		if (this.declaredProviders.some(p => p.id === provider.id)) {
-			throw new Error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", provider.id));
+			throw new Error(localize('authentication.idConflict', "This authentication id '{0}' has already been registered", authProviderIdForDiagnostics(provider.id)));
 		}
 		this._declaredProviders.push(provider);
 		this._onDidChangeDeclaredProviders.fire();
