@@ -9,7 +9,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { IEncryptionService, KnownStorageProvider } from '../../../encryption/common/encryptionService.js';
 import { transformErrorForSerialization } from '../../../../base/common/errors.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { BaseSecretStorageService, SecretDecryptionCause, SecretDecryptionError, SecretStorageUnavailableError } from '../../common/secrets.js';
+import { BaseSecretStorageService, REDACTED_SECRET_KEY, SecretDecryptionCause, SecretDecryptionError, SecretStorageUnavailableError } from '../../common/secrets.js';
 import { InMemoryStorageService, StorageScope, StorageTarget } from '../../../storage/common/storage.js';
 
 class TestEncryptionService implements IEncryptionService {
@@ -406,6 +406,83 @@ suite('secrets', () => {
 			const error = new SecretDecryptionError('my-secret');
 			assert.strictEqual(error.cause, undefined);
 			assert.strictEqual(error.name, 'SecretDecryptionError');
+		});
+	});
+
+	// QL-G-LOGIN-SECRETS review c1 M3 (W-ORCH item): a key built from a server-provided string (a dynamic authentication
+	// provider's issuer URL) can hold a credential in its user info, path or query. No log line at any level and no error
+	// property carries such a key; storage keeps the key itself.
+	suite('a credential-bearing key reaches no log argument or error property', () => {
+		const USERINFO = 'MARK-KEY-USERINFO-71d3';
+		const PATH = 'MARK-KEY-PATH-28fa';
+		const QUERY = 'MARK-KEY-QUERY-c94e';
+		const MARKERS = [USERINFO, PATH, QUERY];
+		const KEY = JSON.stringify({ isDynamicAuthProvider: true, authProviderId: `https://user:${USERINFO}@issuer.example/${PATH}?key=${QUERY}`, clientId: 'client-1' });
+
+		class RecordingLogService extends NullLogService {
+			readonly args: unknown[][] = [];
+			override trace(...args: unknown[]): void { this.args.push(args); }
+			override debug(...args: unknown[]): void { this.args.push(args); }
+			override info(...args: unknown[]): void { this.args.push(args); }
+			override warn(...args: unknown[]): void { this.args.push(args); }
+			override error(...args: unknown[]): void { this.args.push(args); }
+		}
+
+		/** Every string reachable from a value: an Error contributes its name, message, stack, own properties and causes. */
+		function collectStrings(value: unknown, out: string[] = [], seen = new Set<unknown>()): string[] {
+			if (typeof value === 'string') {
+				out.push(value);
+			} else if (typeof value !== 'object' && typeof value !== 'function' || value === null) {
+				out.push(String(value));
+			} else if (!seen.has(value)) {
+				seen.add(value);
+				if (value instanceof Error) {
+					out.push(value.name, value.message, value.stack ?? '', JSON.stringify(transformErrorForSerialization(value)));
+					collectStrings(value.cause, out, seen);
+				}
+				for (const key of Object.getOwnPropertyNames(value)) {
+					collectStrings((value as Record<string, unknown>)[key], out, seen);
+				}
+			}
+			return out;
+		}
+
+		function assertNoMarker(what: string, value: unknown): void {
+			for (const text of collectStrings(value)) {
+				for (const marker of MARKERS) {
+					assert.ok(!text.includes(marker), `${what}: a marker (${marker}) reached it: ${text}`);
+				}
+			}
+		}
+
+		test('set, get, a failed decryption, delete and the change notification, at trace level', async () => {
+			const logService = store.add(new RecordingLogService());
+			const encryptionService = new TestEncryptionService();
+			const storageService = store.add(new InMemoryStorageService());
+			const service = store.add(new BaseSecretStorageService(false, storageService, encryptionService, logService));
+			const changed: string[] = [];
+			store.add(service.onDidChangeSecret(key => changed.push(key)));
+
+			await service.set(KEY, 'value');
+			assert.strictEqual(await service.get(KEY), 'value');
+			const decrypt = sinon.stub(encryptionService, 'decrypt').callsFake(() => Promise.reject(new Error('keychain refused')));
+			let failure: unknown;
+			try {
+				await service.get(KEY);
+			} catch (e) {
+				failure = e;
+			}
+			decrypt.restore();
+			await service.delete(KEY);
+
+			assertNoMarker('the log arguments', logService.args);
+			assert.ok(failure instanceof SecretDecryptionError, `expected SecretDecryptionError, got ${failure}`);
+			assertNoMarker('the rejected error', failure);
+			assert.strictEqual(failure.key, REDACTED_SECRET_KEY);
+			assert.ok(logService.args.some(args => args[0] === '[secrets] getting secret for key:' && args[1] === `secret://${REDACTED_SECRET_KEY}`), JSON.stringify(logService.args));
+			// Storage and the change event keep the key itself: only its diagnostic form is redacted.
+			assert.deepStrictEqual(changed, [KEY, KEY], 'the change event names the key itself');
+			assert.deepStrictEqual(await service.keys(), []);
 		});
 	});
 });

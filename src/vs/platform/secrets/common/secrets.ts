@@ -15,6 +15,20 @@ import { localize } from '../../../nls.js';
 
 export const ISecretStorageService = createDecorator<ISecretStorageService>('secretStorageService');
 
+/** The text that stands for a secret's key in a log line or an error when the key is not a plain name. */
+export const REDACTED_SECRET_KEY = '<redacted secret key>';
+
+/**
+ * A secret's key for a log line or an error property; never for storage, which keeps the key itself. A key made only of
+ * letters, digits, '.', '_' and '-' (at most 128) is a name chosen by code and is shown as it is. Any other key (an
+ * extension's JSON key, or a key built from a server-provided string such as an issuer URL) is shown as
+ * {@link REDACTED_SECRET_KEY}, never in part: such a key can hold a credential in its user info, path or query, and this
+ * layer cannot tell which part is safe.
+ */
+export function secretKeyForDiagnostics(key: string): string {
+	return /^[\w.-]{1,128}$/.test(key) ? key : REDACTED_SECRET_KEY;
+}
+
 /** The only cause a SecretDecryptionError carries: it names the class of the failure and nothing of its content. */
 export class SecretDecryptionCause extends Error {
 	override readonly name = 'SecretDecryptionCause';
@@ -36,12 +50,17 @@ export class SecretDecryptionCause extends Error {
  */
 export class SecretDecryptionError extends Error {
 	override readonly name = 'SecretDecryptionError';
+	/** The secret's key as {@link secretKeyForDiagnostics} shows it: the key itself only when it is a plain name. */
+	readonly key: string;
 	/**
+	 * @param key the secret's key; only its diagnostic form is kept (in {@link key} and the message).
 	 * @param failure what the encryption layer threw. Only the name of its class is kept, and only when it is a plain
 	 * identifier; nothing else of it, so neither its message nor its stack nor its own cause.
 	 */
-	constructor(readonly key: string, failure?: unknown) {
-		super(`The stored secret '${key}' could not be decrypted; it is kept.`, failure === undefined ? undefined : { cause: new SecretDecryptionCause(failure) });
+	constructor(key: string, failure?: unknown) {
+		const shownKey = secretKeyForDiagnostics(key);
+		super(`The stored secret '${shownKey}' could not be decrypted; it is kept.`, failure === undefined ? undefined : { cause: new SecretDecryptionCause(failure) });
+		this.key = shownKey;
 	}
 }
 
@@ -122,21 +141,22 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 			const storageService = await this.resolvedStorageService;
 
 			const fullKey = this.getKey(key);
-			this._logService.trace('[secrets] getting secret for key:', fullKey);
+			const shownKey = this.getKey(secretKeyForDiagnostics(key));
+			this._logService.trace('[secrets] getting secret for key:', shownKey);
 			const encrypted = storageService.get(fullKey, StorageScope.APPLICATION);
 			// Only undefined is absence: a stored empty string is a present value that must go through decryption.
 			if (encrypted === undefined) {
-				this._logService.trace('[secrets] no secret found for key:', fullKey);
+				this._logService.trace('[secrets] no secret found for key:', shownKey);
 				return undefined;
 			}
 
 			try {
-				this._logService.trace('[secrets] decrypting gotten secret for key:', fullKey);
+				this._logService.trace('[secrets] decrypting gotten secret for key:', shownKey);
 				// If the storage service is in-memory, we don't need to decrypt
 				const result = this._type === 'in-memory'
 					? encrypted
 					: await this._encryptionService.decrypt(encrypted);
-				this._logService.trace('[secrets] decrypted secret for key:', fullKey);
+				this._logService.trace('[secrets] decrypted secret for key:', shownKey);
 				return result;
 			} catch (e) {
 				const error = new SecretDecryptionError(key, e);
@@ -150,7 +170,8 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 		return this._sequencer.queue(key, async () => {
 			const storageService = await this.resolvedStorageService;
 
-			this._logService.trace('[secrets] encrypting secret for key:', key);
+			const shownKey = secretKeyForDiagnostics(key);
+			this._logService.trace('[secrets] encrypting secret for key:', shownKey);
 			let encrypted;
 			try {
 				// If the storage service is in-memory, we don't need to encrypt
@@ -162,9 +183,9 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 				throw e;
 			}
 			const fullKey = this.getKey(key);
-			this._logService.trace('[secrets] storing encrypted secret for key:', fullKey);
+			this._logService.trace('[secrets] storing encrypted secret for key:', this.getKey(shownKey));
 			storageService.store(fullKey, encrypted, StorageScope.APPLICATION, StorageTarget.MACHINE);
-			this._logService.trace('[secrets] stored encrypted secret for key:', fullKey);
+			this._logService.trace('[secrets] stored encrypted secret for key:', this.getKey(shownKey));
 		});
 	}
 
@@ -175,7 +196,8 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 	protected async writeUnqueued(key: string, value: string): Promise<void> {
 		const storageService = await this.resolvedStorageService;
 
-		this._logService.trace('[secrets] encrypting secret for key:', key);
+		const shownKey = secretKeyForDiagnostics(key);
+		this._logService.trace('[secrets] encrypting secret for key:', shownKey);
 		let encrypted;
 		try {
 			// If the storage service is in-memory, we don't need to encrypt
@@ -183,13 +205,13 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 				? value
 				: await this._encryptionService.encrypt(value);
 		} catch (e) {
-			this._logService.error(`[secrets] encrypting the secret for key '${key}' failed: ${e instanceof Error ? e.name : typeof e}`);
+			this._logService.error(`[secrets] encrypting the secret for key '${shownKey}' failed: ${e instanceof Error ? e.name : typeof e}`);
 			throw e;
 		}
 		const fullKey = this.getKey(key);
-		this._logService.trace('[secrets] storing encrypted secret for key:', fullKey);
+		this._logService.trace('[secrets] storing encrypted secret for key:', this.getKey(shownKey));
 		storageService.store(fullKey, encrypted, StorageScope.APPLICATION, StorageTarget.MACHINE);
-		this._logService.trace('[secrets] stored encrypted secret for key:', fullKey);
+		this._logService.trace('[secrets] stored encrypted secret for key:', this.getKey(shownKey));
 	}
 
 	delete(key: string): Promise<void> {
@@ -197,9 +219,10 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 			const storageService = await this.resolvedStorageService;
 
 			const fullKey = this.getKey(key);
-			this._logService.trace('[secrets] deleting secret for key:', fullKey);
+			const shownKey = this.getKey(secretKeyForDiagnostics(key));
+			this._logService.trace('[secrets] deleting secret for key:', shownKey);
 			storageService.remove(fullKey, StorageScope.APPLICATION);
-			this._logService.trace('[secrets] deleted secret for key:', fullKey);
+			this._logService.trace('[secrets] deleted secret for key:', shownKey);
 		});
 	}
 
@@ -267,7 +290,7 @@ export class BaseSecretStorageService extends Disposable implements ISecretStora
 
 		const secretKey = key.slice(this._storagePrefix.length);
 
-		this._logService.trace(`[SecretStorageService] Notifying change in value for secret: ${secretKey}`);
+		this._logService.trace(`[SecretStorageService] Notifying change in value for secret: ${secretKeyForDiagnostics(secretKey)}`);
 		this.onDidChangeSecretEmitter.fire(secretKey);
 	}
 
