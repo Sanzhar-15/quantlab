@@ -10,6 +10,9 @@ import { evaluateInFrames } from './cdp.mjs';
 
 const isWebview = url => url.startsWith('vscode-webview://');
 const isWorkbench = url => url.startsWith('vscode-file://');
+// The targets the driver attaches to: the workbench window and the webviews. Any other target (a page with an
+// empty URL, the host shell's page) holds neither and is not asked anything.
+export const isAppSurface = url => isWorkbench(url) || isWebview(url);
 
 /** Polls `probe` until it returns a value other than undefined; throws `what` with the last observation. */
 async function until(what, timeoutMs, probe) {
@@ -28,12 +31,12 @@ async function until(what, timeoutMs, probe) {
 
 /** The values of `fn` in the frames where it reports `state` other than 'absent'; exactly one is required. */
 async function inOneFrame(cdp, matches, fn, arg, what) {
-	const { values, errors } = await evaluateInFrames(cdp, matches, fn, arg);
+	const { values, errors, skipped } = await evaluateInFrames(cdp, isAppSurface, matches, fn, arg);
 	const present = values.filter(v => v.value.state !== 'absent');
 	if (present.length > 1) {
 		throw new Error(`[${what}_ambiguous] ${present.length} frames answer: ${present.map(v => v.url).join(', ')}`);
 	}
-	return { hit: present[0]?.value, observed: present.length === 0 ? `no frame (${values.length} evaluated; errors: ${errors.join(' | ') || 'none'})` : JSON.stringify(present[0].value) };
+	return { hit: present[0]?.value, observed: present.length === 0 ? `no frame (${values.length} evaluated; errors: ${errors.join(' | ') || 'none'}; targets not attached: ${skipped.join(', ') || 'none'})` : JSON.stringify(present[0].value) };
 }
 
 // --- functions evaluated inside the Action view webview (serialised; no closures) ---

@@ -13,7 +13,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
-import { connect } from './cdp.mjs';
+import { connect, evaluateInFrames } from './cdp.mjs';
+import { isAppSurface } from './window.mjs';
 import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
@@ -120,13 +121,23 @@ async function webSocketServer(onData) {
 		sockets.push(socket);
 		const accept = crypto.createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
 		socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-		socket.on('data', () => onData(socket));
+		let pending = Buffer.alloc(0);
+		socket.on('data', chunk => {
+			if (result.handle) {
+				const { messages, rest } = clientMessages(Buffer.concat([pending, chunk]));
+				pending = rest;
+				messages.forEach(message => result.handle(socket, message));
+			} else {
+				onData(socket);
+			}
+		});
 	});
 	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-	return {
+	const result = {
 		endpoint: `ws://127.0.0.1:${server.address().port}/devtools/browser/test`,
 		close: () => { sockets.forEach(socket => socket.destroy()); server.close(); },
 	};
+	return result;
 }
 
 /** One unmasked text frame (payload under 126 bytes). */
@@ -168,6 +179,94 @@ test('cdp connect: an endpoint that accepts and never completes the handshake re
 	} finally {
 		sockets.forEach(socket => socket.destroy());
 		server.close();
+	}
+});
+
+/** The client's complete masked text frames at the start of `pending` (payloads under 64 KiB), decoded, and the bytes left over. */
+function clientMessages(pending) {
+	const messages = [];
+	let at = 0;
+	while (pending.length - at >= 2) {
+		let length = pending[at + 1] & 0x7f;
+		let head = at + 2;
+		if (length === 126) {
+			if (pending.length - head < 2) {
+				break;
+			}
+			length = pending.readUInt16BE(head);
+			head += 2;
+		}
+		assert.ok(length < 65536 && (pending[at + 1] & 0x80) !== 0);
+		if (pending.length < head + 4 + length) {
+			break;
+		}
+		const mask = pending.subarray(head, head + 4);
+		const payload = Buffer.from(pending.subarray(head + 4, head + 4 + length).map((byte, i) => byte ^ mask[i % 4]));
+		if ((pending[at] & 0x0f) === 0x1) {
+			messages.push(JSON.parse(payload.toString('utf8')));
+		}
+		at = head + 4 + length;
+	}
+	return { messages, rest: pending.subarray(at) };
+}
+
+/** One unmasked text frame of any length under 64 KiB. */
+function serverFrame(text) {
+	const payload = Buffer.from(text);
+	return Buffer.concat([payload.length < 126 ? Buffer.from([0x81, payload.length]) : Buffer.from([0x81, 126, payload.length >> 8, payload.length & 0xff]), payload]);
+}
+
+/** A browser endpoint with a workbench page and a page whose URL is empty and whose frame tree is never answered (the guest's). */
+async function guestLikeBrowser() {
+	const asked = [];
+	const server = await webSocketServer(() => { });
+	server.handle = (socket, message) => {
+		asked.push(`${message.method}${message.sessionId ? ` ${message.sessionId}` : ''}`);
+		const answer = result => socket.write(serverFrame(JSON.stringify({ id: message.id, result })));
+		switch (message.method) {
+			case 'Target.getTargets': return answer({ targetInfos: [
+				{ targetId: 'BLANK', type: 'page', url: '' },
+				{ targetId: 'WB', type: 'page', url: 'vscode-file://vscode-app/x/workbench.html' },
+				{ targetId: 'SW', type: 'service_worker', url: 'vscode-webview://sw.js' },
+			] });
+			case 'Target.attachToTarget': return answer({ sessionId: `S-${message.params.targetId}` });
+			case 'Page.getFrameTree': return message.sessionId === 'S-BLANK' ? undefined : answer({ frameTree: { frame: { id: 'F1', url: 'vscode-file://vscode-app/x/workbench.html' } } });
+			case 'Page.createIsolatedWorld': return answer({ executionContextId: 7 });
+			case 'Runtime.evaluate': return answer({ result: { value: { state: 'present' } } });
+			case 'Target.detachFromTarget': return answer({});
+		}
+	};
+	return { server, asked };
+}
+
+test('evaluateInFrames attaches only to app-surface targets: the guest\'s silent blank page is listed as not attached, the workbench answers', async () => {
+	const { server, asked } = await guestLikeBrowser();
+	try {
+		const cdp = await connect(server.endpoint, 500);
+		const result = await evaluateInFrames(cdp, isAppSurface, url => url.startsWith('vscode-file://'), () => ({ state: 'present' }), null);
+		assert.deepStrictEqual(result, {
+			values: [{ url: 'vscode-file://vscode-app/x/workbench.html', value: { state: 'present' } }],
+			errors: [],
+			skipped: ['page ""'],
+		});
+		assert.ok(!asked.some(line => line.includes('BLANK')), `the blank page was asked: ${asked.join(', ')}`);
+		await assert.rejects(evaluateInFrames(cdp, undefined, url => url.startsWith('vscode-file://'), () => ({}), null), /cdp_target_filter_missing/);
+		cdp.close();
+		// Control: every target accepted, as before this change -> the blank page's frame tree is the named failure.
+		const all = await connect(server.endpoint, 500);
+		await assert.rejects(evaluateInFrames(all, () => true, url => url.startsWith('vscode-file://'), () => ({}), null),
+			/^Error: \[cdp_no_answer\] Page\.getFrameTree \(session S-BLANK\): no answer after 0\.5 s \(target page \)$/);
+		all.close();
+	} finally {
+		server.close();
+	}
+});
+
+test('isAppSurface: workbench and webview URLs only', () => {
+	assert.strictEqual(isAppSurface('vscode-file://vscode-app/a/workbench.html'), true);
+	assert.strictEqual(isAppSurface('vscode-webview://abc/index.html'), true);
+	for (const url of ['', 'about:blank', 'http://127.0.0.1:47311/', 'devtools://devtools/x']) {
+		assert.strictEqual(isAppSurface(url), false, url);
 	}
 });
 
