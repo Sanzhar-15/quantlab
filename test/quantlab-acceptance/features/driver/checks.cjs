@@ -281,10 +281,17 @@ async function packTrigger() {
 	void vscode.window.showInformationMessage('[ql-features control] Install Pylance from the Python extension pack?', 'Install');
 	await new Promise(resolve => setTimeout(resolve, 2000));
 	const toasts = await ask(requireEnv('QL_FEATURES_CUES'), 'toasts', {}, 60 * 1000);
+	const network = requireEnv('QL_FEATURES_NETWORK');
 	let install;
 	try {
-		await vscode.commands.executeCommand('workbench.extensions.installExtension', 'ms-python.debugpy');
-		install = 'ms-python.debugpy installed';
+		const installing = vscode.commands.executeCommand('workbench.extensions.installExtension', 'ms-python.debugpy');
+		// With the gallery reachable the first install from a publisher asks for trust (a modal); a user presses it.
+		// With the network off the gallery query fails first and no prompt is shown.
+		const trust = network === 'on'
+			? await ask(requireEnv('QL_FEATURES_CUES'), 'trust-modal', { message: 'Do you trust the publisher', button: 'Trust Publisher & Install' }, 120 * 1000)
+			: undefined;
+		await installing;
+		install = `ms-python.debugpy installed${trust === undefined ? '' : ` (trust prompt "${trust.text}" answered)`}`;
 	} catch (err) {
 		install = `ms-python.debugpy not installed: ${err instanceof Error ? err.message : String(err)}`;
 	}
@@ -308,14 +315,16 @@ exports.run = async function () {
 		result.checks = {
 			'python-intelligence': await guarded(pythonIntelligence),
 			'notebook-cell': await guarded(notebookCell),
-			// These two drive the window through the launcher (cues.cjs); import runs last because it changes the settings.
+			// Driven through the launcher's window driver (cues.cjs).
 			'backtest-bundled-engine': await guarded(backtestBundledEngine),
-			'import': await guarded(importFromVsCode),
 		};
+	} else if (mode === 'import') {
+		// Its own launch: the confirmation is a modal (lib.mjs DIALOG_MODES).
+		result.checks = { 'import': await guarded(importFromVsCode) };
 	} else if (mode === 'pack-trigger') {
 		result.packTrigger = await packTrigger();
 	} else if (mode !== 'pins') {
-		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all, pins or pack-trigger)`);
+		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all, pins, import or pack-trigger)`);
 	}
 	fs.writeFileSync(resultPath, JSON.stringify(result, undefined, '\t') + '\n');
 };

@@ -42,6 +42,24 @@ export const PINNED_IDS = ['ms-python.python', 'detachhead.basedpyright', 'ms-to
 export const STATUSES = ['PASS', 'FAIL', 'NOT RUN'];
 
 /**
+ * The driver's modes whose steps need a MODAL dialog (the import confirmation, the publisher-trust prompt of an
+ * install). The workbench refuses every dialog in a launch with --extensionTestsPath (dialogService.ts skipDialogs:
+ * "refused to show dialog in tests"), so these modes run the driver as an extension under development, started by its
+ * own activation; the other modes run it as the extension tests.
+ */
+export const DIALOG_MODES = ['import', 'pack-trigger'];
+
+/** The driver's launch arguments for `mode`: --extensionTestsPath only for the modes that need no dialog. */
+export function driverArgs(mode, driverDir) {
+	const modes = ['all', 'pins', ...DIALOG_MODES];
+	if (!modes.includes(mode)) {
+		throw new Error(`[driver_mode_invalid] ${JSON.stringify(mode)} is not one of ${modes.join(', ')}`);
+	}
+	const args = [`--extensionDevelopmentPath=${driverDir}`];
+	return DIALOG_MODES.includes(mode) ? args : [...args, `--extensionTestsPath=${path.join(driverDir, 'checks.cjs')}`];
+}
+
+/**
  * The launcher disables Electron's asar fs patch for itself only (launcher.mjs, process.noAsar). ELECTRON_NO_ASAR in
  * its environment would reach every app launch through the spread of process.env and run the packaged app without
  * asar, so the launcher refuses to run with it set; it never deletes it quietly.

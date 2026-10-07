@@ -16,8 +16,8 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { connect, waitForEndpoint } from './cdp.mjs';
 import * as net from 'node:net';
-import { assemble, assertNoAsarEnvAbsent, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
-import { backtestForm, importModal, readToasts, waitForWorkbench } from './window.mjs';
+import { assemble, assertNoAsarEnvAbsent, checkIdsFor, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
+import { backtestForm, pressModal, readToasts, waitForWorkbench } from './window.mjs';
 
 // This process only: Electron's asar-patched fs refuses to read a FILE named *.asar as bytes (ENOENT ", not found in
 // .../node_modules.asar"), and the app-tree digest (treeDigest, lib.mjs) hashes every file of the bundle. The digest
@@ -53,9 +53,10 @@ function appPaths(bundle) {
 
 /**
  * One launch on a fresh profile under `dir`, with the window driver answering the driver's cues over
- * CDP while the app runs. Resolves to the driver's result object.
+ * CDP while the app runs. Resolves to the driver's result object. A DIALOG_MODES launch has no extension
+ * tests to end it: once the driver has written its result the window driver closes the browser.
  */
-async function launch(bundle, dir, mode, python) {
+async function launch(bundle, dir, mode, python, network) {
 	const userData = path.join(dir, 'user-data');
 	const workspace = path.join(dir, 'workspace');
 	fs.mkdirSync(path.join(userData, 'User'), { recursive: true });
@@ -75,15 +76,14 @@ async function launch(bundle, dir, mode, python) {
 	fs.mkdirSync(cues);
 	const logPath = path.join(dir, 'app-output.log');
 	const log = fs.openSync(logPath, 'w');
-	const env = { ...process.env, HOME: path.join(dir, 'home'), QL_FEATURES_RESULT: resultPath, QL_FEATURES_MODE: mode, QL_FEATURES_PYTHON: python, QL_FEATURES_CUES: cues, QL_FEATURES_USER_DATA: userData };
+	const env = { ...process.env, HOME: path.join(dir, 'home'), QL_FEATURES_RESULT: resultPath, QL_FEATURES_MODE: mode, QL_FEATURES_PYTHON: python, QL_FEATURES_CUES: cues, QL_FEATURES_USER_DATA: userData, QL_FEATURES_NETWORK: network };
 	delete env.ELECTRON_RUN_AS_NODE;
 	const child = cp.spawn(appPaths(bundle).exe, [
 		workspace,
 		MOCK_KEYCHAIN,
 		`--user-data-dir=${userData}`,
 		`--extensions-dir=${path.join(dir, 'extensions')}`,
-		`--extensionDevelopmentPath=${path.join(here, 'driver')}`,
-		`--extensionTestsPath=${path.join(here, 'driver', 'checks.cjs')}`,
+		...driverArgs(mode, path.join(here, 'driver')),
 		'--disable-workspace-trust',
 		'--skip-welcome',
 		'--skip-release-notes',
@@ -103,11 +103,28 @@ async function launch(bundle, dir, mode, python) {
 	const window = async () => cdp ??= await connect(await waitForEndpoint(logPath, 60_000), CDP_ANSWER_MS);
 	const served = serve(cues, {
 		'backtest-form': async args => backtestForm(await window(), args),
-		'import-modal': async args => importModal(await window(), args),
+		'import-modal': async args => pressModal(await window(), args),
+		'trust-modal': async args => pressModal(await window(), args),
 		'toasts': async () => ({ texts: await readToasts(await window()) }),
 	}, () => exited).then(names => ({ names }), err => ({ error: err instanceof Error ? err.message : String(err) }));
+	let closeError;
+	const closed = !DIALOG_MODES.includes(mode) ? Promise.resolve() : (async () => {
+		while (!exited && !fs.existsSync(resultPath)) {
+			await sleep(1000);
+		}
+		if (exited) {
+			return;
+		}
+		await (await window()).send('Browser.close').catch(err => { closeError = err.message; });
+		const how = await Promise.race([exit.then(() => 'exited'), sleep(30_000).then(() => 'timeout')]);
+		if (how === 'timeout') {
+			closeError = `the app did not exit 30 s after Browser.close${closeError === undefined ? '' : ` (${closeError})`}`;
+			child.kill('SIGKILL');
+		}
+	})().catch(err => { closeError = err instanceof Error ? err.message : String(err); child.kill('SIGKILL'); });
 	const result = await exit;
 	clearTimeout(timer);
+	await closed;
 	const cueService = await served;
 	cdp?.close();
 	fs.closeSync(log);
@@ -120,10 +137,17 @@ async function launch(bundle, dir, mode, python) {
 	if (cueService.error) {
 		return { launchError: `[window_driver_failed] ${mode}: ${cueService.error}` };
 	}
+	if (closeError !== undefined) {
+		return { launchError: `[app_no_exit] ${mode}: ${closeError} (see ${logPath})` };
+	}
 	if (!fs.existsSync(resultPath)) {
 		return { launchError: `[driver_no_result] ${mode}: the app exited with ${result.code ?? result.signal} and the driver wrote no result (see ${logPath})` };
 	}
-	return { ...JSON.parse(fs.readFileSync(resultPath, 'utf8')), exit: result.code ?? result.signal, cuesAnswered: cueService.names };
+	const written = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+	if (written.driverError !== undefined) {
+		return { launchError: `[driver_failed] ${mode}: ${written.driverError}` };
+	}
+	return { ...written, exit: result.code ?? result.signal, cuesAnswered: cueService.names };
 }
 
 /** Every *.log file under `dir`; a logs directory the app has not created yet holds none. */
@@ -320,24 +344,27 @@ try {
 	const checks = {};
 	if (network === 'off') {
 		// 1. The app itself: every check.
-		const main = await launch(app, path.join(evidence, 'main'), 'all', python);
+		const main = await launch(app, path.join(evidence, 'main'), 'all', python, network);
+		// The import needs its modal: its own launch, without the extension tests (DIALOG_MODES).
+		const imported = await launch(app, path.join(evidence, 'import'), 'import', python, network);
 		// 2. The negative control: a copy of the app without one pinned extension; only the pin report is read.
 		const copy = path.join(evidence, 'control', path.basename(app));
 		fs.mkdirSync(path.join(evidence, 'control'));
 		cp.execFileSync('/bin/cp', ['-R', app, copy]);
 		fs.rmSync(findBuiltInExtensionDir(appPaths(copy).extensions, REMOVED_IN_CONTROL), { recursive: true });
 		launched.push(path.resolve(copy));
-		const control = await launch(copy, path.join(evidence, 'control', 'run'), 'pins', python);
+		const control = await launch(copy, path.join(evidence, 'control', 'run'), 'pins', python, network);
 
 		out.preconditions.push(main.launchError
 			? { id: 'network-off', status: 'FAIL', detail: main.launchError }
 			: main.network);
 		Object.assign(checks, main.launchError ? {} : main.checks);
 		if (main.launchError) {
-			for (const id of ['backtest-bundled-engine', 'python-intelligence', 'notebook-cell', 'import']) {
+			for (const id of ['backtest-bundled-engine', 'python-intelligence', 'notebook-cell']) {
 				checks[id] = { status: 'FAIL', detail: main.launchError };
 			}
 		}
+		checks.import = imported.launchError ? { status: 'FAIL', detail: imported.launchError } : imported.checks.import;
 		checks['pinned-dependency-removed'] = control.launchError
 			? { status: 'FAIL', detail: control.launchError }
 			: judgePinnedDependency(main.pins, control.pins, REMOVED_IN_CONTROL);
@@ -354,7 +381,7 @@ try {
 	out.inputs.galleryHosts = hosts;
 	const quiet = await plainLaunch(app, path.join(evidence, 'pack'));
 	const triggerDir = path.join(evidence, 'pack-control');
-	const trigger = await launch(app, triggerDir, 'pack-trigger', python);
+	const trigger = await launch(app, triggerDir, 'pack-trigger', python, network);
 	if (quiet.launchError) {
 		checks['extension-pack-quiet'] = { status: 'FAIL', detail: quiet.launchError };
 	} else if (trigger.launchError) {

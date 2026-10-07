@@ -125,10 +125,10 @@ export async function backtestForm(cdp, args) {
 	return { missingFields: filled.hit.missing, submitted: submitted.label, ...status };
 }
 
-/** Presses `button` on the modal whose message contains `message`. */
-export async function importModal(cdp, args) {
-	return await until(`[import_modal_missing] no dialog "${args.message}" with a button "${args.button}"`, 60_000, async () => {
-		const { hit, observed } = await inOneFrame(cdp, isWorkbench, pressDialogButton, args, 'import_modal');
+/** Presses `button` on the modal whose message contains `message` (the import confirmation, the publisher-trust prompt). */
+export async function pressModal(cdp, args) {
+	return await until(`[modal_missing] no dialog "${args.message}" with a button "${args.button}"`, 60_000, async () => {
+		const { hit, observed } = await inOneFrame(cdp, isWorkbench, pressDialogButton, args, 'modal');
 		return { value: hit?.state === 'clicked' ? hit : undefined, observed };
 	});
 }

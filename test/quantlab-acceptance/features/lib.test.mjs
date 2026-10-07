@@ -15,7 +15,7 @@ import { test } from 'node:test';
 import { createRequire } from 'node:module';
 import { connect, evaluateInFrames } from './cdp.mjs';
 import { isAppSurface } from './window.mjs';
-import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
+import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
 
@@ -260,6 +260,36 @@ test('evaluateInFrames attaches only to app-surface targets: the guest\'s silent
 	} finally {
 		server.close();
 	}
+});
+
+test('driverArgs: the dialog modes run the driver without --extensionTestsPath (dialogs are refused there); the others with it', () => {
+	assert.deepStrictEqual(DIALOG_MODES, ['import', 'pack-trigger']);
+	for (const mode of DIALOG_MODES) {
+		assert.deepStrictEqual(driverArgs(mode, '/d'), ['--extensionDevelopmentPath=/d'], mode);
+	}
+	for (const mode of ['all', 'pins']) {
+		assert.deepStrictEqual(driverArgs(mode, '/d'), ['--extensionDevelopmentPath=/d', '--extensionTestsPath=/d/checks.cjs'], mode);
+	}
+	assert.throws(() => driverArgs('pack', '/d'), /driver_mode_invalid/);
+	assert.throws(() => driverArgs(undefined, '/d'), /driver_mode_invalid/);
+});
+
+test('the driver starts itself in the dialog modes: a loadable manifest, onStartupFinished, the same mode list, errors written as the result', () => {
+	const driver = new URL('./driver/', import.meta.url);
+	const manifest = JSON.parse(fs.readFileSync(new URL('package.json', driver), 'utf8'));
+	assert.match(manifest.engines.vscode, /^\^1\.\d+\.\d+$/, 'engines.vscode must name a major and minor (the app rejects * for an extension under development)');
+	assert.deepStrictEqual(manifest.activationEvents, ['onStartupFinished']);
+	const extension = fs.readFileSync(new URL('extension.cjs', driver), 'utf8');
+	assert.ok(extension.includes(`const DIALOG_MODES = ${DIALOG_MODES.map(mode => `'${mode}'`).join(', ').replace(/^/, '[').replace(/$/, ']')};`), 'extension.cjs DIALOG_MODES differs from lib.mjs');
+	assert.ok(extension.includes('driverError'), 'extension.cjs does not record a driver error');
+	const checks = fs.readFileSync(new URL('checks.cjs', driver), 'utf8');
+	const all = checks.slice(checks.indexOf(`if (mode === 'all')`), checks.indexOf(`} else if (mode === 'import')`));
+	assert.ok(all.length > 0 && !all.includes('importFromVsCode'), 'the import (a modal) is still in the extension-tests mode');
+	const launcher = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
+	assert.ok(!launcher.includes('--extensionTestsPath'), 'launcher.mjs passes --extensionTestsPath itself instead of driverArgs');
+	assert.strictEqual(launcher.match(/await launch\(/g).length, 4);
+	assert.strictEqual(launcher.match(/await launch\([^\n]*, python, network\);/g).length, 4);
+	assert.ok(launcher.includes(`'import', python, network)`), 'no import launch');
 });
 
 test('isAppSurface: workbench and webview URLs only', () => {
