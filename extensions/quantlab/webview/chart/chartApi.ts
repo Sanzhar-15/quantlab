@@ -558,8 +558,11 @@ export class ChartClient {
 	}
 
 	private async createChart(): Promise<void> {
+		// Every theme token is read and validated BEFORE the engine exists, inside the cached initialization promise: a
+		// missing token rejects initialize() and every later call that awaits the chart (ensureChart), and no chart is
+		// ever drawn with the engine's default theme. (createChart reads no `theme` option: chart.setTheme applies it.)
 		this.colors = this.resolveColors();
-		// The theme is applied by initialize() through chart.setTheme (createChart reads no `theme` option).
+		const themeTokens = this.buildThemeTokens();
 		this.chart = createChart(this.container, {
 			autoSize: true,
 			timeFormatter: (time: number) => this.formatTime(time),
@@ -574,6 +577,7 @@ export class ChartClient {
 				},
 			},
 		});
+		this.chart.setTheme(themeTokens);
 		this.installPaneDividerPlugin();
 		this.installDrawnSignalPlugin();
 		this.candleSeries = this.chart.addCandlestickSeries({

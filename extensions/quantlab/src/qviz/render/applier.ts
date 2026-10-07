@@ -79,8 +79,8 @@ export function applyTimeseriesPlan(
  * Tear down a Chart instance and clear the container.
  *
  * The terminal's chart engine disposes a chart through `destroy()` (chart-core `Chart`, its only disposal
- * method). It stops the chart's listeners, observers and workers but leaves its canvases in the container, so
- * the container is cleared after it. A chart without `destroy()` is a named error, never a silent clear.
+ * method), which also removes its own canvases. The container is then cleared as explicit cleanup of anything
+ * else left in it. A chart without `destroy()` is a named error, never a silent clear.
  * Call this before discarding a Chart reference.
  */
 export function disposeChart(chart: Chart, container?: HTMLElement): void {

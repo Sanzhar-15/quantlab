@@ -64,11 +64,13 @@ interface FakeChart {
 	themes: unknown[];
 	watermarks: Array<{ fontSizePx: number; text: string; color: string } | null>;
 	options: CreateChartOptions | undefined;
+	created: number;
+	seriesWrites: number;
 }
 
 function fakeChart(): FakeChart {
-	const record: FakeChart = { chart: undefined as unknown as Chart, themes: [], watermarks: [], options: undefined };
-	const series = () => ({ setData() { }, setMarkers() { }, setVisible() { } });
+	const record: FakeChart = { chart: undefined as unknown as Chart, themes: [], watermarks: [], options: undefined, created: 0, seriesWrites: 0 };
+	const series = () => ({ setData() { record.seriesWrites++; }, setMarkers() { }, setVisible() { } });
 	record.chart = {
 		addPlugin() { },
 		addCandlestickSeries: series,
@@ -122,6 +124,7 @@ suite('chart fallbacks (F-CHARTS-FB)', () => {
 		fake = fakeChart();
 		setTestChartFactory((_container, options) => {
 			fake.options = options;
+			fake.created++;
 			return fake.chart;
 		});
 		resizeCallbacks = [];
@@ -152,10 +155,14 @@ suite('chart fallbacks (F-CHARTS-FB)', () => {
 	});
 
 	for (const name of Object.keys(TOKENS)) {
-		test(`token ${name} removed: initialize names it`, async () => {
+		test(`token ${name} removed: initialize and every later data call name it; no chart is created`, async () => {
 			document.documentElement.style.removeProperty(name);
 			const client = new ChartClient(container(600));
-			await assert.rejects(client.initialize('dark'), new Error(`chart theme: token ${name} is not set`));
+			const named = new Error(`chart theme: token ${name} is not set`);
+			await assert.rejects(client.initialize('dark'), named);
+			await assert.rejects(client.setData([{ t: 1, o: 1, h: 1, l: 1, c: 1 }]), named);
+			assert.strictEqual(fake.created, 0, 'no engine chart is created without a complete theme');
+			assert.strictEqual(fake.seriesWrites, 0, 'no series is written');
 		});
 	}
 
