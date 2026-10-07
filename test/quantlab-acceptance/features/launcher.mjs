@@ -35,6 +35,8 @@ const REMOVED_IN_CONTROL = 'detachhead.basedpyright';
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 const PACK_ACTIVATION_MS = 3 * 60 * 1000;
 const PACK_SETTLE_MS = 60 * 1000;
+// One CDP request's answer, and the connection's opening (cdp.mjs): every function the window driver evaluates is synchronous.
+const CDP_ANSWER_MS = 30 * 1000;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const started = Date.now();
 
@@ -98,7 +100,7 @@ async function launch(bundle, dir, mode, python) {
 	});
 	const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, RUN_TIMEOUT_MS);
 	let cdp;
-	const window = async () => cdp ??= await connect(await waitForEndpoint(logPath, 60_000));
+	const window = async () => cdp ??= await connect(await waitForEndpoint(logPath, 60_000), CDP_ANSWER_MS);
 	const served = serve(cues, {
 		'backtest-form': async args => backtestForm(await window(), args),
 		'import-modal': async args => importModal(await window(), args),
@@ -190,11 +192,14 @@ async function plainLaunch(bundle, dir) {
 		child.on('error', error => { exited = true; resolve({ error }); });
 		child.on('exit', (code, signal) => { exited = true; resolve({ code, signal }); });
 	});
+	// As in launch(): no launch outlives RUN_TIMEOUT_MS, whatever the steps below are waiting for.
+	let timedOut = false;
+	const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, RUN_TIMEOUT_MS);
 	const toasts = new Set();
 	let launchError;
 	let cdp;
 	try {
-		cdp = await connect(await waitForEndpoint(logPath, 60_000));
+		cdp = await connect(await waitForEndpoint(logPath, 60_000), CDP_ANSWER_MS);
 		await waitForWorkbench(cdp, 120_000);
 		const poll = async () => {
 			for (const text of await readToasts(cdp)) {
@@ -229,10 +234,14 @@ async function plainLaunch(bundle, dir) {
 		child.kill('SIGKILL');
 	}
 	const result = await exit;
+	clearTimeout(timer);
 	cdp?.close();
 	fs.closeSync(log);
 	if (result.error) {
 		return { launchError: `[app_launch_failed] pack: ${result.error.message}` };
+	}
+	if (timedOut) {
+		return { launchError: `[app_timeout] pack: killed after ${RUN_TIMEOUT_MS / 1000} s (see ${logPath})` };
 	}
 	if (launchError !== undefined) {
 		return { launchError };

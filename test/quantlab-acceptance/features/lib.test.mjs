@@ -6,11 +6,14 @@
 // node --test test/quantlab-acceptance/features/lib.test.mjs
 
 import assert from 'node:assert';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
+import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
+import { connect } from './cdp.mjs';
 import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
@@ -107,6 +110,76 @@ test('launcher.mjs sets process.noAsar before any fs call and never puts ELECTRO
 	assert.ok(set > 0, 'launcher.mjs does not set process.noAsar = true');
 	assert.ok(set < source.indexOf('fs.'), 'process.noAsar = true comes after the first fs use');
 	assert.ok(!/ELECTRON_NO_ASAR\s*[:=]/.test(source), 'launcher.mjs assigns ELECTRON_NO_ASAR');
+});
+
+/** A WebSocket server on 127.0.0.1: `onData(socket)` runs for each chunk a client sends after the handshake. */
+async function webSocketServer(onData) {
+	const sockets = [];
+	const server = http.createServer();
+	server.on('upgrade', (request, socket) => {
+		sockets.push(socket);
+		const accept = crypto.createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+		socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+		socket.on('data', () => onData(socket));
+	});
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	return {
+		endpoint: `ws://127.0.0.1:${server.address().port}/devtools/browser/test`,
+		close: () => { sockets.forEach(socket => socket.destroy()); server.close(); },
+	};
+}
+
+/** One unmasked text frame (payload under 126 bytes). */
+function textFrame(text) {
+	const payload = Buffer.from(text);
+	assert.ok(payload.length < 126);
+	return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+}
+
+test('cdp connect: a request the endpoint never answers rejects by name at the limit; an answered one resolves', async () => {
+	const silent = await webSocketServer(() => { });
+	const answering = await webSocketServer(socket => socket.write(textFrame('{"id":1,"result":{"ok":true}}')));
+	try {
+		const cdp = await connect(silent.endpoint, 300);
+		const begun = Date.now();
+		await assert.rejects(cdp.send('Target.getTargets'), /^Error: \[cdp_no_answer\] Target\.getTargets: no answer after 0\.3 s$/);
+		assert.ok(Date.now() - begun >= 290, 'rejected before the limit');
+		await assert.rejects(cdp.send('Page.getFrameTree', {}, 'S1'), /\[cdp_no_answer\] Page\.getFrameTree \(session S1\)/);
+		cdp.close();
+		const live = await connect(answering.endpoint, 5000);
+		assert.deepStrictEqual(await live.send('Target.getTargets'), { ok: true });
+		live.close();
+	} finally {
+		silent.close();
+		answering.close();
+	}
+});
+
+test('cdp connect: an endpoint that accepts and never completes the handshake rejects by name; the limit is required', async () => {
+	const sockets = [];
+	const server = http.createServer();
+	server.on('upgrade', (_request, socket) => sockets.push(socket));
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	try {
+		const endpoint = `ws://127.0.0.1:${server.address().port}/x`;
+		await assert.rejects(connect(endpoint, 300), /\[cdp_connect_timeout\] .* not open after 0\.3 s/);
+		await assert.rejects(connect(endpoint), /cdp_answer_limit_missing/);
+		await assert.rejects(connect(endpoint, 0), /cdp_answer_limit_missing/);
+	} finally {
+		sockets.forEach(socket => socket.destroy());
+		server.close();
+	}
+});
+
+test('launcher.mjs: every connect() passes CDP_ANSWER_MS and both launch functions carry the RUN_TIMEOUT_MS kill', () => {
+	const source = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
+	const connects = source.match(/[^.\w]connect\([^\n]*/g).filter(line => !line.includes('import'));
+	assert.strictEqual(connects.length, 2);
+	for (const line of connects) {
+		assert.ok(/, CDP_ANSWER_MS\);$/.test(line), `connect without the answer limit: ${line}`);
+	}
+	assert.strictEqual(source.split(`setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, RUN_TIMEOUT_MS);`).length - 1, 2);
+	assert.ok(source.includes('[app_timeout] pack: killed after'), 'plainLaunch does not report its timeout');
 });
 
 test('processesInside: only commands run from inside a launched bundle, never the launcher itself', () => {
