@@ -80,6 +80,7 @@ import { IOpenURLOptions, IURLService } from '../../platform/url/common/url.js';
 import { URLHandlerChannelClient, URLHandlerRouter } from '../../platform/url/common/urlIpc.js';
 import { NativeURLService } from '../../platform/url/common/urlService.js';
 import { ElectronURLListener } from '../../platform/url/electron-main/electronUrlListener.js';
+import { UtilityProcess } from '../../platform/utilityProcess/electron-main/utilityProcess.js';
 import { IWebviewManagerService } from '../../platform/webview/common/webviewManagerService.js';
 import { WebviewMainService } from '../../platform/webview/electron-main/webviewMainService.js';
 import { isFolderToOpen, isWorkspaceToOpen, IWindowOpenable } from '../../platform/window/common/window.js';
@@ -1418,6 +1419,7 @@ export class CodeApplication extends Disposable {
 		// A failed write is thrown into the code that changed the registry, never caught.
 		if (globalThis.QL_TEST_BUILD) {
 			const { dump } = await import('./qlHost/viewRecordsDump.js');
+			const { qlProcessRoleLines } = await import('./qlHost/processRoles.js');
 			const userDataPath = this.environmentMainService.userDataPath;
 			const publishViewRecords = (records: readonly ViewRecord[]): void => {
 				this.logService.info(`QuantLab host: test build: view records written to ${dump(records, userDataPath)}`);
@@ -1467,6 +1469,26 @@ export class CodeApplication extends Disposable {
 					workbenchView.webContents.send('vscode:runAction', { id: request.id, from: 'menu', args: request.args });
 					this.logService.info(`QuantLab host: test build: workbench action ${request.id} sent by the test driver`);
 					terminalHost.host.log(`test driver action sent id=${request.id}`);
+				} else if (event.message === 'ql-test:process-roles') {
+					// Package rows A5a-c and the per-process egress capture: which OS process has which role, as the main process
+					// knows it (the argv does not tell the utility processes apart; no renderer pid is logged). Format: processRoles.ts.
+					const lines = qlProcessRoleLines({
+						mainPid: process.pid,
+						views: terminalHost.viewRecords().map(record => {
+							const view = terminalHost.view(record.name);
+							if (!view) {
+								throw new Error(`QuantLab host (DRIVER): ql-test:process-roles: the registered view ${record.name} is not in the window`);
+							}
+
+							return { name: record.name, pid: view.webContents.getOSProcessId() };
+						}),
+						utilities: UtilityProcess.getAll(),
+						metrics: app.getAppMetrics()
+					});
+					for (const line of lines) {
+						this.logService.info(`QuantLab host: test build: ${line}`);
+					}
+					terminalHost.host.log(`test driver process roles written lines=${lines.length}`);
 				}
 			});
 			// A console message sent before this line reached no listener (measured: PERF's test-toggle on package 10 was lost when
