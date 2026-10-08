@@ -14,7 +14,7 @@ import { IConfigurationService } from '../../../configuration/common/configurati
 import { IFileService } from '../../../files/common/files.js';
 import { IUserDataProfilesService } from '../../../userDataProfile/common/userDataProfile.js';
 import { parseSettingsSyncContent, SettingsSynchroniser } from '../../common/settingsSync.js';
-import { ISyncData, IUserDataSyncStoreService, SyncResource, UserDataSyncError, UserDataSyncErrorCode } from '../../common/userDataSync.js';
+import { IRemoteUserData, ISyncData, IUserDataSyncStoreService, SyncResource, UserDataSyncError, UserDataSyncErrorCode } from '../../common/userDataSync.js';
 import { assertNoNeverSynced, assertNoNeverSyncedProperty, assertOrdinaryKept, DEMO_EMAIL, DEMO_PASSWORD, IRawSettings, RawStyle, rawSettings } from './rawNeverSyncedSettings.js';
 import { UserDataSyncClient, UserDataSyncTestServer } from './userDataSyncClient.js';
 
@@ -210,5 +210,71 @@ suite('SettingsSync - never-synced settings written more than once (STRIP-1)', (
 
 		await assert.rejects(testObject.sync(await client.getLatestRef(SyncResource.Settings)), (error: unknown) => error instanceof UserDataSyncError && error.code === UserDataSyncErrorCode.LocalInvalidContent);
 		assert.deepStrictEqual(server.posts.filter(post => post.url.endsWith('/resource/settings')), [], 'nothing is uploaded from a file that does not parse');
+	}));
+
+	// QuantLab F-SYNC-STRIP-2 (L4, B5): hasRemoteChanged checks a local file that exists for syntax errors, and treats an absent
+	// file and an empty one as two explicit cases, each read as `{}` the way upstream reads them. Neither is passed through the
+	// parse check as a substituted '{}': the check is never run on them (the `localContent || '{}'` form ran it on '{}').
+	interface ISynchroniserInternals {
+		hasRemoteChanged(lastSyncUserData: IRemoteUserData): Promise<boolean>;
+		hasErrors(content: string, isArray: boolean): boolean;
+	}
+
+	/** After a sync of one ordinary setting, the last sync data, and a record of every content `hasErrors` is asked about from now on. */
+	async function syncedOnceAndWatchHasErrors(): Promise<{ internals: ISynchroniserInternals; lastSyncUserData: IRemoteUserData; checked: string[] }> {
+		await writeLocal('{\n\t"files.autoSave": "off"\n}');
+		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
+		const lastSyncUserData = await testObject.getLastSyncUserData();
+		assert.ok(lastSyncUserData);
+		const internals = testObject as unknown as ISynchroniserInternals;
+		const original = internals.hasErrors.bind(testObject);
+		const checked: string[] = [];
+		internals.hasErrors = (content, isArray) => {
+			checked.push(content);
+			return original(content, isArray);
+		};
+		return { internals, lastSyncUserData, checked };
+	}
+
+	test('hasRemoteChanged, the local file is absent: a local change, and nothing is parse-checked', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const { internals, lastSyncUserData, checked } = await syncedOnceAndWatchHasErrors();
+		await client.instantiationService.get(IFileService).del(settingsResource());
+
+		assert.strictEqual(await internals.hasRemoteChanged(lastSyncUserData), true);
+		assert.deepStrictEqual(checked, [], 'an absent file is not parse-checked (as a substituted {} or otherwise)');
+	}));
+
+	test('hasRemoteChanged, the local file is empty: a local change, and nothing is parse-checked', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const { internals, lastSyncUserData, checked } = await syncedOnceAndWatchHasErrors();
+		await writeLocal('');
+
+		assert.strictEqual(await internals.hasRemoteChanged(lastSyncUserData), true);
+		assert.deepStrictEqual(checked, [], 'empty content is not parse-checked');
+	}));
+
+	test('hasRemoteChanged, the local file holds only whitespace: read as empty, and nothing is parse-checked', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const { internals, lastSyncUserData, checked } = await syncedOnceAndWatchHasErrors();
+		await writeLocal('  \n\t \n');
+
+		assert.strictEqual(await internals.hasRemoteChanged(lastSyncUserData), true);
+		assert.deepStrictEqual(checked, [], 'whitespace-only content is not parse-checked');
+	}));
+
+	test('hasRemoteChanged, the local file exists and is unchanged: no change, and its own trimmed content is what is parse-checked', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const { internals, lastSyncUserData, checked } = await syncedOnceAndWatchHasErrors();
+		const content = await readLocal();
+
+		assert.strictEqual(await internals.hasRemoteChanged(lastSyncUserData), false);
+		assert.ok(checked.length >= 1, 'content that exists is parse-checked');
+		assert.ok(checked.every(entry => entry === content.trim()), `only the file's own content is checked, not a substitute: ${JSON.stringify(checked)}`);
+	}));
+
+	test('hasRemoteChanged, the local file exists and does not parse: a local change', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const { internals, lastSyncUserData, checked } = await syncedOnceAndWatchHasErrors();
+		const broken = '{\n\t"files.autoSave": "off",\n\t"qic.demo.password": "SENTINEL-TYPING';
+		await writeLocal(broken);
+
+		assert.strictEqual(await internals.hasRemoteChanged(lastSyncUserData), true);
+		assert.ok(checked.length >= 1 && checked.every(entry => entry === broken), JSON.stringify(checked));
 	}));
 });

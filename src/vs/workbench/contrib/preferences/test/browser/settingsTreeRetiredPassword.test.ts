@@ -13,6 +13,7 @@ import { IWorkbenchConfigurationService } from '../../../../services/configurati
 import { IWorkbenchEnvironmentService } from '../../../../services/environment/common/environmentService.js';
 import { ISetting, SettingMatchType, SettingValueType } from '../../../../services/preferences/common/preferences.js';
 import { DefaultSettings } from '../../../../services/preferences/common/preferencesModels.js';
+import { getInvalidTypeError } from '../../../../services/preferences/common/preferencesValidation.js';
 import { IUserDataProfileService } from '../../../../services/userDataProfile/common/userDataProfile.js';
 // The production registration of the retired demo keys (a side effect of the import, as in the application).
 import '../../../../services/quantlabHostIdentity/common/quantlabRetiredSettings.js';
@@ -102,10 +103,18 @@ suite('Settings editor - the retired demo password is not rendered as a value (S
 		assertNoTextControl(searchRow(PASSWORD, configuredWith({ [PASSWORD]: SENTINEL_PASSWORD })), SENTINEL_PASSWORD, 'search result');
 	});
 
+	// The validator the Settings editor itself calls (settingsTree.ts: SettingsTreeDelegate.getTemplateId and
+	// SettingComplexRenderer.renderValidations) on the REGISTERED schema: a configured string is a valid value, so the row
+	// shows no "invalid type, fix in JSON" error. (Negative: registering `type: ['null']` makes the first assertion RED.)
 	test('a configured password string is not flagged as an invalid type', () => {
 		const row = treeRow(PASSWORD, configuredWith({ [PASSWORD]: SENTINEL_PASSWORD }));
 		assert.ok(row);
 		assert.deepStrictEqual(row.setting.type, ['string', 'null']);
+		assert.strictEqual(getInvalidTypeError(SENTINEL_PASSWORD, row.setting.type), undefined);
+		assert.strictEqual(getInvalidTypeError(SENTINEL_PASSWORD, registeredSetting(PASSWORD).type), undefined);
+		// the nullable member is a valid value too, and the validator can fail: a number is not a string or null
+		assert.strictEqual(getInvalidTypeError(null, row.setting.type), undefined);
+		assert.ok(getInvalidTypeError(12345, row.setting.type), 'a number must be flagged, otherwise this check cannot fail');
 	});
 
 	test('an unconfigured password is not listed at all', () => {

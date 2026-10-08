@@ -26,6 +26,9 @@ import { Registry } from '../../../../platform/registry/common/platform.js';
  *   (settingsTreeModels.ts, initSettingValueType), whose row is only an "Edit in settings.json" button and holds no
  *   value control. A string value still validates against the type, so the row shows no type error either. The
  *   text of the user's own settings.json is not covered by this: the JSON editor shows what the user typed.
+ *   What is proved: the row model (settingsTreeRetiredPassword.test.ts), the validator on this schema (the same file), and
+ *   the RENDERED row, whose text nodes, input values, titles and attributes hold no value
+ *   (settingsTreeRetiredPasswordRendered.test.ts). The tree's virtual list is not part of that proof.
  *   `qic.demo.email` stays a `string`: it is an address, not a credential.
  * No `default`, on purpose. Remove together with that list after the first user-facing release that includes QuantLab.
  */
