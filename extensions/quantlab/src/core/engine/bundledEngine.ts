@@ -49,8 +49,8 @@ export function bundledEngineCandidates(extensionPath: string, platform: NodeJS.
 		path.join(extensionPath, '..', '..', 'engine-dist', 'quantlab-engine', exeName),
 		// Inside extension resources (packaged layout)
 		path.join(extensionPath, 'engine', 'quantlab-engine', exeName),
-		// Build output directory
-		path.join(extensionPath, '..', '..', '.build', 'dist', 'quantlab-engine', exeName),
+		// The bundle-quantlab-engine task's output (build/engine/bundle.ts: .build/quantlab-engine/quantlab-engine/<exe>)
+		path.join(extensionPath, '..', '..', '.build', 'quantlab-engine', 'quantlab-engine', exeName),
 	];
 }
 
@@ -78,27 +78,50 @@ export function resolveBundledEngine(extensionPath: string, platform: NodeJS.Pla
 export interface EngineSelection {
 	/** The quantlab extension's directory. */
 	readonly extensionPath: string;
-	/** The application root (`vscode.env.appRoot`): an extension inside it is the packaged app's built-in one. */
+	/** The application root (`vscode.env.appRoot`); its product.json says whether this is a packaged build ({@link isPackagedApp}). */
 	readonly appRoot: string;
 	readonly platform: NodeJS.Platform;
 	/** `quantlab.pythonPath` as the user set it; empty when unset. */
 	readonly explicitPython: string;
 }
 
-function isInside(child: string, parent: string): boolean {
-	const relative = path.relative(parent, child);
-	return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+/**
+ * Whether the app at `appRoot` is a packaged build rather than a source run (scripts/code.sh).
+ * The extension's location cannot tell them apart: a source run also has the extension at
+ * <appRoot>/extensions/quantlab (src/vs/platform/environment/common/environmentService.ts derives
+ * the app root and the built-in extensions directory from the same root). The signal is the build
+ * stamp: the packaging task (build/gulpfile.vscode.ts, productJsonStream) writes `commit` into the
+ * packaged product.json, and the repository's own product.json, which a source run reads, has none.
+ * A product.json that cannot be read, or a `commit` that is neither absent nor a non-empty string,
+ * is not a verdict and throws by name.
+ */
+export function isPackagedApp(appRoot: string): boolean {
+	const source = path.join(appRoot, 'product.json');
+	let product: Record<string, unknown>;
+	try {
+		product = JSON.parse(fs.readFileSync(source, 'utf8')) as Record<string, unknown>;
+	} catch (err: unknown) {
+		throw new Error(`[product_unreadable] Quantlab: cannot tell a packaged app from a source run, ${source} is unreadable: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	const commit = product['commit'];
+	if (commit === undefined) {
+		return false;
+	}
+	if (typeof commit !== 'string' || commit === '') {
+		throw new Error(`[product_unreadable] Quantlab: ${source} has a commit that is not a non-empty string: ${JSON.stringify(commit)}`);
+	}
+	return true;
 }
 
 /**
  * The engine a backtest runs on. There is no implicit interpreter: no managed venv, no PATH probe.
- * - In the packaged app, only its bundled engine (`<extension>/engine/quantlab-engine/<exe>`); absent, a named error.
- * - In development, `quantlab.pythonPath` when the user set it (it must exist, and the engine source tree
+ * - In the packaged app ({@link isPackagedApp}), only its bundled engine (`<extension>/engine/quantlab-engine/<exe>`); absent, a named error.
+ * - In a source run, `quantlab.pythonPath` when the user set it (it must exist, and the engine source tree
  *   beside the extension must exist), else a bundled engine at a development location, else a named error.
  */
 export function selectEngine(selection: EngineSelection): EngineLaunch {
 	const { extensionPath, appRoot, platform, explicitPython } = selection;
-	if (isInside(extensionPath, appRoot)) {
+	if (isPackagedApp(appRoot)) {
 		const packaged = bundledEngineCandidates(extensionPath, platform)[1];
 		if (!fs.statSync(packaged, { throwIfNoEntry: false })?.isFile()) {
 			throw new Error(`[engine_missing] Quantlab: this app's bundled backtest engine is missing (${packaged}); reinstall the app.`);

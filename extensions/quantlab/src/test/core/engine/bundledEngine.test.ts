@@ -9,7 +9,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { bundledEngineCandidates, bundledEngineLaunch, ENGINE_SOURCES, resolveBundledEngine, selectEngine } from '../../../core/engine/bundledEngine';
+import { bundledEngineCandidates, bundledEngineLaunch, ENGINE_SOURCES, isPackagedApp, resolveBundledEngine, selectEngine } from '../../../core/engine/bundledEngine';
 
 suite('bundledEngine – resolver', () => {
 
@@ -104,11 +104,18 @@ suite('bundledEngine – selectEngine', () => {
 		return file;
 	}
 
+	// product.json as the packaging task writes it (with a commit) or as a source run reads it (without).
+	function writeProduct(appRoot: string, commit?: unknown): void {
+		fs.mkdirSync(appRoot, { recursive: true });
+		fs.writeFileSync(path.join(appRoot, 'product.json'), JSON.stringify(commit === undefined ? { nameShort: 'Delta Plus' } : { nameShort: 'Delta Plus', commit }));
+	}
+
 	// The packaged app: <appRoot>/extensions/quantlab, the engine inside the extension.
 	function packaged(): { appRoot: string; extensionPath: string; exe: string } {
 		const appRoot = path.join(root, 'Delta Plus.app', 'Contents', 'Resources', 'app');
 		const extensionPath = path.join(appRoot, 'extensions', 'quantlab');
 		fs.mkdirSync(extensionPath, { recursive: true });
+		writeProduct(appRoot, '0123456789abcdef0123456789abcdef01234567');
 		return { appRoot, extensionPath, exe: path.join(extensionPath, 'engine', 'quantlab-engine', 'quantlab-engine') };
 	}
 
@@ -137,35 +144,62 @@ suite('bundledEngine – selectEngine', () => {
 		}
 	});
 
-	test('development: quantlab.pythonPath when set, on the engine source tree', () => {
-		const extensionPath = path.join(root, 'extensions', 'quantlab');
-		fs.mkdirSync(path.join(root, 'engine'), { recursive: true });
+	// A source run (scripts/code.sh): the extension is at <appRoot>/extensions/quantlab, appRoot is the
+	// repository root, and its product.json carries no commit.
+	function sourceRun(): { appRoot: string; extensionPath: string } {
+		const appRoot = root;
+		const extensionPath = path.join(appRoot, 'extensions', 'quantlab');
 		fs.mkdirSync(extensionPath, { recursive: true });
+		writeProduct(appRoot);
+		return { appRoot, extensionPath };
+	}
+
+	test('source run (extension under appRoot): a declared quantlab.pythonPath selects the setting', () => {
+		const { appRoot, extensionPath } = sourceRun();
+		fs.mkdirSync(path.join(root, 'engine'), { recursive: true });
 		const python = place(path.join(root, 'venv', 'bin', 'python'));
-		place(path.join(root, '.build', 'dist', 'quantlab-engine', 'quantlab-engine'));
-		assert.deepStrictEqual(selectEngine({ extensionPath, appRoot: path.join(root, 'app'), platform: 'darwin', explicitPython: python }), {
+		place(path.join(root, '.build', 'quantlab-engine', 'quantlab-engine', 'quantlab-engine'));
+		assert.deepStrictEqual(selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: python }), {
 			executable: python, source: 'setting quantlab.pythonPath', cwd: path.join(root, 'engine'), engineRoot: path.join(root, 'engine'),
 		});
 	});
 
-	test('development: a set quantlab.pythonPath that is not a file, or no source tree, fails by name', () => {
-		const extensionPath = path.join(root, 'extensions', 'quantlab');
-		fs.mkdirSync(extensionPath, { recursive: true });
-		const appRoot = path.join(root, 'app');
+	test('source run, no setting, only the bundle task output present: that bundle is selected', () => {
+		const { appRoot, extensionPath } = sourceRun();
+		const exe = place(path.join(root, '.build', 'quantlab-engine', 'quantlab-engine', 'quantlab-engine'));
+		assert.deepStrictEqual(selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: '' }), {
+			executable: exe, source: 'development bundled engine', cwd: path.dirname(exe), engineRoot: null,
+		});
+	});
+
+	test('source run: a set quantlab.pythonPath that is not a file, or no source tree, fails by name', () => {
+		const { appRoot, extensionPath } = sourceRun();
 		assert.throws(() => selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: path.join(root, 'nope') }), /^Error: \[engine_python_missing\]/);
 		const python = place(path.join(root, 'venv', 'bin', 'python'));
 		assert.throws(() => selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: python }), /^Error: \[engine_source_missing\]/);
 	});
 
-	test('development, nothing set: a bundled engine at a development location, else fails by name', () => {
-		const extensionPath = path.join(root, 'extensions', 'quantlab');
+	test('source run, nothing set: a bundled engine at a development location, else fails by name', () => {
+		const { appRoot, extensionPath } = sourceRun();
 		fs.mkdirSync(path.join(root, 'engine'), { recursive: true });
-		fs.mkdirSync(extensionPath, { recursive: true });
-		const appRoot = path.join(root, 'app');
 		assert.throws(() => selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: '' }), /^Error: \[engine_missing\] Quantlab: no bundled backtest engine at .*, and quantlab\.pythonPath is not set\.$/);
-		const exe = place(path.join(root, '.build', 'dist', 'quantlab-engine', 'quantlab-engine'));
+		const exe = place(path.join(root, 'engine-dist', 'quantlab-engine', 'quantlab-engine'));
 		assert.deepStrictEqual(selectEngine({ extensionPath, appRoot, platform: 'darwin', explicitPython: '' }), {
 			executable: exe, source: 'development bundled engine', cwd: path.dirname(exe), engineRoot: null,
 		});
+	});
+
+	test('the build stamp decides: no commit is a source run, a commit string is packaged, anything else or no product.json throws by name', () => {
+		const appRoot = path.join(root, 'app');
+		writeProduct(appRoot);
+		assert.strictEqual(isPackagedApp(appRoot), false);
+		writeProduct(appRoot, 'abc123');
+		assert.strictEqual(isPackagedApp(appRoot), true);
+		for (const bad of ['', 7, null]) {
+			writeProduct(appRoot, bad);
+			assert.throws(() => isPackagedApp(appRoot), /^Error: \[product_unreadable\] Quantlab: .*commit that is not a non-empty string/);
+		}
+		fs.rmSync(path.join(appRoot, 'product.json'));
+		assert.throws(() => isPackagedApp(appRoot), /^Error: \[product_unreadable\] Quantlab: cannot tell a packaged app from a source run/);
 	});
 });
