@@ -3,6 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import es from 'event-stream';
+import filter from 'gulp-filter';
+import buffer from 'gulp-buffer';
+import { Stream } from 'stream';
+import File from 'vinyl';
+
 // The packaged quantlab manifest declares the Quantbook notebook type only where the product authorises
 // Quantbook (product.json `quantlab.quantbookEnabled`). A notebook contribution has no `when` clause: left
 // in a product whose key is false, `*.qnb` resolves to a notebook editor whose serializer never registers,
@@ -61,4 +67,33 @@ export function gateQuantbookManifest(manifest: IQuantlabManifest, authorised: b
 		activationEvents: activationEvents.filter(e => !quantbookNotebookTypes.some(type => e === `onNotebook:${type}`)),
 		contributes,
 	};
+}
+
+/**
+ * Gates quantlab's package.json in its packaging stream, BEFORE the stream is renamed under `extensions/quantlab/`:
+ * gulp-filter matches the path relative to the file's cwd, so `extensions/quantlab/package.json` names the manifest
+ * only while each file still sits at its source path. A stream that ends without the manifest passing the gate
+ * fails by name, so a pattern that stops matching cannot ship the ungated manifest silently.
+ */
+export function gateQuantlabPackageJsonStream(input: Stream, authorised: boolean): Stream {
+	const manifestFilter = filter('extensions/quantlab/package.json', { restore: true });
+	let gated = 0;
+	return input
+		.pipe(manifestFilter)
+		.pipe(buffer())
+		.pipe(es.mapSync((f: File) => {
+			gated++;
+			f.contents = Buffer.from(JSON.stringify(gateQuantbookManifest(JSON.parse(f.contents!.toString('utf8')), authorised)));
+			return f;
+		}))
+		.pipe(manifestFilter.restore)
+		.pipe(es.through(function (this: es.ThroughStream, file: File) {
+			this.emit('data', file);
+		}, function (this: es.ThroughStream) {
+			if (gated !== 1) {
+				this.emit('error', new Error(`[quantbook-manifest] extensions/quantlab/package.json passed the manifest gate ${gated} time(s) in the quantlab packaging stream; expected exactly once`));
+				return;
+			}
+			this.emit('end');
+		}));
 }

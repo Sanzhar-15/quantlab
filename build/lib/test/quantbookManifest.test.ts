@@ -6,7 +6,11 @@
 import assert from 'assert';
 import fs from 'fs';
 import path from 'path';
-import { gateQuantbookManifest, quantbookAuthorised, quantbookNotebookTypes } from '../quantbookManifest.ts';
+import es from 'event-stream';
+import rename from 'gulp-rename';
+import { Stream } from 'stream';
+import File from 'vinyl';
+import { gateQuantbookManifest, gateQuantlabPackageJsonStream, quantbookAuthorised, quantbookNotebookTypes } from '../quantbookManifest.ts';
 
 const root = path.join(import.meta.dirname, '../../..');
 const readJson = (relative: string) => JSON.parse(fs.readFileSync(path.join(root, relative), 'utf8'));
@@ -71,5 +75,45 @@ suite('quantbookManifest', () => {
 		const noArrays = structuredClone(source);
 		delete noArrays.contributes.notebooks;
 		assert.throws(() => gateQuantbookManifest(noArrays, false), /no 'contributes\.notebooks' or 'activationEvents' array/);
+	});
+
+	// The packaging stream: files carry their source path (cwd = repo root, base = the extension folder), as
+	// fromLocal emits them, and the gate runs before the rename under `extensions/<name>/`.
+	function quantlabFiles(): File[] {
+		const base = path.join(root, 'extensions', 'quantlab');
+		return ['package.json', 'out/src/extension.js'].map(relative => new File({
+			cwd: root,
+			base,
+			path: path.join(base, relative),
+			contents: Buffer.from(relative === 'package.json' ? fs.readFileSync(path.join(base, 'package.json'), 'utf8') : '// js'),
+		}));
+	}
+
+	function collect(stream: Stream): Promise<File[]> {
+		return new Promise((resolve, reject) => {
+			const files: File[] = [];
+			stream.on('data', (f: File) => files.push(f));
+			stream.on('error', reject);
+			stream.on('end', () => resolve(files));
+		});
+	}
+
+	test('the packaging stream gates the quantlab manifest at its source path, exactly once, and passes the other files unchanged', async () => {
+		const files = await collect(gateQuantlabPackageJsonStream(es.readArray(quantlabFiles()), false)
+			.pipe(rename(p => p.dirname = `extensions/quantlab/${p.dirname}`)));
+		const manifest = files.find(f => f.relative === path.join('extensions', 'quantlab', 'package.json'))!;
+		assert.ok(manifest, files.map(f => f.relative).join(', '));
+		const packaged = JSON.parse(manifest.contents!.toString('utf8'));
+		for (const type of quantbookNotebookTypes) {
+			assert.strictEqual(declaredNotebookTypes(packaged).includes(type), false);
+			assert.strictEqual(notebookActivationEvents(packaged).includes(`onNotebook:${type}`), false);
+		}
+		const js = files.find(f => f.relative === path.join('extensions', 'quantlab', 'out', 'src', 'extension.js'))!;
+		assert.strictEqual(js.contents!.toString('utf8'), '// js');
+	});
+
+	test('a stream whose manifest never reaches the gate (renamed first) fails by name', async () => {
+		const renamedFirst = es.readArray(quantlabFiles()).pipe(rename(p => p.dirname = `extensions/quantlab/${p.dirname}`));
+		await assert.rejects(collect(gateQuantlabPackageJsonStream(renamedFirst, false)), /\[quantbook-manifest\] extensions\/quantlab\/package\.json passed the manifest gate 0 time\(s\)/);
 	});
 });
