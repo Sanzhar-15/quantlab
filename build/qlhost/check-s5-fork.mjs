@@ -57,7 +57,7 @@ row('row 5 windowImpl logs both lines through the formatter, no `|| \'<unknown>\
 // gate: the refusal reason
 const gate = readFileSync(join(src, 'vs/code/electron-main/qlHost/gate.ts'), 'utf8');
 const defaulted = /reason: refusal \?\?/.test(gate);
-const pushesRefusal = gate.includes('this.unadopted.push({ window: codeWindow, reason: refusal });');
+const pushesRefusal = gate.includes('this.unadopted.push({ window: codeWindow, reason: refusal, capacity });');
 const invariant = /if \(refusal === undefined\) \{\n\t\t\tthrow new Error\(/.test(gate);
 row('row 6 gate pushes the refusal itself after a raised invariant', !defaulted && pushesRefusal && invariant, `defaulted=${defaulted} pushesRefusal=${pushesRefusal} invariant=${invariant}`);
 
