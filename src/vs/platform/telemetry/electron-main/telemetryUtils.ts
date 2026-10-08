@@ -3,7 +3,6 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { getDevDeviceId } from '../../../base/node/id.js';
 import { ILogService } from '../../log/common/log.js';
 import { IStateService } from '../../state/node/state.js';
 import { machineIdKey, sqmIdKey, devDeviceIdKey } from '../common/telemetry.js';
@@ -31,12 +30,4 @@ export async function resolveDevDeviceId(stateService: IStateService, logService
 	stateService.setItem(devDeviceIdKey, devDeviceId);
 	logService.trace(`Resolved devDevice identifier: ${devDeviceId}`);
 	return devDeviceId;
-}
-
-export async function validateDevDeviceId(stateService: IStateService, logService: ILogService): Promise<void> {
-	const actualDeviceId = await getDevDeviceId(logService.error.bind(logService));
-	const currentDeviceId = await resolveNodeDevDeviceId(stateService, logService);
-	if (actualDeviceId !== currentDeviceId) {
-		stateService.setItem(devDeviceIdKey, actualDeviceId);
-	}
 }

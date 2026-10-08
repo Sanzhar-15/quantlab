@@ -115,13 +115,9 @@ export async function getSqmMachineId(errorLogger: (error: Error) => void): Prom
 	return '';
 }
 
-export async function getDevDeviceId(errorLogger: (error: Error) => void): Promise<string> {
-	try {
-		const deviceIdPackage = await import('@vscode/deviceid');
-		const id = await deviceIdPackage.getDeviceId();
-		return id;
-	} catch (err) {
-		errorLogger(err);
-		return uuid.generateUuid();
-	}
+// Quantlab (F-STRIP-DEVID-1): the developer device id is local to this app, a fresh UUID that callers keep in the
+// app's own state (`telemetry.devDeviceId`). The shared Microsoft developer-tools id file that `@vscode/deviceid`
+// reads or creates under the user's home is neither read nor written.
+export function generateDevDeviceId(): string {
+	return uuid.generateUuid();
 }

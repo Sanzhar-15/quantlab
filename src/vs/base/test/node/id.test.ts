@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { getMachineId, getSqmMachineId, getDevDeviceId } from '../../node/id.js';
+import { getMachineId, getSqmMachineId, generateDevDeviceId } from '../../node/id.js';
 import { getMac } from '../../node/macAddress.js';
 import { flakySuite } from './testUtils.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../common/utils.js';
@@ -26,11 +26,9 @@ flakySuite('ID', () => {
 		assert.strictEqual(errors.length, 0);
 	});
 
-	test('getDevDeviceId', async function () {
-		const errors = [];
-		const id = await getDevDeviceId(err => errors.push(err));
-		assert.ok(typeof id === 'string');
-		assert.strictEqual(errors.length, 0);
+	test('generateDevDeviceId is a UUID made by the app', function () {
+		assert.match(generateDevDeviceId(), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		assert.notStrictEqual(generateDevDeviceId(), generateDevDeviceId());
 	});
 
 	test('getMac', async () => {
