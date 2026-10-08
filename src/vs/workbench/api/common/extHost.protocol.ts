@@ -205,6 +205,8 @@ export interface IRegisterDynamicAuthenticationProviderDetails extends IRegister
 	clientId: string;
 	clientSecret?: string;
 	authorizationServer: UriComponents;
+	/** The `removalCount` the window passed to `$registerDynamicAuthProvider` for this registration, returned unchanged. */
+	removalCount: number;
 }
 
 export interface MainThreadAuthenticationShape extends IDisposable {
@@ -221,7 +223,6 @@ export interface MainThreadAuthenticationShape extends IDisposable {
 	$promptForClientRegistration(authorizationServerUrl: string): Promise<{ clientId: string; clientSecret?: string } | undefined>;
 	$registerDynamicAuthenticationProvider(details: IRegisterDynamicAuthenticationProviderDetails): Promise<void>;
 	$setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void>;
-	$sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret }: { providerId: string; clientId?: string; authorizationServer?: UriComponents; label?: string; clientSecret?: string }): Promise<void>;
 }
 
 export interface MainThreadSecretStateShape extends IDisposable {
@@ -2104,7 +2105,12 @@ export interface ExtHostAuthenticationShape {
 	$removeSession(id: string, sessionId: string): Promise<void>;
 	$onDidChangeAuthenticationSessions(id: string, label: string, extensionIdFilter?: string[]): Promise<void>;
 	$onDidUnregisterAuthenticationProvider(id: string): Promise<void>;
-	$registerDynamicAuthProvider(authorizationServer: UriComponents, serverMetadata: IAuthorizationServerMetadata, resource?: IAuthorizationProtectedResourceMetadata, clientId?: string, clientSecret?: string, initialTokens?: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<string>;
+	/**
+	 * `removalCount` is the window's count of completed removals of the provider when it began the registration; the
+	 * extension host returns it in `$registerDynamicAuthenticationProvider`, and a registration begun before a completed
+	 * removal is refused there.
+	 */
+	$registerDynamicAuthProvider(authorizationServer: UriComponents, serverMetadata: IAuthorizationServerMetadata, resource: IAuthorizationProtectedResourceMetadata | undefined, clientId: string | undefined, clientSecret: string | undefined, initialTokens: (IAuthorizationTokenResponse & { created_at: number })[] | undefined, removalCount: number): Promise<string>;
 	$onDidChangeDynamicAuthProviderTokens(authProviderId: string, clientId: string, tokens?: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void>;
 }
 

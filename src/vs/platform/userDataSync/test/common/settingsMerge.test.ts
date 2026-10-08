@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
-import { addSetting, getIgnoredSettings, merge, updateIgnoredSettings } from '../../common/settingsMerge.js';
+import { addSetting, getIgnoredSettings, merge, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
 import type { IConflictSetting } from '../../common/userDataSync.js';
 
 const formattingOptions = { eol: '\n', insertSpaces: false, tabSize: 4 };
@@ -1667,6 +1667,246 @@ suite('SettingsMerge - never-synced settings (SYNC-1)', () => {
 	});
 });
 
+
+// QuantLab carry SYNC-1, c1 repair M2: a REMOTE (and base) that already holds the retired pair must not keep it. Ordinary ignored
+// settings keep the other side's value; the never-synced pair is removed from every outbound content and a remote holding it
+// receives a change that removes it.
+suite('SettingsMerge - never-synced settings already held by the remote (SYNC-1 M2)', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	const passwordSentinel = 'SENTINEL-old-not-a-real-value';
+	const emailSentinel = 'SENTINEL-old-not-a-real-address';
+	const withPair = (content: Record<string, unknown>) => stringify({ ...content, 'qic.demo.email': emailSentinel, 'qic.demo.password': passwordSentinel });
+
+	// What the workbench tombstone registration (`ignoreSync: true`) contributes to the default ignored settings.
+	const tombstoneDefaults = ['qic.demo.email', 'qic.demo.password'];
+	const ignoredVariants: { name: string; ignored: string[] }[] = [
+		{ name: 'default ignored settings', ignored: getIgnoredSettings(tombstoneDefaults, new TestConfigurationService()) },
+		{ name: 'explicit -qic.demo.* opt-back-in', ignored: getIgnoredSettings(tombstoneDefaults, new TestConfigurationService({ 'settingsSync.ignoredSettings': ['-qic.demo.password', '-qic.demo.email'] })) },
+		{ name: 'explicit +qic.demo.password entry', ignored: getIgnoredSettings(tombstoneDefaults, new TestConfigurationService({ 'settingsSync.ignoredSettings': ['+qic.demo.password'] })) },
+		{ name: 'explicit +qic.demo.password and -qic.demo.password entries', ignored: getIgnoredSettings(tombstoneDefaults, new TestConfigurationService({ 'settingsSync.ignoredSettings': ['+qic.demo.password', '-qic.demo.password', '-qic.demo.email'] })) },
+	];
+
+	function assertNoPair(content: string | null, message: string): asserts content is string {
+		assert.ok(content !== null, `${message}: the path must produce content`);
+		assert.ok(!content.includes(passwordSentinel), `${message}: qic.demo.password value is in the content`);
+		assert.ok(!content.includes(emailSentinel), `${message}: qic.demo.email value is in the content`);
+		const parsed = JSON.parse(content);
+		assert.ok(!('qic.demo.password' in parsed), `${message}: qic.demo.password key is in the content`);
+		assert.ok(!('qic.demo.email' in parsed), `${message}: qic.demo.email key is in the content`);
+	}
+
+	test('the ignored settings of every variant still list both keys', () => {
+		for (const { name, ignored } of ignoredVariants) {
+			assert.ok(ignored.includes('qic.demo.email') && ignored.includes('qic.demo.password'), name);
+		}
+	});
+
+	for (const { name, ignored } of ignoredVariants) {
+
+		test(`merge from base: remote == base holds the pair, local removed it and changed another setting [${name}]`, () => {
+			const remote = withPair({ 'a': 1 });
+			const local = stringify({ 'a': 2 });
+
+			const actual = merge(local, remote, remote, ignored, [], formattingOptions);
+
+			assertNoPair(actual.remoteContent, 'uploaded content');
+			assert.strictEqual(JSON.parse(actual.remoteContent).a, 2);
+			assert.strictEqual(actual.localContent, null);
+			assert.strictEqual(actual.hasConflicts, false);
+		});
+
+		test(`merge from base: remote holds the pair and local changed too [${name}]`, () => {
+			const base = withPair({ 'a': 1 });
+			const remote = withPair({ 'a': 1, 'b': 3 });
+			const local = stringify({ 'a': 2 });
+
+			const actual = merge(local, remote, base, ignored, [], formattingOptions);
+
+			assertNoPair(actual.remoteContent, 'uploaded content');
+			assert.deepStrictEqual(JSON.parse(actual.remoteContent), { 'a': 2, 'b': 3 });
+			assert.strictEqual(actual.hasConflicts, false);
+		});
+
+		test(`merge from base: only the remote moved and it holds the pair, so the remote gets a removal change [${name}]`, () => {
+			const base = stringify({ 'a': 1 });
+			const remote = withPair({ 'a': 1, 'b': 3 });
+			const local = stringify({ 'a': 1 });
+
+			const actual = merge(local, remote, base, ignored, [], formattingOptions);
+
+			assertNoPair(actual.remoteContent, 'uploaded content');
+			assert.deepStrictEqual(JSON.parse(actual.remoteContent), { 'a': 1, 'b': 3 });
+			assertNoPair(actual.localContent, 'local content');
+		});
+
+		test(`merge from base: nothing but the pair differs, local already lacks it, so the remote gets a removal change [${name}]`, () => {
+			const remote = withPair({ 'a': 1 });
+			const local = stringify({ 'a': 1 });
+
+			const actual = merge(local, remote, remote, ignored, [], formattingOptions);
+
+			assertNoPair(actual.remoteContent, 'uploaded content');
+			assert.deepStrictEqual(JSON.parse(actual.remoteContent), { 'a': 1 });
+		});
+
+		test(`first sync (no base): remote holds the pair and local adds a setting [${name}]`, () => {
+			const remote = withPair({ 'a': 1 });
+			const local = stringify({ 'a': 1, 'b': 2 });
+
+			const actual = merge(local, remote, null, ignored, [], formattingOptions);
+
+			assertNoPair(actual.remoteContent, 'uploaded content');
+			assert.deepStrictEqual(JSON.parse(actual.remoteContent), { 'a': 1, 'b': 2 });
+			assert.strictEqual(actual.hasConflicts, false);
+		});
+
+		test(`first sync (no base): empty local, remote holds the pair, so the remote gets a removal change [${name}]`, () => {
+			const remote = withPair({ 'a': 1 });
+
+			const actual = merge('{}', remote, null, ignored, [], formattingOptions);
+
+			assertNoPair(actual.remoteContent, 'uploaded content');
+			assert.deepStrictEqual(JSON.parse(actual.remoteContent), { 'a': 1 });
+			assertNoPair(actual.localContent, 'local content');
+		});
+
+		test(`has-remote-changed check: last synced content holds the pair and local lacks it [${name}]`, () => {
+			// settingsSync.hasRemoteChanged: merge(local, lastSync, lastSync, ...).remoteContent !== null
+			const lastSync = withPair({ 'a': 1 });
+			const local = stringify({ 'a': 1 });
+
+			const actual = merge(local, lastSync, lastSync, ignored, [], formattingOptions);
+
+			assertNoPair(actual.remoteContent, 'uploaded content');
+		});
+
+		test(`accepted preview: content about to be uploaded is rebuilt against a remote that holds the pair [${name}]`, () => {
+			// settingsSync.applyResult: content = updateIgnoredSettingsForRemote(content, <remote settings>, ignored, ...) before updateRemoteUserData
+			const remote = withPair({ 'a': 1 });
+			const preview = stringify({ 'a': 2 });
+
+			const actual = updateIgnoredSettingsForRemote(preview, remote, ignored, formattingOptions);
+
+			assertNoPair(actual, 'applyResult upload');
+			assert.deepStrictEqual(JSON.parse(actual), { 'a': 2 });
+		});
+
+		test(`accepted preview: edited content that carries the pair is scrubbed against the remote [${name}]`, () => {
+			const remote = withPair({ 'a': 1 });
+			const edited = withPair({ 'a': 2 });
+
+			const actual = updateIgnoredSettingsForRemote(edited, remote, ignored, formattingOptions);
+
+			assertNoPair(actual, 'accepted preview');
+			assert.deepStrictEqual(JSON.parse(actual), { 'a': 2 });
+		});
+
+		test(`opt-back-in read from the uploaded content itself still drops the pair [${name}]`, () => {
+			// applyResult: getIgnoredSettings(defaults, config, content) reads settingsSync.ignoredSettings from the content
+			const remote = withPair({ 'a': 1 });
+			const content = stringify({ 'a': 2, 'settingsSync.ignoredSettings': ['+qic.demo.password', '-qic.demo.password', '-qic.demo.email'] });
+			const ignoredFromContent = getIgnoredSettings(tombstoneDefaults, new TestConfigurationService(), content);
+
+			assertNoPair(updateIgnoredSettingsForRemote(content, remote, ignoredFromContent, formattingOptions), 'applyResult upload');
+		});
+	}
+
+	test('an ordinary ignored setting keeps the remote value (established behaviour, unchanged)', () => {
+		const ignored = getIgnoredSettings([...tombstoneDefaults, 'ordinary.ignored'], new TestConfigurationService());
+		const remote = stringify({ 'a': 1, 'ordinary.ignored': 'remote-value' });
+		const local = stringify({ 'a': 2, 'ordinary.ignored': 'local-value' });
+
+		const merged = merge(local, remote, remote, ignored, [], formattingOptions);
+		assert.ok(merged.remoteContent !== null);
+		assert.deepStrictEqual(JSON.parse(merged.remoteContent), { 'a': 2, 'ordinary.ignored': 'remote-value' });
+
+		assert.deepStrictEqual(JSON.parse(updateIgnoredSettings(local, remote, ignored, formattingOptions)), { 'a': 2, 'ordinary.ignored': 'remote-value' });
+	});
+
+	test('an ordinary ignored setting keeps the remote value while the pair is removed', () => {
+		const ignored = getIgnoredSettings([...tombstoneDefaults, 'ordinary.ignored'], new TestConfigurationService());
+		const remote = withPair({ 'a': 1, 'ordinary.ignored': 'remote-value' });
+		const local = stringify({ 'a': 2, 'ordinary.ignored': 'local-value' });
+
+		const merged = merge(local, remote, remote, ignored, [], formattingOptions);
+		assertNoPair(merged.remoteContent, 'uploaded content');
+		assert.deepStrictEqual(JSON.parse(merged.remoteContent), { 'a': 2, 'ordinary.ignored': 'remote-value' });
+
+		const rebuilt = updateIgnoredSettingsForRemote(local, remote, ignored, formattingOptions);
+		assertNoPair(rebuilt, 'applyResult upload');
+		assert.deepStrictEqual(JSON.parse(rebuilt), { 'a': 2, 'ordinary.ignored': 'remote-value' });
+	});
+});
+
+
+// QuantLab carry SYNC-1, c1 repair M2 (run 8, settingsResource row a6): content built for the LOCAL file keeps the local
+// values of the never-synced pair and never takes the other side's (profile import, accept-remote, a merge that only the
+// remote moved), whatever ignored-settings list the caller passes.
+suite('SettingsMerge - never-synced settings in local-bound content (SYNC-1 M2)', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	const remotePair = { 'qic.demo.email': 'SENTINEL-remote-not-a-real-address', 'qic.demo.password': 'SENTINEL-remote-not-a-real-value' };
+	const localPair = { 'qic.demo.email': 'SENTINEL-local-not-a-real-address', 'qic.demo.password': 'SENTINEL-local-not-a-real-value' };
+
+	const tombstoneDefaults = ['qic.demo.email', 'qic.demo.password'];
+	const ignoredVariants: { name: string; ignored: string[] }[] = [
+		{ name: 'default ignored settings', ignored: getIgnoredSettings(tombstoneDefaults, new TestConfigurationService()) },
+		{ name: 'explicit -qic.demo.* opt-back-in', ignored: getIgnoredSettings(tombstoneDefaults, new TestConfigurationService({ 'settingsSync.ignoredSettings': ['-qic.demo.password', '-qic.demo.email'] })) },
+		{ name: 'an ignored list without the pair', ignored: [] },
+	];
+
+	for (const { name, ignored } of ignoredVariants) {
+
+		test(`rebuilt for the local file: the local values of the pair are kept, the remote ones are not taken [${name}]`, () => {
+			// settingsSync.getAcceptResult (accept remote) and settingsResource.apply (profile import):
+			// updateIgnoredSettings(<incoming content>, <local file content>, ...)
+			const incoming = stringify({ 'a': 1, ...remotePair });
+			const local = stringify({ 'b': 2, ...localPair });
+
+			const actual = updateIgnoredSettings(incoming, local, ignored, formattingOptions);
+
+			assert.deepStrictEqual(JSON.parse(actual), { 'a': 1, ...localPair });
+		});
+
+		test(`rebuilt for the local file: a local file without the pair does not receive the remote one [${name}]`, () => {
+			const incoming = stringify({ 'a': 1, ...remotePair });
+			const local = stringify({ 'b': 2 });
+
+			const actual = updateIgnoredSettings(incoming, local, ignored, formattingOptions);
+
+			assert.deepStrictEqual(JSON.parse(actual), { 'a': 1 });
+		});
+
+		test(`merge where only the remote moved: local keeps its pair, the remote gets a removal change [${name}]`, () => {
+			const base = stringify({ 'a': 1 });
+			const remote = stringify({ 'a': 1, 'b': 3, ...remotePair });
+			const local = stringify({ 'a': 1, ...localPair });
+
+			const actual = merge(local, remote, base, ignored, [], formattingOptions);
+
+			assert.ok(actual.localContent !== null);
+			assert.deepStrictEqual(JSON.parse(actual.localContent), { 'a': 1, 'b': 3, ...localPair });
+			assert.ok(actual.remoteContent !== null);
+			assert.deepStrictEqual(JSON.parse(actual.remoteContent), { 'a': 1, 'b': 3 });
+		});
+
+		test(`merge where both moved: local keeps its pair, the upload holds none [${name}]`, () => {
+			const base = stringify({ 'a': 1, ...remotePair });
+			const remote = stringify({ 'a': 1, 'b': 3, ...remotePair });
+			const local = stringify({ 'a': 2, ...localPair });
+
+			const actual = merge(local, remote, base, ignored, [], formattingOptions);
+
+			assert.ok(actual.localContent !== null);
+			assert.deepStrictEqual(JSON.parse(actual.localContent), { 'a': 2, 'b': 3, ...localPair });
+			assert.ok(actual.remoteContent !== null);
+			assert.deepStrictEqual(JSON.parse(actual.remoteContent), { 'a': 2, 'b': 3 });
+		});
+	}
+});
 
 function stringify(value: any): string {
 	return JSON.stringify(value, null, '\t');

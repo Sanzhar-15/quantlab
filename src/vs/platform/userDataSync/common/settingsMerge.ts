@@ -25,6 +25,12 @@ export interface IMergeResult {
  * content. `qic.demo.email` and `qic.demo.password` were registered by a contribution that no longer exists, so a
  * value left in a user's settings.json must not be synced. They are appended AFTER the user's `-key` opt-back-in
  * entries in {@link getIgnoredSettings}, so no `settingsSync.ignoredSettings` entry can bring them back.
+ *
+ * They never cross the boundary in either direction. Outbound: content built to leave this machine
+ * ({@link updateIgnoredSettingsForRemote} and every `remoteContent` of {@link merge}) holds neither key, whatever the
+ * remote, the base or the ignored-settings list say, and a remote that still holds them receives a change that
+ * removes them. Local-bound: content built for the local file ({@link updateIgnoredSettings} with the local content
+ * as source, every `localContent` of {@link merge}) keeps the local values and never takes the other side's.
  * Remove this list after the first user-facing release that includes QuantLab.
  */
 export const NEVER_SYNCED_SETTINGS: readonly string[] = Object.freeze(['qic.demo.email', 'qic.demo.password']);
@@ -76,7 +82,40 @@ export function removeComments(content: string, formattingOptions: FormattingOpt
 	return result;
 }
 
+function holdsNeverSyncedSettings(content: string): boolean {
+	const parsed = parse(content);
+	return !!parsed && NEVER_SYNCED_SETTINGS.some(key => parsed[key] !== undefined);
+}
+
+function neverSyncedSettingsHeld(targetContent: string, sourceContent: string): string[] {
+	const target = parse(targetContent);
+	const source = parse(sourceContent);
+	return NEVER_SYNCED_SETTINGS.filter(key => (!!target && target[key] !== undefined) || (!!source && source[key] !== undefined));
+}
+
+function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions): string {
+	const parsed = parse(content);
+	if (!parsed) {
+		return content;
+	}
+	for (const key of NEVER_SYNCED_SETTINGS) {
+		if (parsed[key] !== undefined) {
+			content = contentUtil.edit(content, [key], undefined, formattingOptions);
+		}
+	}
+	return content;
+}
+
+/**
+ * Ignored settings take the value they have in `sourceContent` (or are removed when the source lacks them). Each
+ * {@link NEVER_SYNCED_SETTINGS} key is among them exactly when either side holds it, whatever list the caller passed, so
+ * content where neither side holds the pair is rebuilt as the ordinary ignored settings alone rebuild it. Built for the
+ * local file with the local content as source, the result keeps the local values; built with `'{}'` as source, it holds
+ * none. Content that leaves this machine and is rebuilt against the remote is built with
+ * {@link updateIgnoredSettingsForRemote}.
+ */
 export function updateIgnoredSettings(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
+	ignoredSettings = distinct([...ignoredSettings.filter(key => !NEVER_SYNCED_SETTINGS.includes(key)), ...neverSyncedSettingsHeld(targetContent, sourceContent)]);
 	if (ignoredSettings.length) {
 		const sourceTree = parseSettings(sourceContent);
 		const source = parse(sourceContent) || {};
@@ -110,9 +149,23 @@ export function updateIgnoredSettings(targetContent: string, sourceContent: stri
 	return targetContent;
 }
 
+/**
+ * Outbound content (it leaves this machine): {@link updateIgnoredSettings}, then {@link NEVER_SYNCED_SETTINGS} are removed
+ * whatever `sourceContent` holds, so a remote that holds them never has them copied back into an upload.
+ */
+export function updateIgnoredSettingsForRemote(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
+	return removeNeverSyncedSettings(updateIgnoredSettings(targetContent, sourceContent, ignoredSettings, formattingOptions), formattingOptions);
+}
+
 export function merge(originalLocalContent: string, originalRemoteContent: string, baseContent: string | null, ignoredSettings: string[], resolvedConflicts: { key: string; value: any | undefined }[], formattingOptions: FormattingOptions): IMergeResult {
 
-	const localContentWithoutIgnoredSettings = updateIgnoredSettings(originalLocalContent, originalRemoteContent, ignoredSettings, formattingOptions);
+	// NEVER_SYNCED_SETTINGS are ignored by every merge, whatever list the caller passed.
+	ignoredSettings = distinct([...ignoredSettings, ...NEVER_SYNCED_SETTINGS]);
+	// A remote that holds them must receive a change that removes them, even when nothing else differs.
+	const remoteHoldsNeverSynced = holdsNeverSyncedSettings(originalRemoteContent);
+
+	// Outbound: it is compared with the base (the last uploaded content) and uploaded as is when only local moved.
+	const localContentWithoutIgnoredSettings = updateIgnoredSettingsForRemote(originalLocalContent, originalRemoteContent, ignoredSettings, formattingOptions);
 	const localForwarded = baseContent !== localContentWithoutIgnoredSettings;
 	const remoteForwarded = baseContent !== originalRemoteContent;
 
@@ -128,13 +181,18 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 
 	/* remote has changed and local has not */
 	if (remoteForwarded && !localForwarded) {
-		return { conflictsSettings: [], localContent: updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions), remoteContent: null, hasConflicts: false };
+		return {
+			conflictsSettings: [],
+			localContent: updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions),
+			remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions) : null,
+			hasConflicts: false
+		};
 	}
 
 	/* local is empty and not synced before */
 	if (baseContent === null && isEmpty(originalLocalContent)) {
 		const localContent = areSame(originalLocalContent, originalRemoteContent, ignoredSettings) ? null : updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions);
-		return { conflictsSettings: [], localContent, remoteContent: null, hasConflicts: false };
+		return { conflictsSettings: [], localContent, remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions) : null, hasConflicts: false };
 	}
 
 	/* remote and local has changed */
@@ -252,6 +310,8 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 			localContent = addSetting(key, remoteContent, localContent, formattingOptions);
 		}
 	}
+
+	remoteContent = removeNeverSyncedSettings(remoteContent, formattingOptions);
 
 	const hasConflicts = conflicts.size > 0 || !areSame(localContent, remoteContent, ignoredSettings);
 	const hasLocalChanged = hasConflicts || !areSame(localContent, originalLocalContent, []);

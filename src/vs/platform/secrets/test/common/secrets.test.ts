@@ -9,7 +9,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { IEncryptionService, KnownStorageProvider } from '../../../encryption/common/encryptionService.js';
 import { transformErrorForSerialization } from '../../../../base/common/errors.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { BaseSecretStorageService, SecretDecryptionCause, SecretDecryptionError, SecretEncryptionCause, SecretEncryptionError } from '../../common/secrets.js';
+import { BaseSecretStorageService, REDACTED_SECRET_KEY, SecretDecryptionCause, SecretDecryptionError, SecretEncryptionCause, SecretEncryptionError, SecretStorageUnavailableError } from '../../common/secrets.js';
 import { InMemoryStorageService, StorageScope, StorageTarget } from '../../../storage/common/storage.js';
 
 class TestEncryptionService implements IEncryptionService {
@@ -341,6 +341,42 @@ suite('secrets', () => {
 			}
 		}
 
+		// F-SECRETS-6 (W-ORCH): the unqueued write (F-SECRETS-3, NativeSecretStorageService.set) follows the same rule. This
+		// changes F-SECRETS-3's behaviour: it logged the failure's name and rethrew the raw error.
+		class UnqueuedWriter extends BaseSecretStorageService {
+			write(key: string, value: string): Promise<void> {
+				return this.writeUnqueued(key, value);
+			}
+		}
+
+		for (const { label, make } of failures) {
+			test(`the unqueued write rejects SecretEncryptionError and leaks nothing of ${label}`, async () => {
+				const failure = make();
+				const encryptionService = new TestEncryptionService();
+				const storageService = store.add(new InMemoryStorageService());
+				const logService = store.add(new CapturingLogService());
+				const writer = store.add(new UnqueuedWriter(false, storageService, encryptionService, logService));
+				sinon.stub(encryptionService, 'encrypt').callsFake(() => Promise.reject(failure));
+				logService.calls.length = 0;
+
+				const rejection = await writer.write('my-secret', 'my-secret-value').then(() => undefined, e => e);
+
+				assert.ok(rejection instanceof SecretEncryptionError, `rejected with ${deepText(rejection)}`);
+				assert.notStrictEqual(rejection, failure, 'the rejection is not the raw error');
+				assert.strictEqual(rejection.key, 'my-secret');
+				assert.ok(rejection.cause instanceof SecretEncryptionCause && rejection.cause.kind === 'encryption-service');
+				assert.ok(!deepText(rejection).includes(marker), 'message, stack, cause chain');
+				assert.ok(logService.calls.some(args => args.some(arg => arg instanceof SecretEncryptionError)), 'the failure is logged as the named error');
+				let markers = 0;
+				for (const args of logService.calls) {
+					assert.ok(!args.includes(failure), 'the raw error is not a log argument');
+					markers += deepText(args).split(marker).length - 1;
+				}
+				assert.strictEqual(markers, 0, 'no marker in any log call');
+				assert.strictEqual(storageService.get('secret://my-secret', StorageScope.APPLICATION), undefined, 'nothing is stored');
+			});
+		}
+
 		test('an error built without a failure has no cause', () => {
 			assert.strictEqual(new SecretEncryptionError('my-secret').cause, undefined);
 			assert.strictEqual(new SecretEncryptionError('my-secret').name, 'SecretEncryptionError');
@@ -348,43 +384,75 @@ suite('secrets', () => {
 	});
 
 	suite('BaseSecretStorageService useInMemoryStorage=false, encryption not available', () => {
-		let service: BaseSecretStorageService;
-		let spyNoEncryptionService: sinon.SinonSpiedInstance<TestEncryptionService>;
-		let sandbox: sinon.SinonSandbox;
+		// F-SECRETS-3: no fallback to an in-memory store. Every call rejects, named; the persisted secrets are kept; the failure
+		// is not remembered, so the persisted secret is read once encryption is available.
+		class RecordingLogService extends NullLogService {
+			readonly errors: string[] = [];
+			override error(message: string | Error, ...args: unknown[]): void {
+				this.errors.push([String(message), ...args.map(arg => String(arg))].join(' '));
+			}
+		}
 
-		setup(() => {
-			sandbox = sinon.createSandbox();
-			spyNoEncryptionService = sandbox.spy(new TestNoEncryptionService());
-			service = store.add(new BaseSecretStorageService(
-				false,
-				store.add(new InMemoryStorageService()),
-				spyNoEncryptionService,
-				store.add(new NullLogService()))
-			);
+		function snapshot(storageService: InMemoryStorageService): [string, string | undefined][] {
+			return storageService.keys(StorageScope.APPLICATION, StorageTarget.MACHINE).sort().map(key => [key, storageService.get(key, StorageScope.APPLICATION)]);
+		}
+
+		function isUnavailable(e: unknown): boolean {
+			assert.ok(e instanceof SecretStorageUnavailableError, `expected SecretStorageUnavailableError, got ${e}`);
+			assert.strictEqual(e.name, 'SecretStorageUnavailableError');
+			assert.ok(!e.message.includes('my-secret-value') && !e.message.includes('encrypted+'), 'the error carries no secret');
+			return true;
+		}
+
+		test('every call rejects named, the persisted secret stays byte-identical, and it is read once encryption is available', async () => {
+			const encryptionService = new TestEncryptionService();
+			const storageService = store.add(new InMemoryStorageService());
+			storageService.store('secret://my-secret', 'encrypted+my-secret-value', StorageScope.APPLICATION, StorageTarget.MACHINE);
+			const before = snapshot(storageService);
+			const logService = store.add(new RecordingLogService());
+			const available = sinon.stub(encryptionService, 'isEncryptionAvailable').resolves(false);
+			const encrypt = sinon.spy(encryptionService, 'encrypt');
+			const decrypt = sinon.spy(encryptionService, 'decrypt');
+			const service = store.add(new BaseSecretStorageService(false, storageService, encryptionService, logService));
+
+			await assert.rejects(service.get('my-secret'), isUnavailable);
+			await assert.rejects(service.set('my-secret', 'replacement-value'), isUnavailable);
+			await assert.rejects(service.set('other-secret', 'other-value'), isUnavailable);
+			await assert.rejects(service.delete('my-secret'), isUnavailable);
+			await assert.rejects(service.keys(), isUnavailable);
+
+			assert.deepStrictEqual(snapshot(storageService), before, 'the persisted storage is byte-identical');
+			assert.notStrictEqual(service.type, 'in-memory');
+			assert.strictEqual(encrypt.callCount, 0);
+			assert.strictEqual(decrypt.callCount, 0);
+			assert.strictEqual(available.callCount, 5, 'a failed initialization is not remembered: every call checks again');
+			assert.strictEqual(logService.errors.length, 5, 'one error line per failed call');
+			for (const line of logService.errors) {
+				assert.ok(line.includes('Secret storage is unavailable') && !line.includes('my-secret-value'), line);
+			}
+
+			available.resolves(true);
+			assert.strictEqual(await service.get('my-secret'), 'my-secret-value');
+			assert.strictEqual(service.type, 'persisted');
+			assert.strictEqual(await service.get('other-secret'), undefined, 'nothing written while unavailable is held anywhere');
+			assert.deepStrictEqual(snapshot(storageService), before);
+			encrypt.restore();
+			decrypt.restore();
+			available.restore();
 		});
 
-		teardown(() => {
-			sandbox.restore();
-		});
+		test('in-memory mode is unchanged: it never consults encryption and keeps secrets in memory only', async () => {
+			const encryptionService = new TestNoEncryptionService();
+			const available = sinon.spy(encryptionService, 'isEncryptionAvailable');
+			const storageService = store.add(new InMemoryStorageService());
+			const service = store.add(new BaseSecretStorageService(true, storageService, encryptionService, store.add(new NullLogService())));
 
-		test('type', async () => {
-			assert.strictEqual(service.type, 'unknown');
-			// trigger lazy initialization
 			await service.set('my-secret', 'my-secret-value');
-
+			assert.strictEqual(await service.get('my-secret'), 'my-secret-value');
 			assert.strictEqual(service.type, 'in-memory');
-		});
-
-		test('set and get', async () => {
-			const key = 'my-secret';
-			const value = 'my-secret-value';
-			await service.set(key, value);
-			const result = await service.get(key);
-			assert.strictEqual(result, value);
-
-			// Additionally ensure the encryptionservice was not used
-			assert.strictEqual(spyNoEncryptionService.encrypt.callCount, 0);
-			assert.strictEqual(spyNoEncryptionService.decrypt.callCount, 0);
+			assert.strictEqual(available.callCount, 0);
+			assert.deepStrictEqual(snapshot(storageService), [], 'the persisted storage is not written');
+			available.restore();
 		});
 	});
 
@@ -513,6 +581,83 @@ suite('secrets', () => {
 			const error = new SecretDecryptionError('my-secret');
 			assert.strictEqual(error.cause, undefined);
 			assert.strictEqual(error.name, 'SecretDecryptionError');
+		});
+	});
+
+	// QL-G-LOGIN-SECRETS review c1 M3 (W-ORCH item): a key built from a server-provided string (a dynamic authentication
+	// provider's issuer URL) can hold a credential in its user info, path or query. No log line at any level and no error
+	// property carries such a key; storage keeps the key itself.
+	suite('a credential-bearing key reaches no log argument or error property', () => {
+		const USERINFO = 'MARK-KEY-USERINFO-71d3';
+		const PATH = 'MARK-KEY-PATH-28fa';
+		const QUERY = 'MARK-KEY-QUERY-c94e';
+		const MARKERS = [USERINFO, PATH, QUERY];
+		const KEY = JSON.stringify({ isDynamicAuthProvider: true, authProviderId: `https://user:${USERINFO}@issuer.example/${PATH}?key=${QUERY}`, clientId: 'client-1' });
+
+		class RecordingLogService extends NullLogService {
+			readonly args: unknown[][] = [];
+			override trace(...args: unknown[]): void { this.args.push(args); }
+			override debug(...args: unknown[]): void { this.args.push(args); }
+			override info(...args: unknown[]): void { this.args.push(args); }
+			override warn(...args: unknown[]): void { this.args.push(args); }
+			override error(...args: unknown[]): void { this.args.push(args); }
+		}
+
+		/** Every string reachable from a value: an Error contributes its name, message, stack, own properties and causes. */
+		function collectStrings(value: unknown, out: string[] = [], seen = new Set<unknown>()): string[] {
+			if (typeof value === 'string') {
+				out.push(value);
+			} else if (typeof value !== 'object' && typeof value !== 'function' || value === null) {
+				out.push(String(value));
+			} else if (!seen.has(value)) {
+				seen.add(value);
+				if (value instanceof Error) {
+					out.push(value.name, value.message, value.stack ?? '', JSON.stringify(transformErrorForSerialization(value)));
+					collectStrings(value.cause, out, seen);
+				}
+				for (const key of Object.getOwnPropertyNames(value)) {
+					collectStrings((value as Record<string, unknown>)[key], out, seen);
+				}
+			}
+			return out;
+		}
+
+		function assertNoMarker(what: string, value: unknown): void {
+			for (const text of collectStrings(value)) {
+				for (const marker of MARKERS) {
+					assert.ok(!text.includes(marker), `${what}: a marker (${marker}) reached it: ${text}`);
+				}
+			}
+		}
+
+		test('set, get, a failed decryption, delete and the change notification, at trace level', async () => {
+			const logService = store.add(new RecordingLogService());
+			const encryptionService = new TestEncryptionService();
+			const storageService = store.add(new InMemoryStorageService());
+			const service = store.add(new BaseSecretStorageService(false, storageService, encryptionService, logService));
+			const changed: string[] = [];
+			store.add(service.onDidChangeSecret(key => changed.push(key)));
+
+			await service.set(KEY, 'value');
+			assert.strictEqual(await service.get(KEY), 'value');
+			const decrypt = sinon.stub(encryptionService, 'decrypt').callsFake(() => Promise.reject(new Error('keychain refused')));
+			let failure: unknown;
+			try {
+				await service.get(KEY);
+			} catch (e) {
+				failure = e;
+			}
+			decrypt.restore();
+			await service.delete(KEY);
+
+			assertNoMarker('the log arguments', logService.args);
+			assert.ok(failure instanceof SecretDecryptionError, `expected SecretDecryptionError, got ${failure}`);
+			assertNoMarker('the rejected error', failure);
+			assert.strictEqual(failure.key, REDACTED_SECRET_KEY);
+			assert.ok(logService.args.some(args => args[0] === '[secrets] getting secret for key:' && args[1] === `secret://${REDACTED_SECRET_KEY}`), JSON.stringify(logService.args));
+			// Storage and the change event keep the key itself: only its diagnostic form is redacted.
+			assert.deepStrictEqual(changed, [KEY, KEY], 'the change event names the key itself');
+			assert.deepStrictEqual(await service.keys(), []);
 		});
 	});
 });

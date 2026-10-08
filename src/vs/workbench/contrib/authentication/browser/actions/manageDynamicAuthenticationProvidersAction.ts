@@ -7,12 +7,12 @@ import { localize, localize2 } from '../../../../../nls.js';
 import { Action2 } from '../../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { IQuickInputService, IQuickPickItem } from '../../../../../platform/quickinput/common/quickInput.js';
-import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderInfo } from '../../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
+import { IDynamicAuthenticationProviderStorageService, DynamicAuthenticationProviderCleanupInfo } from '../../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { IAuthenticationService } from '../../../../services/authentication/common/authentication.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 
 interface IDynamicProviderQuickPickItem extends IQuickPickItem {
-	provider: DynamicAuthenticationProviderInfo;
+	provider: DynamicAuthenticationProviderCleanupInfo;
 }
 
 export class RemoveDynamicAuthenticationProvidersAction extends Action2 {
@@ -34,9 +34,10 @@ export class RemoveDynamicAuthenticationProvidersAction extends Action2 {
 		const authenticationService = accessor.get(IAuthenticationService);
 		const dialogService = accessor.get(IDialogService);
 
-		const interactedProviders = dynamicAuthStorageService.getInteractedProviders();
+		// Every provider whose stored data may exist, including one whose registration was written but not committed.
+		const removableProviders = dynamicAuthStorageService.getRemovableProviders();
 
-		if (interactedProviders.length === 0) {
+		if (removableProviders.length === 0) {
 			await dialogService.info(
 				localize('noDynamicProviders', 'No dynamic authentication providers'),
 				localize('noDynamicProvidersDetail', 'No dynamic authentication providers have been used yet.')
@@ -44,9 +45,9 @@ export class RemoveDynamicAuthenticationProvidersAction extends Action2 {
 			return;
 		}
 
-		const items: IDynamicProviderQuickPickItem[] = interactedProviders.map(provider => ({
+		const items: IDynamicProviderQuickPickItem[] = removableProviders.map(provider => ({
 			label: provider.label,
-			description: localize('clientId', 'Client ID: {0}', provider.clientId),
+			description: localize('clientId', 'Client ID: {0}', provider.clientIds.join(', ')),
 			provider
 		}));
 
@@ -80,13 +81,17 @@ export class RemoveDynamicAuthenticationProvidersAction extends Action2 {
 		for (const item of selected) {
 			const providerId = item.provider.providerId;
 
-			// Unregister from authentication service if still registered
-			if (authenticationService.isAuthenticationProviderRegistered(providerId)) {
-				authenticationService.unregisterAuthenticationProvider(providerId);
-			}
-
-			// Remove from dynamic storage service
-			await dynamicAuthStorageService.removeDynamicProvider(providerId);
+			// Remove from dynamic storage service first: a stored list that cannot be read (for example changed while the
+			// confirmation was open) or a removal that cannot be saved rejects here, and the provider stays registered and usable.
+			// Once it resolves, a session write from an operation of the provider that is still pending (a refresh, a sign-in)
+			// is rejected by the storage service, so it recreates no stored session and returns no usable credential.
+			// The provider is unregistered, if still registered, only once its stored data is removed, in the same step that
+			// completes the removal: a registration that begins after the removal is not unregistered by it.
+			await dynamicAuthStorageService.removeDynamicProvider(providerId, () => {
+				if (authenticationService.isAuthenticationProviderRegistered(providerId)) {
+					authenticationService.unregisterAuthenticationProvider(providerId);
+				}
+			});
 		}
 	}
 }

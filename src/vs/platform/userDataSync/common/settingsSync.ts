@@ -20,7 +20,7 @@ import { ITelemetryService } from '../../telemetry/common/telemetry.js';
 import { IUriIdentityService } from '../../uriIdentity/common/uriIdentity.js';
 import { IUserDataProfile, IUserDataProfilesService } from '../../userDataProfile/common/userDataProfile.js';
 import { AbstractInitializer, AbstractJsonFileSynchroniser, IAcceptResult, IFileResourcePreview, IMergeResult } from './abstractSynchronizer.js';
-import { getIgnoredSettings, isEmpty, merge, updateIgnoredSettings } from './settingsMerge.js';
+import { getIgnoredSettings, isEmpty, merge, updateIgnoredSettings, updateIgnoredSettingsForRemote } from './settingsMerge.js';
 import { Change, IRemoteUserData, IUserDataSyncLocalStoreService, IUserDataSyncConfiguration, IUserDataSynchroniser, IUserDataSyncLogService, IUserDataSyncEnablementService, IUserDataSyncStoreService, IUserDataSyncUtilService, SyncResource, UserDataSyncError, UserDataSyncErrorCode, USER_DATA_SYNC_CONFIGURATION_SCOPE, USER_DATA_SYNC_SCHEME, getIgnoredSettingsForExtension, IUserData } from './userDataSync.js';
 
 interface ISettingsResourcePreview extends IFileResourcePreview {
@@ -242,10 +242,10 @@ export class SettingsSynchroniser extends AbstractJsonFileSynchroniser implement
 
 		if (remoteChange !== Change.None) {
 			const formatUtils = await this.getFormattingOptions();
-			// Update ignored settings from remote
+			// Update ignored settings from remote (never-synced settings are removed: this content is uploaded)
 			const remoteSettingsSyncContent = this.getSettingsSyncContent(remoteUserData);
 			const ignoredSettings = await this.getIgnoredSettings(content);
-			content = updateIgnoredSettings(content, remoteSettingsSyncContent ? remoteSettingsSyncContent.settings : '{}', ignoredSettings, formatUtils);
+			content = updateIgnoredSettingsForRemote(content, remoteSettingsSyncContent ? remoteSettingsSyncContent.settings : '{}', ignoredSettings, formatUtils);
 			this.logService.trace(`${this.syncResourceLogLabel}: Updating remote settings...`);
 			remoteUserData = await this.updateRemoteUserData(JSON.stringify(this.toSettingsSyncContent(content)), force ? null : remoteUserData.ref);
 			this.logService.info(`${this.syncResourceLogLabel}: Updated remote settings`);

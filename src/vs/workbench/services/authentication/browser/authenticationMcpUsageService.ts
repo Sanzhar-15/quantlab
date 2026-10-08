@@ -8,6 +8,7 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { authProviderIdForDiagnostics } from './dynamicAuthenticationProviderStorageService.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IAuthenticationService } from '../common/authentication.js';
@@ -151,8 +152,10 @@ export class AuthenticationMcpUsageService extends Disposable implements IAuthen
 					this._mcpServersUsingAuth.add(u.mcpServerId);
 				}
 			}
-		} catch (e) {
-			this._logService.error(e);
+		} catch {
+			// Neither the id (a dynamic provider's id is its issuer string, which can hold a credential) nor the caught value
+			// (foreign text) is logged: the diagnostic identity and a fixed category.
+			this._logService.error(`Could not read the accounts of provider ${authProviderIdForDiagnostics(providerId)} for the usage cache (details not logged)`);
 		}
 	}
 }

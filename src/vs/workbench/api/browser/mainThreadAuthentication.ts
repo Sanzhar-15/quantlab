@@ -26,6 +26,7 @@ import { IURLService } from '../../../platform/url/common/url.js';
 import { DeferredPromise, raceTimeout } from '../../../base/common/async.js';
 import { IAuthorizationTokenResponse } from '../../../base/common/oauth.js';
 import { IDynamicAuthenticationProviderStorageService } from '../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
+import { authProviderIdForDiagnostics, DynamicAuthProviderRemovedError } from '../../services/authentication/browser/dynamicAuthenticationProviderStorageService.js';
 import { IClipboardService } from '../../../platform/clipboard/common/clipboardService.js';
 import { IQuickInputService } from '../../../platform/quickinput/common/quickInput.js';
 import { IProductService } from '../../../platform/product/common/productService.js';
@@ -157,6 +158,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			create: async (authorizationServer, serverMetadata, resource) => {
 				// Auth Provider Id is a combination of the authorization server and the resource, if provided.
 				const authProviderId = resource ? `${authorizationServer.toString(true)} ${resource.resource}` : authorizationServer.toString(true);
+				// Read before anything stored: a removal that completes after this refuses the registration when it is saved.
+				const removalCount = this.dynamicAuthProviderStorageService.getRemovalCount(authProviderId);
 				const clientDetails = await this.dynamicAuthProviderStorageService.getClientRegistration(authProviderId);
 				let clientId = clientDetails?.clientId;
 				const clientSecret = clientDetails?.clientSecret;
@@ -174,7 +177,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 					resource,
 					clientId,
 					clientSecret,
-					initialTokens
+					initialTokens,
+					removalCount
 				);
 			}
 		}));
@@ -183,13 +187,16 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 	async $registerAuthenticationProvider({ id, label, supportsMultipleAccounts, resourceServer, supportedAuthorizationServers, supportsChallenges }: IRegisterAuthenticationProviderDetails): Promise<void> {
 		if (!this.authenticationService.declaredProviders.find(p => p.id === id)) {
 			// If telemetry shows that this is not happening much, we can instead throw an error here.
-			this.logService.warn(`Authentication provider ${id} was not declared in the Extension Manifest.`);
+			// A dynamic provider is never declared, and its id is its issuer string, which can hold a credential: the log line
+			// and the telemetry event carry the diagnostic identity.
+			const diagnosticId = authProviderIdForDiagnostics(id);
+			this.logService.warn(`Authentication provider ${diagnosticId} was not declared in the Extension Manifest.`);
 			type AuthProviderNotDeclaredClassification = {
 				owner: 'TylerLeonhardt';
 				comment: 'An authentication provider was not declared in the Extension Manifest.';
 				id: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The provider id.' };
 			};
-			this.telemetryService.publicLog2<{ id: string }, AuthProviderNotDeclaredClassification>('authentication.providerNotDeclared', { id });
+			this.telemetryService.publicLog2<{ id: string }, AuthProviderNotDeclaredClassification>('authentication.providerNotDeclared', { id: diagnosticId });
 		}
 		const emitter = new Emitter<AuthenticationSessionsChangeEvent>();
 		this._registrations.set(id, emitter);
@@ -287,6 +294,14 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 	}
 
 	async $registerDynamicAuthenticationProvider(details: IRegisterDynamicAuthenticationProviderDetails): Promise<void> {
+		// Validated and saved before it is published: a stored list that cannot be read, or a registration that cannot be
+		// saved, rejects here, and no provider is registered. The extension host publishes its side only after this resolves.
+		// A registration begun before a removal of the provider completed is refused by the save; one whose save completed
+		// before a removal that has completed since is refused here, so a removed provider is not published.
+		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label, details.removalCount);
+		if (this.dynamicAuthProviderStorageService.getRemovalCount(details.id) !== details.removalCount) {
+			throw new DynamicAuthProviderRemovedError();
+		}
 		await this.$registerAuthenticationProvider({
 			id: details.id,
 			label: details.label,
@@ -294,28 +309,10 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			supportedAuthorizationServers: [details.authorizationServer],
 			resourceServer: details.resourceServer,
 		});
-		await this.dynamicAuthProviderStorageService.storeClientRegistration(details.id, URI.revive(details.authorizationServer).toString(true), details.clientId, details.clientSecret, details.label);
 	}
 
 	async $setSessionsForDynamicAuthProvider(authProviderId: string, clientId: string, sessions: (IAuthorizationTokenResponse & { created_at: number })[]): Promise<void> {
 		await this.dynamicAuthProviderStorageService.setSessionsForDynamicAuthProvider(authProviderId, clientId, sessions);
-	}
-
-	async $sendDidChangeDynamicProviderInfo({ providerId, clientId, authorizationServer, label, clientSecret }: Partial<{ providerId: string; clientId: string; authorizationServer: UriComponents; label: string; clientSecret: string }>): Promise<void> {
-		this.logService.info(`Client ID for authentication provider ${providerId} changed to ${clientId}`);
-		const existing = this.dynamicAuthProviderStorageService.getInteractedProviders().find(p => p.providerId === providerId);
-		if (!existing) {
-			throw new Error(`Dynamic authentication provider ${providerId} not found. Has it been registered?`);
-		}
-
-		// Store client credentials together
-		await this.dynamicAuthProviderStorageService.storeClientRegistration(
-			providerId || existing.providerId,
-			authorizationServer ? URI.revive(authorizationServer).toString(true) : existing.authorizationServer,
-			clientId || existing.clientId,
-			clientSecret,
-			label || existing.label
-		);
 	}
 
 	private async loginPrompt(provider: IAuthenticationProvider, extensionName: string, recreatingSession: boolean, options?: AuthenticationInteractiveOptions): Promise<boolean> {
@@ -546,7 +543,8 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 			extensionId: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The extension id.' };
 			providerId: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The provider id.' };
 		};
-		this.telemetryService.publicLog2<{ extensionId: string; providerId: string }, AuthProviderUsageClassification>('authentication.providerUsage', { providerId, extensionId });
+		// The diagnostic identity: a dynamic provider's id is its issuer string, which can hold a credential.
+		this.telemetryService.publicLog2<{ extensionId: string; providerId: string }, AuthProviderUsageClassification>('authentication.providerUsage', { providerId: authProviderIdForDiagnostics(providerId), extensionId });
 	}
 
 	//#region Account Preferences

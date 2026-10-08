@@ -23,7 +23,6 @@ import { IAuthenticationMcpAccessService } from '../../services/authentication/b
 import { IAuthenticationMcpService } from '../../services/authentication/browser/authenticationMcpService.js';
 import { IAuthenticationMcpUsageService } from '../../services/authentication/browser/authenticationMcpUsageService.js';
 import { AuthenticationSession, AuthenticationSessionAccount, IAuthenticationService } from '../../services/authentication/common/authentication.js';
-import { IDynamicAuthenticationProviderStorageService } from '../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
 import { ExtensionHostKind, extensionHostKindToString } from '../../services/extensions/common/extensionHostKind.js';
 import { IExtensionService } from '../../services/extensions/common/extensions.js';
 import { IExtHostContext, extHostNamedCustomer } from '../../services/extensions/common/extHostCustomers.js';
@@ -52,7 +51,6 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		@IAuthenticationMcpService private readonly authenticationMcpServersService: IAuthenticationMcpService,
 		@IAuthenticationMcpAccessService private readonly authenticationMCPServerAccessService: IAuthenticationMcpAccessService,
 		@IAuthenticationMcpUsageService private readonly authenticationMCPServerUsageService: IAuthenticationMcpUsageService,
-		@IDynamicAuthenticationProviderStorageService private readonly _dynamicAuthenticationProviderStorageService: IDynamicAuthenticationProviderStorageService,
 		@IExtensionService private readonly _extensionService: IExtensionService,
 		@IContextKeyService private readonly _contextKeyService: IContextKeyService,
 	) {
@@ -191,6 +189,11 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 	}
 
 	async $getTokenFromServerMetadata(id: number, authDetails: IMcpAuthenticationDetails, { errorOnUserInteraction, forceNewRegistration }: IMcpAuthenticationOptions = {}): Promise<string | undefined> {
+		if (forceNewRegistration) {
+			// A new registration would remove the stored client registration and sessions. That happens only by an explicit
+			// act of the user (the 'Remove Dynamic Authentication Providers' command), never on request of an automatic path.
+			throw new Error(nls.localize('mcpForcedRegistrationRefused', "A new client registration is never forced automatically; remove the stored sign-in with the command 'Authentication: Remove Dynamic Authentication Providers'."));
+		}
 		const server = this._serverDefinitions.get(id);
 		if (!server) {
 			return undefined;
@@ -199,15 +202,6 @@ export class MainThreadMcp extends Disposable implements MainThreadMcpShape {
 		const resourceServer = authDetails.resourceMetadata?.resource ? URI.parse(authDetails.resourceMetadata.resource) : undefined;
 		const resolvedScopes = authDetails.scopes ?? authDetails.resourceMetadata?.scopes_supported ?? authDetails.authorizationServerMetadata.scopes_supported ?? [];
 		let providerId = await this._authenticationService.getOrActivateProviderIdForServer(authorizationServer, resourceServer);
-		if (forceNewRegistration && providerId) {
-			if (!this._authenticationService.isDynamicAuthenticationProvider(providerId)) {
-				throw new Error('Cannot force new registration for a non-dynamic authentication provider.');
-			}
-			this._authenticationService.unregisterAuthenticationProvider(providerId);
-			// TODO: Encapsulate this and the unregister in one call in the auth service
-			await this._dynamicAuthenticationProviderStorageService.removeDynamicProvider(providerId);
-			providerId = undefined;
-		}
 
 		if (!providerId) {
 			const provider = await this._authenticationService.createDynamicAuthenticationProvider(authorizationServer, authDetails.authorizationServerMetadata, authDetails.resourceMetadata);
