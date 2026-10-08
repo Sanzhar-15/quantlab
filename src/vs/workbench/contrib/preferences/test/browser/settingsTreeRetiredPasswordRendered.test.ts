@@ -25,7 +25,7 @@ import { workbenchInstantiationService } from '../../../../test/browser/workbenc
 import { IExtensionsWorkbenchService } from '../../../extensions/common/extensions.js';
 // The production registration of the retired demo keys (a side effect of the import, as in the application).
 import '../../../../services/quantlabHostIdentity/common/quantlabRetiredSettings.js';
-import { SettingTreeRenderers } from '../../browser/settingsTree.js';
+import { AbstractSettingRenderer, SettingTreeRenderers } from '../../browser/settingsTree.js';
 import { ISettingsEditorViewState, SettingsTreeGroupElement, SettingsTreeModel, SettingsTreeSettingElement } from '../../browser/settingsTreeModels.js';
 
 // QuantLab F-SYNC-STRIP-2 (S2, B3): the Settings row of a configured `qic.demo.password` is RENDERED here, by the real
@@ -181,16 +181,27 @@ suite('Settings editor - the rendered row of the retired demo password (STRIP-2)
 		const row = treeRow(PASSWORD, registeredSetting(PASSWORD), configuration);
 		const { container, templateId } = renderRow(renderers, row);
 
-		// The assertions below say something only if the row was really rendered, by the complex renderer.
+		// The assertions below say something only if the row was really rendered, by the complex renderer. The renderer writes
+		// the setting's identity (data-key, data-id), is-configured and invalid-input on the template's `containerElement`, the
+		// `.setting-item-contents` child it appends to the container it is given (settingsTree.ts renderCommonTemplate:
+		// `container = DOM.append(_container, $(CONTENTS_SELECTOR))`, renderSettingElement lines 994-997: `template.containerElement`),
+		// not on the container itself; only the `setting-item-complex` class goes on the container (renderCommonTemplate: `_container.classList.add`).
 		assert.strictEqual(templateId, COMPLEX_TEMPLATE_ID);
 		assert.ok(container.classList.contains('setting-item-complex'), 'the row is the complex template');
-		assert.strictEqual(container.getAttribute('data-key'), PASSWORD);
-		assert.ok(container.classList.contains('is-configured'), 'the row shows as modified');
+		// eslint-disable-next-line no-restricted-syntax
+		const contents = container.querySelectorAll<HTMLElement>(AbstractSettingRenderer.CONTENTS_SELECTOR);
+		assert.strictEqual(contents.length, 1, 'the template has exactly one contents element');
+		const rowElement = contents[0];
+		assert.strictEqual(rowElement.getAttribute(AbstractSettingRenderer.SETTING_KEY_ATTR), PASSWORD, 'the rendered row is the password setting');
+		assert.strictEqual(rowElement.getAttribute(AbstractSettingRenderer.SETTING_ID_ATTR), row.id, 'the rendered row is the model row');
+
+		// The value check comes before the cosmetic ones, so that a renderer that shows the value fails on the value.
+		assert.deepStrictEqual(whereIsTheSentinel(container, SENTINEL_PASSWORD), []);
+
+		assert.ok(rowElement.classList.contains('is-configured'), 'the row shows as modified');
 		assert.ok(container.textContent?.includes('Edit in settings.json'), 'the row offers Edit in settings.json');
 		assert.ok(row.displayLabel.length > 0 && container.textContent?.includes(row.displayLabel), 'the row shows its label');
-		assert.ok(!container.classList.contains('invalid-input'), 'a configured string is a valid value: no invalid-type error');
-
-		assert.deepStrictEqual(whereIsTheSentinel(container, SENTINEL_PASSWORD), []);
+		assert.ok(!rowElement.classList.contains('invalid-input'), 'a configured string is a valid value: no invalid-type error');
 	});
 
 	// The control on a real rendered row: the email is a plain string setting and the text renderer puts it in an input.
