@@ -13,7 +13,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import { test } from 'node:test';
 import { pressNativeDialog } from './native-dialog.mjs';
-import { awaitModal, checkDialogStyle, modalSurfaces, pressModal, readToasts, waitForWorkbench } from './window.mjs';
+import { awaitModal, backtestForm, checkDialogStyle, modalSurfaces, pressModal, readToasts, waitForWorkbench } from './window.mjs';
 
 const MESSAGE = 'Import settings, keybindings and extensions from VS Code?';
 const BUTTON = 'Import';
@@ -316,8 +316,12 @@ test('both surfaces: no app pid throws [native_pid_missing] when the surfaces ar
 });
 
 test('DOM surface: a dialog gone between the reading and the click throws [modal_dom_changed], nothing clicked', async () => {
-	const wb = fakeWorkbench(null);
-	await assert.rejects(modalSurfaces(wb.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom.press(), /\[modal_dom_changed\] .*nothing was clicked/);
+	const wb = fakeWorkbench({ text: MESSAGE, buttons: [BUTTON, 'Cancel'] });
+	const dom = modalSurfaces(wb.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	const observation = await dom.read();
+	assert.strictEqual(observation.found, true);
+	wb.box = null;
+	await assert.rejects(dom.press(observation), /\[modal_dom_changed\] .*nothing was clicked/);
 	assert.deepStrictEqual(wb.clicked, []);
 });
 
@@ -334,11 +338,11 @@ const toastDocument = texts => ({
 /**
  * A fake CDP connection onto several frames, each its own page target: `specs` = [{ url, document, exception?, reject?, attachFails? }].
  * A frame with `exception` answers Runtime.evaluate with exceptionDetails, one with `reject` rejects the request, one with
- * `attachFails` rejects Target.attachToTarget. `fx.frames` may change between calls (fx.add); `fx.asked` lists the frame URLs evaluated.
+ * `attachFails` rejects Target.attachToTarget. `fx.frames` may change between calls (fx.add); `fx.asked` lists the frame URLs evaluated; `fx.beforeEvaluate(n)` / `fx.afterEvaluate(n)` run before / after the n-th evaluation (1-based), to change the frames in the middle of a step.
  */
 function fakeFrames(specs) {
 	let seq = 0;
-	const fx = { frames: [], asked: [] };
+	const fx = { frames: [], asked: [], evaluations: 0, beforeEvaluate: () => { }, afterEvaluate: () => { } };
 	fx.add = spec => {
 		const frame = { ...spec, targetId: `T${++seq}`, frameId: `F${seq}` };
 		fx.frames.push(frame);
@@ -363,13 +367,16 @@ function fakeFrames(specs) {
 				case 'Runtime.evaluate': {
 					const frame = fx.frames.find(f => f.frameId === params.contextId);
 					fx.asked.push(frame.url);
+					fx.beforeEvaluate(++fx.evaluations);
 					if (frame.reject !== undefined) {
 						throw new Error(frame.reject);
 					}
 					if (frame.exception !== undefined) {
 						return { exceptionDetails: { text: 'Uncaught', exception: { description: frame.exception } } };
 					}
-					return { result: { value: new Function('document', `return ${params.expression}`)(frame.document) } };
+					const value = new Function('document', `return ${params.expression}`)(frame.document);
+					fx.afterEvaluate(fx.evaluations);
+					return { result: { value } };
 				}
 				case 'Target.detachFromTarget': return {};
 				default: throw new Error(`fake CDP: unexpected ${method}`);
@@ -415,4 +422,199 @@ test('DOM surface: a failed frame observation fails read() and the modal wait by
 		await assert.rejects(awaitModal(importArgs, surfaces, FAST), /\[modal_observation_failed\] .*vscode-file:\/\/b\/workbench\.html/);
 		assert.deepStrictEqual(shown.clicked, []);
 	}
+});
+
+/** The error a promise rejects with (the test fails if it resolves), so that the effects can be asserted before the message. */
+const failure = promise => promise.then(() => assert.fail('expected a rejection'), error => error);
+
+// --- a mutation runs in exactly one frame that was found, revalidated and unique (review RULING c1, item 8) ---
+const WEBVIEW_A = 'vscode-webview://a/index.html';
+const WEBVIEW_B = 'vscode-webview://b/index.html';
+
+/** A frame state for a dialog document: { box, clicked }. */
+const dialogFrame = (url, box) => ({ url, shown: { box, clicked: [] }, get document() { return dialogDocument(this.shown); } });
+const dialogBox = (buttons = [BUTTON, 'Cancel']) => ({ text: MESSAGE, buttons });
+const totalClicks = frames => frames.flatMap(f => f.shown.clicked);
+
+test('DOM press: two workbench frames hold the dialog -> [modal_ambiguous] and no click in either, at the reading and at the press', async () => {
+	const a = dialogFrame(WB_A, dialogBox());
+	const b = dialogFrame(WB_B, dialogBox());
+	const fx = fakeFrames([a, b]);
+	const dom = modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	await assert.rejects(dom.read(), /^Error: \[modal_ambiguous\] 2 frames answer: vscode-file:\/\/a\/workbench\.html, vscode-file:\/\/b\/workbench\.html; nothing was changed$/);
+	await assert.rejects(awaitModal(importArgs, modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }), FAST), /\[modal_ambiguous\]/);
+	assert.deepStrictEqual(totalClicks([a, b]), []);
+});
+
+test('DOM press: a second matching frame appears between the reading and the press -> [modal_ambiguous], zero clicks in both frames', async () => {
+	const a = dialogFrame(WB_A, dialogBox());
+	const fx = fakeFrames([a]);
+	const dom = modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	const observation = await dom.read();
+	assert.strictEqual(observation.found, true);
+	const b = dialogFrame(WB_B, dialogBox());
+	fx.add(b);
+	const error = await failure(dom.press(observation));
+	assert.deepStrictEqual(totalClicks([a, b]), []);
+	assert.match(error.message, /^\[modal_ambiguous\] 2 frames answer: .*; nothing was changed$/);
+});
+
+test('DOM press: the dialog moved to another frame between the reading and the press -> [modal_dom_changed] naming both, zero clicks', async () => {
+	const a = dialogFrame(WB_A, dialogBox());
+	const fx = fakeFrames([a]);
+	const dom = modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	const observation = await dom.read();
+	a.shown.box = null;
+	const b = dialogFrame(WB_B, dialogBox());
+	fx.add(b);
+	const error = await failure(dom.press(observation));
+	assert.deepStrictEqual(totalClicks([a, b]), []);
+	assert.match(error.message, /^\[modal_dom_changed\] .* was seen in vscode-file:\/\/a\/workbench\.html, but at the click: the match is now in vscode-file:\/\/b\/workbench\.html .*; nothing was clicked$/);
+});
+
+test('DOM press: a second matching button in the frame is [modal_ambiguous] at the reading, at the revalidation and inside the page at the click; zero clicks', async () => {
+	const twice = [BUTTON, BUTTON, 'Cancel'];
+	const a = dialogFrame(WB_A, dialogBox(twice));
+	await assert.rejects(modalSurfaces(fakeFrames([a]).cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom.read(), /^Error: \[modal_ambiguous\] 2 matching buttons in vscode-file:\/\/a\/workbench\.html: .*; nothing was changed$/);
+	// Appearing after the reading: caught by the revalidation.
+	const b = dialogFrame(WB_A, dialogBox());
+	const dom = modalSurfaces(fakeFrames([b]).cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	const observation = await dom.read();
+	b.shown.box = dialogBox(twice);
+	await assert.rejects(dom.press(observation), /\[modal_ambiguous\] 2 matching buttons/);
+	// Appearing between the revalidation and the click: caught by the page function itself (evaluation 1 = reading, 2 = revalidation, 3 = click).
+	const c = dialogFrame(WB_A, dialogBox());
+	const fx = fakeFrames([c]);
+	const late = modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	const seen = await late.read();
+	fx.beforeEvaluate = n => { if (n === 3) { c.shown.box = dialogBox(twice); } };
+	await assert.rejects(late.press(seen), /\[modal_ambiguous\] 2 matching buttons/);
+	assert.deepStrictEqual(totalClicks([a, b, c]), []);
+});
+
+test('DOM press: a second frame appearing after the revalidation is never pressed: the click runs in the observed frame alone', async () => {
+	const a = dialogFrame(WB_A, dialogBox());
+	const b = dialogFrame(WB_B, dialogBox());
+	const fx = fakeFrames([a]);
+	const dom = modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	const observation = await dom.read();
+	fx.beforeEvaluate = n => { if (n === 2) { fx.add(b); } };
+	const modal = await dom.press(observation);
+	assert.strictEqual(modal.clicked, BUTTON);
+	assert.deepStrictEqual(a.shown.clicked, [BUTTON]);
+	assert.deepStrictEqual(b.shown.clicked, []);
+});
+
+test('DOM press: one matching frame (another workbench frame without a dialog) is pressed exactly once, in that frame', async () => {
+	const a = dialogFrame(WB_A, dialogBox());
+	const b = dialogFrame(WB_B, null);
+	const fx = fakeFrames([b, a]);
+	const run1 = await awaitModal(importArgs, modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }), FAST);
+	assert.strictEqual(run1.surface, 'dom');
+	assert.deepStrictEqual(a.shown.clicked, [BUTTON]);
+	assert.deepStrictEqual(b.shown.clicked, []);
+	assert.deepStrictEqual(fx.asked, [WB_B, WB_A, WB_B, WB_A, WB_A], 'read (both frames), revalidation (both frames), click (the observed frame only)');
+});
+
+test('DOM press: press() without the frame its read() found throws [modal_press_unobserved], nothing clicked', async () => {
+	const a = dialogFrame(WB_A, dialogBox());
+	const dom = modalSurfaces(fakeFrames([a]).cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom;
+	await assert.rejects(dom.press(), /\[modal_press_unobserved\]/);
+	assert.deepStrictEqual(a.shown.clicked, []);
+});
+
+/** The fake `document` of an Action view webview: `form` = { open, fields: { id: { value, required } }, submits: [{ label, disabled, clicks }], changes, status }. */
+function formDocument(form) {
+	const element = {
+		querySelector: selector => {
+			const field = form.fields[selector.slice(1)];
+			return field === undefined ? null : field;
+		},
+		dispatchEvent: () => { form.changes++; },
+	};
+	return {
+		querySelector: selector => {
+			switch (selector) {
+				case '#action-config-form': return form.open ? element : null;
+				case '.status-card': return form.status === undefined ? null : { classList: ['status-card', `status-${form.status}`] };
+				case '.status-meta': case '.callout.error': return null;
+				default: throw new Error(`fake document: unexpected querySelector ${selector}`);
+			}
+		},
+		querySelectorAll: selector => {
+			switch (selector) {
+				case '#action-config-form button[type=submit]': return form.open ? form.submits.map(b => ({ disabled: b.disabled, textContent: ` ${b.label} `, click: () => { b.clicks++; form.status = 'completed'; } })) : [];
+				case '#action-config-form [required]': return Object.entries(form.fields).filter(([, f]) => f.required).map(([id, f]) => ({ id, value: f.value }));
+				default: throw new Error(`fake document: unexpected querySelectorAll ${selector}`);
+			}
+		},
+	};
+}
+const formFrame = (url, { open = true, submits = [{ label: 'Run Backtest', disabled: false, clicks: 0 }] } = {}) => {
+	const form = { open, fields: { symbol: { value: '', required: true } }, submits, changes: 0, status: undefined };
+	return { url, form, get document() { return formDocument(form); } };
+};
+const mutations = frames => frames.map(f => ({ changes: f.form.changes, symbol: f.form.fields.symbol.value, clicks: f.form.submits.map(b => b.clicks) }));
+const FORM_ARGS = { values: { symbol: 'AAPL', nosuch: 'x' }, runTimeoutMs: 5000 };
+
+test('backtestForm: one matching webview frame is filled once and pressed once (another webview frame without the form is untouched)', async () => {
+	const a = formFrame(WEBVIEW_A);
+	const b = formFrame(WEBVIEW_B, { open: false });
+	const result = await backtestForm(fakeFrames([b, a]).cdp, FORM_ARGS);
+	assert.deepStrictEqual(result, { missingFields: ['nosuch'], submitted: 'Run Backtest', state: 'card', status: 'completed', meta: '', error: '' });
+	assert.deepStrictEqual(mutations([a, b]), [{ changes: 1, symbol: 'AAPL', clicks: [1] }, { changes: 0, symbol: '', clicks: [0] }]);
+});
+
+test('backtestForm: a second form frame appears between the observation and the fill -> [backtest_form_ambiguous], neither frame is filled or pressed', async () => {
+	const a = formFrame(WEBVIEW_A);
+	const b = formFrame(WEBVIEW_B);
+	const fx = fakeFrames([a]);
+	fx.beforeEvaluate = n => { if (n === 1) { fx.add(b); } };
+	const error = await failure(backtestForm(fx.cdp, FORM_ARGS));
+	assert.deepStrictEqual(mutations([a, b]), [{ changes: 0, symbol: '', clicks: [0] }, { changes: 0, symbol: '', clicks: [0] }]);
+	assert.match(error.message, /^\[backtest_form_ambiguous\] 2 frames answer: vscode-webview:\/\/a\/index\.html, vscode-webview:\/\/b\/index\.html; nothing was changed$/);
+});
+
+test('backtestForm: the form moved to another frame between the observation and the fill -> [backtest_form_lost], nothing filled or pressed', async () => {
+	const a = formFrame(WEBVIEW_A);
+	const b = formFrame(WEBVIEW_B);
+	const fx = fakeFrames([a]);
+	fx.afterEvaluate = n => { if (n === 1) { a.form.open = false; fx.add(b); } };
+	const error = await failure(backtestForm(fx.cdp, FORM_ARGS));
+	assert.deepStrictEqual(mutations([a, b]), [{ changes: 0, symbol: '', clicks: [0] }, { changes: 0, symbol: '', clicks: [0] }]);
+	assert.match(error.message, /^\[backtest_form_lost\] the form disappeared before it was filled: the match is now in vscode-webview:\/\/b\/index\.html .*; nothing was changed$/);
+});
+
+test('backtestForm: a second form frame appears between the observation and the submit press -> [backtest_form_ambiguous], zero clicks in both frames', async () => {
+	const a = formFrame(WEBVIEW_A);
+	const b = formFrame(WEBVIEW_B);
+	const fx = fakeFrames([a]);
+	// Evaluations: 1 form observation, 2 revalidation, 3 fill, 4 submit observation (b is added during it), 5 revalidation, 6 press.
+	fx.beforeEvaluate = n => { if (n === 4) { fx.add(b); } };
+	const error = await failure(backtestForm(fx.cdp, FORM_ARGS));
+	assert.deepStrictEqual(mutations([a, b]), [{ changes: 1, symbol: 'AAPL', clicks: [0] }, { changes: 0, symbol: '', clicks: [0] }]);
+	assert.match(error.message, /^\[backtest_form_ambiguous\] 2 frames answer: .*; nothing was changed$/);
+});
+
+test('backtestForm: a second form frame appearing after the submit revalidation is not pressed: the press runs in the observed frame alone', async () => {
+	const a = formFrame(WEBVIEW_A);
+	const b = formFrame(WEBVIEW_B);
+	const fx = fakeFrames([a]);
+	fx.beforeEvaluate = n => { if (n === 5) { fx.add(b); } };
+	const result = await backtestForm(fx.cdp, FORM_ARGS);
+	assert.strictEqual(result.submitted, 'Run Backtest');
+	assert.deepStrictEqual(mutations([a, b]), [{ changes: 1, symbol: 'AAPL', clicks: [1] }, { changes: 0, symbol: '', clicks: [0] }]);
+});
+
+test('backtestForm: two submit buttons in the form frame -> [backtest_form_ambiguous] naming the count, neither pressed', async () => {
+	const a = formFrame(WEBVIEW_A, { submits: [{ label: 'Run Backtest', disabled: false, clicks: 0 }, { label: 'Run Backtest', disabled: false, clicks: 0 }] });
+	await assert.rejects(backtestForm(fakeFrames([a]).cdp, FORM_ARGS), /^Error: \[backtest_form_ambiguous\] 2 matching buttons in vscode-webview:\/\/a\/index\.html: .*; nothing was changed$/);
+	assert.deepStrictEqual(mutations([a]), [{ changes: 1, symbol: 'AAPL', clicks: [0, 0] }]);
+});
+
+test('backtestForm: a failed observation in a second webview frame fails the step by name (item 7 reaches every caller)', async () => {
+	const a = formFrame(WEBVIEW_A);
+	const b = formFrame(WEBVIEW_B, { open: false });
+	await assert.rejects(backtestForm(fakeFrames([a, { ...b, exception: 'Error: webview crashed' }]).cdp, FORM_ARGS), /^Error: \[backtest_form_observation_failed\] 1 frame\(s\) could not be observed \(1 answered\): vscode-webview:\/\/b\/index\.html: Error: webview crashed$/);
+	assert.deepStrictEqual(mutations([a]), [{ changes: 0, symbol: '', clicks: [0] }]);
 });

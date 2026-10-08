@@ -245,7 +245,7 @@ test('evaluateInFrames attaches only to app-surface targets: the guest\'s silent
 		const cdp = await connect(server.endpoint, 500);
 		const result = await evaluateInFrames(cdp, isAppSurface, url => url.startsWith('vscode-file://'), () => ({ state: 'present' }), null);
 		assert.deepStrictEqual(result, {
-			values: [{ url: 'vscode-file://vscode-app/x/workbench.html', value: { state: 'present' } }],
+			values: [{ url: 'vscode-file://vscode-app/x/workbench.html', targetId: 'WB', frameId: 'F1', value: { state: 'present' } }],
 			errors: [],
 			skipped: ['page ""'],
 		});

@@ -90,11 +90,13 @@ function frames(tree) {
  * Evaluates `fn(arg)` in every frame whose URL satisfies `matches`, inside the page and iframe targets whose
  * own URL satisfies `targets`. Only those targets are attached: the packaged app also has a page target with
  * an empty URL whose Page.getFrameTree is never answered (guest P1b, guest-p1b-r3), and asking it stalled
- * every step. Returns `{ values: [{ url, value }], errors: [text], skipped: [text] }`: a frame that cannot be
+ * every step. Returns `{ values: [{ url, targetId, frameId, value }], errors: [text], skipped: [text] }`: a frame that cannot be
  * evaluated is listed in `errors` and a target not attached in `skipped`, never dropped silently, so a caller
- * that finds no value can say why.
+ * that finds no value can say why. Each value carries the identity of its frame, { url, targetId, frameId, value }.
+ * `only` ({ targetId, frameId }, optional) narrows the evaluation to that one frame of that one target (a frame that is
+ * no longer there yields no value): how a caller acts on a frame it has already observed and not on every match.
  */
-export async function evaluateInFrames(cdp, targets, matches, fn, arg) {
+export async function evaluateInFrames(cdp, targets, matches, fn, arg, only = undefined) {
 	if (typeof targets !== 'function') {
 		throw new Error('[cdp_target_filter_missing] evaluateInFrames needs the predicate on target URLs');
 	}
@@ -103,13 +105,13 @@ export async function evaluateInFrames(cdp, targets, matches, fn, arg) {
 	const { targetInfos } = await cdp.send('Target.getTargets');
 	const candidates = targetInfos.filter(t => t.type === 'page' || t.type === 'iframe');
 	const skipped = candidates.filter(t => !targets(t.url)).map(t => `${t.type} ${JSON.stringify(t.url)}`);
-	for (const target of candidates.filter(t => targets(t.url))) {
+	for (const target of candidates.filter(t => targets(t.url) && (only === undefined || t.targetId === only.targetId))) {
 		// A target that does not answer is named with its type and URL: the caller's error says which one.
 		const named = err => { throw new Error(`${err.message} (target ${target.type} ${target.url})`); };
 		const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true }).catch(named);
 		try {
 			const { frameTree } = await cdp.send('Page.getFrameTree', {}, sessionId).catch(named);
-			for (const frame of frames(frameTree).filter(f => matches(f.url))) {
+			for (const frame of frames(frameTree).filter(f => matches(f.url) && (only === undefined || f.id === only.frameId))) {
 				try {
 					const { executionContextId } = await cdp.send('Page.createIsolatedWorld', { frameId: frame.id, worldName: 'ql-features-driver' }, sessionId);
 					const { result, exceptionDetails } = await cdp.send('Runtime.evaluate', {
@@ -121,7 +123,7 @@ export async function evaluateInFrames(cdp, targets, matches, fn, arg) {
 					if (exceptionDetails) {
 						errors.push(`${frame.url}: ${exceptionDetails.exception?.description ?? exceptionDetails.text}`);
 					} else {
-						values.push({ url: frame.url, value: result.value });
+						values.push({ url: frame.url, targetId: target.targetId, frameId: frame.id, value: result.value });
 					}
 				} catch (err) {
 					errors.push(`${frame.url}: ${err.message}`);
