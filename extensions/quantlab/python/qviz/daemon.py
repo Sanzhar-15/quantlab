@@ -112,15 +112,17 @@ def _parse_preview_window(req: dict) -> tuple[int, int]:
         )
     return n_raw, offset_raw
 
-# Megaudit-2 A4-C2: pin a minimum DuckDB version. The qviz daemon relies on
-# `connection.execute(...).arrow()` and the Arrow integration shape that has
-# been stable since DuckDB 0.9.0. Older releases either lacked the method
-# (≤0.8) or used a different chunking layout (early 0.9 betas) that produced
-# malformed IPC. We compare against this minimum at startup so a misconfigured
-# venv fails LOUDLY with an actionable message instead of crashing mid-query
-# with a confusing AttributeError or arrow extraction failure on the webview
-# side.
-MIN_DUCKDB_VERSION = (0, 9, 0)
+# Megaudit-2 A4-C2: pin a minimum DuckDB version. The qviz daemon fetches
+# every result with `execute(...).to_arrow_table()`, which DuckDB first ships
+# in 1.5.0 (1.4.x has only the deprecated `fetch_arrow_table`, and its
+# `.arrow()` returns a RecordBatchReader, not a Table). 1.5.0 itself aborts
+# the process at the daemon's start (InternalException "Attempted to
+# dereference unique_ptr that is NULL!", measured on linux aarch64,
+# F-FEAT-QVIZ-REQ-1), so the floor is 1.5.1. DuckDB 1.5 needs Python >= 3.10.
+# We compare against this minimum at startup so a misconfigured venv fails
+# LOUDLY with an actionable message instead of failing mid-query with an
+# AttributeError on every aggregate.
+MIN_DUCKDB_VERSION = (1, 5, 1)
 
 
 def _parse_duckdb_version(version_str: str) -> tuple[int, ...]:
@@ -165,8 +167,8 @@ def _check_duckdb_version() -> None:
     if actual < MIN_DUCKDB_VERSION:
         sys.stderr.write(
             f"ERROR: duckdb {raw} is too old; minimum required is "
-            f"{'.'.join(str(x) for x in MIN_DUCKDB_VERSION)}. "
-            "Upgrade with: pip install --upgrade 'duckdb>="
+            f"{'.'.join(str(x) for x in MIN_DUCKDB_VERSION)} "
+            "(it needs Python >= 3.10). Upgrade with: pip install --upgrade 'duckdb>="
             f"{'.'.join(str(x) for x in MIN_DUCKDB_VERSION)}'\n"
         )
         sys.exit(3)
