@@ -648,6 +648,68 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 		assert.deepStrictEqual(JSON.parse(local), { 'a': 1, ...localPair });
 	}));
 
+	// The opt-back-in form of `settingsSync.ignoredSettings`, read by the real ConfigurationService from the local settings file.
+	const optBackIn = { 'settingsSync.ignoredSettings': ['-qic.demo.email', '-qic.demo.password'] };
+
+	async function readLocalSettings(): Promise<unknown> {
+		const settingsResource = client.instantiationService.get(IUserDataProfilesService).defaultProfile.settingsResource;
+		return JSON.parse((await client.instantiationService.get(IFileService).readFile(settingsResource)).value.toString());
+	}
+
+	// The opt-in entries themselves name the keys, so the uploaded content is checked as parsed settings (own properties) and for the sentinel values.
+	async function assertRemoteHoldsNoPair(message: string): Promise<Record<string, unknown>> {
+		const { content } = await client.read(testObject.resource);
+		assert.ok(content !== null, `${message}: the remote must hold content`);
+		const uploaded = parseSettings(content);
+		for (const sentinel of [...Object.values(remotePair), ...Object.values(localPair)]) {
+			assert.ok(!uploaded.includes(sentinel), `${message}: sentinel ${sentinel} is in the uploaded content`);
+		}
+		const parsed: Record<string, unknown> = JSON.parse(uploaded);
+		assert.ok(!Object.prototype.hasOwnProperty.call(parsed, 'qic.demo.email'), `${message}: qic.demo.email is in the uploaded content`);
+		assert.ok(!Object.prototype.hasOwnProperty.call(parsed, 'qic.demo.password'), `${message}: qic.demo.password is in the uploaded content`);
+		return parsed;
+	}
+
+	test('user opts both keys back in: first auto sync uploads neither key and the local file keeps them', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const local = { 'a': 1, ...localPair, ...optBackIn };
+		await updateSettings(JSON.stringify(local), client);
+
+		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
+
+		const uploaded = await assertRemoteHoldsNoPair('first sync');
+		assert.strictEqual(uploaded['a'], 1, 'the ordinary setting must reach the remote');
+		assert.deepStrictEqual(uploaded['settingsSync.ignoredSettings'], optBackIn['settingsSync.ignoredSettings'], 'the opt-in must have been in force for this sync');
+		assert.deepStrictEqual(await readLocalSettings(), local);
+	}));
+
+	test('user opts both keys back in: a later sync of an unrelated change uploads neither key and the local file keeps them', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await updateSettings(JSON.stringify({ 'a': 1, ...localPair, ...optBackIn }), client);
+		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
+		await assertRemoteHoldsNoPair('first sync');
+
+		const changed = { 'a': 2, ...localPair, ...optBackIn };
+		await updateSettings(JSON.stringify(changed), client);
+		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
+
+		const uploaded = await assertRemoteHoldsNoPair('later sync');
+		assert.strictEqual(uploaded['a'], 2, 'the unrelated change must reach the remote');
+		assert.deepStrictEqual(await readLocalSettings(), changed);
+	}));
+
+	test('user opts both keys back in and the remote already holds the pair: accepting local uploads neither key and the local file keeps them', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await seedRemote({ 'a': 1, ...remotePair });
+		const local = { 'b': 2, ...localPair, ...optBackIn };
+		await updateSettings(JSON.stringify(local), client);
+
+		const preview = await testObject.sync(await client.getLatestRef(SyncResource.Settings), true);
+		await testObject.accept(preview!.resourcePreviews[0].localResource);
+		await testObject.apply(false);
+
+		const uploaded = await assertRemoteHoldsNoPair('accept local');
+		assert.strictEqual(uploaded['b'], 2, 'the ordinary setting must reach the remote');
+		assert.deepStrictEqual(await readLocalSettings(), local);
+	}));
+
 });
 
 function parseSettings(content: string): string {
