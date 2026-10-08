@@ -39,6 +39,21 @@ export interface IQlWorkbenchListener {
 
 	/** An open request completed and a workbench exists: the request wants it on screen. */
 	surface(cause: string): void;
+
+	/** QuantLab host (P12): a launch that asked for nothing to open reached the gate and no workbench exists: bring the host's own window forward. */
+	restoreHostWindow(): void;
+}
+
+/**
+ * QuantLab host (P12): the first use succeeded and the workbench is open, but the request also opened windows the host cannot
+ * show, so the gate closed them. The refusal is expected (a restored session of several windows) and handled, so it is its own
+ * type: the host logs it and shows no dialog, while every other first-use failure still gets one.
+ */
+export class QlExtraWindowsRefusedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'QlExtraWindowsRefusedError';
+	}
 }
 
 function describeOpenContext(context: OpenContext): string {
@@ -51,6 +66,22 @@ function describeOpenContext(context: OpenContext): string {
 		case OpenContext.API: return 'api';
 		case OpenContext.LINK: return 'link';
 	}
+}
+
+// QuantLab host (P12): the stock `launchMainService` answers a second launch that carries nothing to open by focusing the last
+// active CodeWindow, and opens an empty window only when it finds none. The host's window is not a CodeWindow and the
+// workbench is lazy, so it always finds none and calls `open({ forceEmpty })`: here that request must not be a first use, nobody
+// asked for a workbench. What the launch asks for is read from the request alone: a launch context (the OS or a shell, not the
+// menu, a link or the API), no openables of any kind, no explicit ask for a window (`--new-window`, a profile, a remote), and
+// not the first launch's own request (`initialStartup`, `app.ts` `openFirstWindow`, which is also how the toggle key opens it).
+function isBareSecondLaunch(openConfig: IOpenConfiguration): boolean {
+	const { cli } = openConfig;
+
+	return (openConfig.context === OpenContext.DESKTOP || openConfig.context === OpenContext.CLI)
+		&& !openConfig.initialStartup
+		&& !openConfig.urisToOpen?.length
+		&& !cli._.length && !cli['folder-uri'] && !cli['file-uri']
+		&& !cli['new-window'] && !openConfig.forceProfile && !openConfig.forceTempProfile && !openConfig.remoteAuthority;
 }
 
 export class QlWindowsGate extends Disposable implements IWindowsMainService {
@@ -157,7 +188,8 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 
 	//#region the one gate
 
-	private async use<T>(cause: string, run: () => Promise<T>): Promise<T> {
+	/** `whenIdle`: what a request that must not be a first use does instead, when no workbench exists (P12); with a workbench it runs as any other. */
+	private async use<T>(cause: string, run: () => Promise<T>, whenIdle?: () => T): Promise<T> {
 		await this.listenerAttached.p;
 
 		if (this.state === 'opening') {
@@ -165,7 +197,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		}
 
 		if (this.state === 'idle') {
-			return this.firstUse(cause, run);
+			return whenIdle ? whenIdle() : this.firstUse(cause, run);
 		}
 
 		const { value, extras } = await this.runOpen(run);
@@ -207,7 +239,8 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		return opened.then(({ value, extras }) => {
 			this.listener?.surface(cause);
 			if (extras) {
-				throw extras; // the workbench is open and kept; the request still reports that it asked for more windows than the host holds
+				// the workbench is open and kept; the request still reports that it asked for more windows than the host holds (P12: by type)
+				throw new QlExtraWindowsRefusedError(extras.message);
 			}
 
 			return value;
@@ -310,7 +343,20 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 	//#region IWindowsMainService
 
 	open(openConfig: IOpenConfiguration): Promise<ICodeWindow[]> {
-		return this.use(`open (${describeOpenContext(openConfig.context)})`, () => this.inner.open(openConfig));
+		const cause = `open (${describeOpenContext(openConfig.context)})`;
+
+		return this.use(cause, () => this.inner.open(openConfig), isBareSecondLaunch(openConfig) ? () => this.broughtForward(cause) : undefined);
+	}
+
+	/** P12: with no workbench, a launch that asks for nothing to open opens nothing; the host's window (the app's window) comes forward. */
+	private broughtForward(cause: string): ICodeWindow[] {
+		this.logService.info(`QuantLab host: ${cause} request carries nothing to open and no workbench exists; no workbench opened, the host window was brought forward`);
+		if (!this.listener) {
+			throw new Error('QuantLab host (P12): the gate has no listener to bring the host window forward'); // `use` awaited the attach: a host defect
+		}
+		this.listener.restoreHostWindow();
+
+		return [];
 	}
 
 	openEmptyWindow(openConfig: IOpenEmptyConfiguration, options?: IOpenEmptyWindowOptions): Promise<ICodeWindow[]> {

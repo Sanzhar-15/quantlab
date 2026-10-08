@@ -21,7 +21,7 @@ import { ICodeWindow } from '../../../platform/window/electron-main/window.js';
 import type { TerminalHost, WorkbenchContents } from '../ql-client/index.js';
 import { IAdoptedWorkbench } from './adopt.js';
 import { QlDialogMainService } from './dialogs.js';
-import { IQlWorkbenchListener, QlWindowsGate } from './gate.js';
+import { IQlWorkbenchListener, QlExtraWindowsRefusedError, QlWindowsGate } from './gate.js';
 import { secureWorkbenchContents } from './security.js';
 import { IQlFramePolicy } from './securityPolicy.js';
 import type { IQlVisibleTarget } from './standIn.js';
@@ -377,6 +377,15 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		// dialog was app-modal with nobody to answer it (SIGTERM 1.5 s after the attach: alive 60 s, no will-quit).
 		if (this.closing || this.deps.lifecycleMainService.quitRequested) {
 			this.deps.logService.error(`QuantLab host: ${what} failed while the app is quitting; no dialog is shown`, error);
+
+			return;
+		}
+
+		// QuantLab host (P12): the first use succeeded and the workbench is open; the request only asked for more windows than the
+		// host holds, and the gate closed them. A restored session of several windows does that on every first use, so it is
+		// logged (at error: the gate refused something) and no alert is shown for a handled, expected refusal. Told by type, never by message.
+		if (error instanceof QlExtraWindowsRefusedError) {
+			this.deps.logService.error(`QuantLab host: ${what}: ${error.message}; no dialog is shown`);
 
 			return;
 		}
