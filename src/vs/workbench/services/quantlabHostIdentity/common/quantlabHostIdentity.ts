@@ -194,8 +194,8 @@ export interface IQuantlabHostIdentityService {
 	unsubscribe(handle: number): void;
 
 	/**
-	 * Every well-formed frame for a subscribed handle. A `state` frame of kind `closed` ends the
-	 * subscription: the host has forgotten it, and so has the service.
+	 * Every well-formed frame for a subscribed handle. A `state` frame of kind `closed` or `error` ends
+	 * the subscription (whatever its epoch): the host has forgotten it, and so has the service.
 	 */
 	readonly onDidReceiveFrame: Event<QuantlabDataFrame>;
 }

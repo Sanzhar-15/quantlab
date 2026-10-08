@@ -173,8 +173,9 @@ export class MainThreadQuantlabHost extends Disposable implements MainThreadQuan
 			return;
 		}
 
-		if (frame.state.kind === 'closed') {
-			// The host has ended and forgotten this subscription, and so has the service: nothing to unsubscribe.
+		if (frame.state.kind === 'closed' || frame.state.kind === 'error') {
+			// Both are terminal, whatever their epoch: the host has ended and forgotten this subscription, and so has
+			// the service: nothing to unsubscribe.
 			this._forget(frame.handle);
 		}
 		this._proxy.$onState(handle, frame.state, frame.epoch);

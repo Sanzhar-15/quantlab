@@ -108,8 +108,14 @@ export interface RunDataFile {
 export class ServerDataCache {
 	private static instance: ServerDataCache | undefined;
 	private readonly runDir: string;
-	/** Run files written by THIS instance and not yet disposed. */
+	/**
+	 * Run files written by THIS instance whose deletion has not yet SUCCEEDED. A path leaves this set only when its
+	 * unlink succeeded (or the file was already gone, ENOENT): a failed unlink keeps the instance responsible for the
+	 * file, so a later explicit dispose or reset tries again.
+	 */
 	private readonly liveRunFiles = new Set<string>();
+	/** Disposals in flight, so two concurrent disposes of one file share ONE unlink attempt. */
+	private readonly disposalsInFlight = new Map<string, Promise<void>>();
 
 	private constructor(context: vscode.ExtensionContext) {
 		this.runDir = path.join(context.globalStorageUri.fsPath, 'server-data-cache');
@@ -132,7 +138,8 @@ export class ServerDataCache {
 	/**
 	 * Deletes every run file this instance wrote and has not disposed (a run
 	 * still in flight at deactivation). Each failure is logged, then all are
-	 * thrown together.
+	 * thrown together. A file whose unlink failed stays owned by the retired
+	 * instance, so its RunDataFile.dispose() can still delete it.
 	 */
 	static resetInstance(): void {
 		if (ServerDataCache.instance) {
@@ -140,10 +147,14 @@ export class ServerDataCache {
 			ServerDataCache.instance = undefined;
 			const failures: string[] = [];
 			for (const runPath of Array.from(instance.liveRunFiles)) {
-				instance.liveRunFiles.delete(runPath);
 				try {
 					fs.unlinkSync(runPath);
+					instance.liveRunFiles.delete(runPath);
 				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+						// Already gone: nothing is left to own (the failure is still reported below).
+						instance.liveRunFiles.delete(runPath);
+					}
 					const message = `${runPath}: ${error instanceof Error ? error.message : String(error)}`;
 					console.error(`ServerDataCache: failed to delete run data file ${message}`);
 					failures.push(message);
@@ -204,12 +215,15 @@ export class ServerDataCache {
 		try {
 			await fsPromises.writeFile(runPath, header + rows, { encoding: 'utf8', flag: 'wx' });
 		} catch (error) {
-			this.liveRunFiles.delete(runPath);
 			const writeMessage = error instanceof Error ? error.message : String(error);
-			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-				// A partial file may exist; remove it. ENOENT = the write never created it.
+			if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+				// 'wx' refused: the file at this path is not ours, so it is never unlinked and never owned.
+				this.liveRunFiles.delete(runPath);
+			} else {
+				// A partial file may exist; remove it. ENOENT = the write never created it. A failed unlink keeps the
+				// path owned (the next resetInstance tries again); it is not forgotten here.
 				try {
-					await fsPromises.unlink(runPath);
+					await this.unlinkOwned(runPath);
 				} catch (cleanupError) {
 					if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
 						const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
@@ -227,15 +241,38 @@ export class ServerDataCache {
 	}
 
 	/**
-	 * Deletes one run file. Idempotent: a second dispose (or one after
-	 * resetInstance already deleted it) does nothing. Any unlink failure throws.
+	 * Deletes one run file. Idempotent once the deletion has succeeded: a second dispose (or one after
+	 * resetInstance already deleted it) does nothing. Any unlink failure throws and leaves the file owned, so the
+	 * next explicit dispose or reset tries again; nothing is retried automatically.
 	 */
-	private async disposeRunFile(runPath: string): Promise<void> {
+	private disposeRunFile(runPath: string): Promise<void> {
 		if (!this.liveRunFiles.has(runPath)) {
-			return;
+			return Promise.resolve();
+		}
+		const inFlight = this.disposalsInFlight.get(runPath);
+		if (inFlight) {
+			return inFlight;
+		}
+		const disposal = this.unlinkOwned(runPath).finally(() => this.disposalsInFlight.delete(runPath));
+		this.disposalsInFlight.set(runPath, disposal);
+		return disposal;
+	}
+
+	/**
+	 * One unlink attempt of an owned run file. Ownership ends when the unlink succeeded, or failed with ENOENT (the
+	 * file is already gone, so nothing is left to clean up; the error still throws). Any other failure throws and
+	 * keeps the path owned.
+	 */
+	private async unlinkOwned(runPath: string): Promise<void> {
+		try {
+			await fsPromises.unlink(runPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+				this.liveRunFiles.delete(runPath);
+			}
+			throw error;
 		}
 		this.liveRunFiles.delete(runPath);
-		await fsPromises.unlink(runPath);
 	}
 
 	/**

@@ -206,6 +206,40 @@ suite('MainThreadQuantlabHost', () => {
 		assert.strictEqual(log.infos.length, 1);
 	});
 
+	// Both terminal kinds forget the handle, whatever their epoch: an old-epoch frame that crosses a new identity is forwarded
+	// (the extension host decides what to deliver) but must still release the handle, or nothing would ever end it.
+	// Planted negative control: restore `frame.state.kind === 'closed'` alone in _routeFrame: the 'error' run keeps the handle and
+	// $unsubscribe sends one unsubscribe to the service.
+	for (const kind of ['closed', 'error'] as const) {
+		test(`an old-epoch '${kind}' state frame after a new identity is forwarded and forgets the subscription; a later $unsubscribe sends nothing`, async () => {
+			const customer = createCustomer();
+
+			await customer.$subscribe(7, 'ticks', null, 1);
+			const serviceHandle = service.subscribed[0].handle;
+			service.identity = { epoch: 2, signedIn: false };
+			service.identityTick.fire();
+			await flush();
+			service.frames.fire({ handle: serviceHandle, epoch: 1, kind: 'state', state: { kind, message: 'review-ended' } });
+			customer.$unsubscribe(7);
+
+			assert.deepStrictEqual(proxy.identities, [{ epoch: 2, signedIn: false }]);
+			assert.deepStrictEqual(proxy.states, [[7, { kind, message: 'review-ended' }, 1]]);
+			assert.deepStrictEqual(service.unsubscribed, []);
+			assert.strictEqual(log.infos.length, 1);
+		});
+	}
+
+	test('a non-terminal state frame keeps the subscription: a later $unsubscribe ends it at the service', async () => {
+		const customer = createCustomer();
+
+		await customer.$subscribe(7, 'ticks', null, 1);
+		const serviceHandle = service.subscribed[0].handle;
+		service.frames.fire({ handle: serviceHandle, epoch: 1, kind: 'state', state: { kind: 'reconnecting' } });
+		customer.$unsubscribe(7);
+
+		assert.deepStrictEqual(service.unsubscribed, [serviceHandle]);
+	});
+
 	test('a refused $subscribe answers ok:false and leaves the handle free', async () => {
 		const customer = createCustomer();
 		service.subscribeImpl = async () => { throw new QuantlabHostError('not-signed-in', 'signed out', undefined); };

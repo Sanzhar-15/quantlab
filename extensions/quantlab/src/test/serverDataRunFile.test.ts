@@ -9,6 +9,7 @@ installVscodeShim();
 import 'mocha';
 import * as assert from 'assert';
 import * as fs from 'fs';
+import fsModule = require('fs');
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
@@ -108,6 +109,149 @@ suite('Q-2 (a): per-run server-data files', () => {
 		const runFile = await ServerDataCache.getInstance().writeRunFile(SOURCE, '1D');
 		ServerDataCache.resetInstance();
 		assert.ok(!fs.existsSync(runFile.path), 'undisposed run file deleted at reset');
+	});
+
+	// QL-LOGIN+DATA c1 SHOULD 8: the cache keeps cleanup ownership of a run file until its unlink SUCCEEDS -- in dispose, in
+	// resetInstance and in partial-write cleanup. A failed unlink is visible (it throws) and is never retried by itself; the
+	// next EXPLICIT cleanup tries again.
+	suite('cleanup ownership until the unlink succeeds', () => {
+		const realUnlink = fsModule.promises.unlink;
+		const realUnlinkSync = fsModule.unlinkSync;
+		const realWriteFile = fsModule.promises.writeFile;
+		let attempts: string[] = [];
+		let ebusyBudget = 0;
+
+		const ebusy = (): Error => Object.assign(new Error('EBUSY: resource busy or locked, unlink'), { code: 'EBUSY' });
+		const owned = (runPath: string, instance: ServerDataCache): boolean =>
+			(instance as unknown as { liveRunFiles: Set<string> }).liveRunFiles.has(runPath);
+
+		setup(() => {
+			attempts = [];
+			ebusyBudget = 0;
+			// Every unlink is counted; the first `ebusyBudget` of them fail with EBUSY, the rest reach the real filesystem.
+			(fsModule.promises as unknown as { unlink: unknown }).unlink = async (target: string): Promise<void> => {
+				attempts.push(`unlink ${path.basename(target)}`);
+				if (ebusyBudget > 0) {
+					ebusyBudget--;
+					throw ebusy();
+				}
+				return realUnlink(target);
+			};
+			(fsModule as unknown as { unlinkSync: unknown }).unlinkSync = (target: string): void => {
+				attempts.push(`unlinkSync ${path.basename(target)}`);
+				if (ebusyBudget > 0) {
+					ebusyBudget--;
+					throw ebusy();
+				}
+				realUnlinkSync(target);
+			};
+		});
+
+		teardown(() => {
+			(fsModule.promises as unknown as { unlink: unknown }).unlink = realUnlink;
+			(fsModule as unknown as { unlinkSync: unknown }).unlinkSync = realUnlinkSync;
+			(fsModule.promises as unknown as { writeFile: unknown }).writeFile = realWriteFile;
+		});
+
+		test('dispose: a first unlink that fails EBUSY throws and keeps the path; the second explicit dispose deletes it (2 attempts)', async () => {
+			// NEGATIVE CONTROL: put `this.liveRunFiles.delete(runPath)` back before the unlink in disposeRunFile (and
+			// drop the delete from unlinkOwned's success path) -> the second dispose is a silent no-op: 1 attempt,
+			// the file still exists, the path is no longer owned -> RED.
+			const instance = ServerDataCache.getInstance();
+			const runFile = await instance.writeRunFile(SOURCE, '1D');
+			ebusyBudget = 1;
+
+			await assert.rejects(() => runFile.dispose(), /EBUSY/);
+			assert.strictEqual(attempts.length, 1);
+			assert.ok(owned(runFile.path, instance), 'the failed unlink keeps the path owned');
+			assert.ok(fs.existsSync(runFile.path));
+
+			await runFile.dispose();
+			assert.strictEqual(attempts.length, 2, 'no automatic retry in between: exactly one attempt per explicit dispose');
+			assert.ok(!owned(runFile.path, instance), 'ownership ends when the unlink succeeds');
+			assert.ok(!fs.existsSync(runFile.path));
+
+			await runFile.dispose();
+			assert.strictEqual(attempts.length, 2, 'a dispose after success does nothing');
+		});
+
+		test('reset: a first unlinkSync that fails EBUSY throws and keeps the path; the file\'s explicit dispose deletes it (2 attempts)', async () => {
+			// NEGATIVE CONTROL: put `instance.liveRunFiles.delete(runPath)` back before `fs.unlinkSync` in resetInstance
+			// -> the explicit dispose afterwards is a silent no-op: 1 attempt, the file still exists -> RED.
+			const instance = ServerDataCache.getInstance();
+			const runFile = await instance.writeRunFile(SOURCE, '1D');
+			ebusyBudget = 1;
+
+			assert.throws(() => ServerDataCache.resetInstance(), /1 run data file\(s\) could not be deleted.*EBUSY/);
+			assert.strictEqual(attempts.length, 1);
+			assert.ok(owned(runFile.path, instance), 'the failed reset keeps the path owned by the retired instance');
+			assert.ok(fs.existsSync(runFile.path));
+
+			await runFile.dispose();
+			assert.deepStrictEqual(attempts, [`unlinkSync ${path.basename(runFile.path)}`, `unlink ${path.basename(runFile.path)}`]);
+			assert.ok(!owned(runFile.path, instance));
+			assert.ok(!fs.existsSync(runFile.path));
+		});
+
+		test('partial-write cleanup: a failed unlink keeps the path owned; the explicit reset deletes it (2 attempts)', async () => {
+			// NEGATIVE CONTROL: put `this.liveRunFiles.delete(runPath)` back as the first statement of writeRunFile's
+			// catch -> the path is forgotten, resetInstance finds nothing, the partial file survives with 1 attempt -> RED.
+			const instance = ServerDataCache.getInstance();
+			(fsModule.promises as unknown as { writeFile: unknown }).writeFile = async (target: string, data: string, options: object): Promise<void> => {
+				await realWriteFile(target, data.slice(0, 10), options as fs.WriteFileOptions);
+				throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' });
+			};
+			ebusyBudget = 1;
+
+			await assert.rejects(
+				() => instance.writeRunFile(SOURCE, '1D'),
+				/Failed to write run data file .*EIO.*removing the partial file also failed: EBUSY/
+			);
+			const [partial] = fs.readdirSync(runDir);
+			assert.ok(partial, 'the partial file is left behind');
+			const partialPath = path.join(runDir, partial);
+			assert.strictEqual(attempts.length, 1);
+			assert.ok(owned(partialPath, instance), 'the failed cleanup keeps the path owned');
+
+			ServerDataCache.resetInstance();
+			assert.strictEqual(attempts.length, 2);
+			assert.ok(!owned(partialPath, instance));
+			assert.ok(!fs.existsSync(partialPath));
+		});
+
+		test('partial-write cleanup that succeeds releases the path at once', async () => {
+			const instance = ServerDataCache.getInstance();
+			(fsModule.promises as unknown as { writeFile: unknown }).writeFile = async (target: string, data: string, options: object): Promise<void> => {
+				await realWriteFile(target, data.slice(0, 10), options as fs.WriteFileOptions);
+				throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' });
+			};
+
+			await assert.rejects(() => instance.writeRunFile(SOURCE, '1D'), /Failed to write run data file .*EIO/);
+			assert.strictEqual(attempts.length, 1);
+			assert.deepStrictEqual(fs.readdirSync(runDir), []);
+			assert.strictEqual((instance as unknown as { liveRunFiles: Set<string> }).liveRunFiles.size, 0);
+		});
+
+		test('two concurrent disposes of one file share one unlink attempt', async () => {
+			const runFile = await ServerDataCache.getInstance().writeRunFile(SOURCE, '1D');
+
+			await Promise.all([runFile.dispose(), runFile.dispose()]);
+
+			assert.strictEqual(attempts.length, 1);
+			assert.ok(!fs.existsSync(runFile.path));
+		});
+
+		test('a file that is already gone (ENOENT) is reported once, then no longer owned', async () => {
+			const instance = ServerDataCache.getInstance();
+			const runFile = await instance.writeRunFile(SOURCE, '1D');
+			fs.unlinkSync(runFile.path);
+			attempts = [];
+
+			await assert.rejects(() => runFile.dispose(), /ENOENT/);
+			assert.ok(!owned(runFile.path, instance), 'nothing is left to own');
+			await runFile.dispose();
+			assert.strictEqual(attempts.length, 1);
+		});
 	});
 
 	test('a bar without volume is refused, never written as 0', async () => {

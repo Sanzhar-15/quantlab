@@ -206,11 +206,15 @@ export class ExtHostQuantlabHost implements ExtHostQuantlabHostShape {
 	}
 
 	$onState(handle: number, state: QuantlabSubscriptionStateDto, epoch: number): void {
-		const entry = this._deliverable(handle, epoch);
+		// `closed` and `error` are terminal. Their bookkeeping does not depend on the epoch: only DATA (and the
+		// non-terminal states) must belong to the current identity, while a terminal state of an older epoch still
+		// has to end its subscriber and forget the handle, or the handle would live on with nobody to end it.
+		const terminal = state.kind === 'closed' || state.kind === 'error';
+		const entry = terminal ? this._openEntry(handle) : this._deliverable(handle, epoch);
 		if (entry === undefined) {
 			return;
 		}
-		if (state.kind === 'closed') {
+		if (terminal) {
 			// The main side has ended and forgotten this subscription: nothing is owed on dispose.
 			entry.phase = 'ended';
 			this._subscriptions.delete(handle);
@@ -328,11 +332,19 @@ export class ExtHostQuantlabHost implements ExtHostQuantlabHostShape {
 		}
 	}
 
-	/** The entry a delivery is for, or `undefined` when it is dropped (unknown handle, or an epoch that is not the current one). */
-	private _deliverable(handle: number, epoch: number): ISubscriptionEntry | undefined {
+	/** The entry of an open subscription, or `undefined` (logged) when the handle is not open. */
+	private _openEntry(handle: number): ISubscriptionEntry | undefined {
 		const entry = this._subscriptions.get(handle);
 		if (entry === undefined) {
 			this._logService.debug(`${LOG_PREFIX} dropped a delivery for handle ${handle}, which is not open`);
+		}
+		return entry;
+	}
+
+	/** The entry a delivery is for, or `undefined` when it is dropped (unknown handle, or an epoch that is not the current one). */
+	private _deliverable(handle: number, epoch: number): ISubscriptionEntry | undefined {
+		const entry = this._openEntry(handle);
+		if (entry === undefined) {
 			return undefined;
 		}
 		if (this._identity === undefined || epoch !== this._identity.epoch) {

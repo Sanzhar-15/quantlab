@@ -511,6 +511,45 @@ suite('QuantlabHostIdentityService - data', () => {
 		assert.strictEqual(dataCalls.length, 1, 'no unsubscribe is sent for a subscription the host ended');
 	});
 
+	// `closed` and `error` are both terminal and release the handle whatever their epoch (the service holds no identity): the
+	// frame is delivered, later frames are dropped, and an unsubscribe is refused without any invoke.
+	// Planted negative control: restore `frame.state.kind === 'closed'` alone in onFrame: the 'error' run keeps the handle, the
+	// later data frame is delivered and unsubscribe() sends an unsubscribe invoke instead of throwing.
+	for (const kind of ['closed', 'error'] as const) {
+		test(`an old-epoch '${kind}' state frame after a newer frame is delivered and releases the handle; unsubscribe then sends nothing`, async () => {
+			dataImpl = async () => ({ ok: true, data: null });
+			const service = await createService();
+			const frames = received(service);
+
+			await service.subscribe(4, 'ticks', null, 1);
+			sendFrame({ handle: 4, epoch: 2, kind: 'data', data: 'epoch 2' });
+			sendFrame({ handle: 4, epoch: 1, kind: 'state', state: { kind, message: 'review-ended' } });
+			sendFrame({ handle: 4, epoch: 2, kind: 'data', data: 'late' });
+
+			assert.deepStrictEqual(frames, [
+				{ handle: 4, epoch: 2, kind: 'data', data: 'epoch 2' },
+				{ handle: 4, epoch: 1, kind: 'state', state: { kind, message: 'review-ended' } },
+			]);
+			assert.throws(() => service.unsubscribe(4), /not subscribed/);
+			assert.strictEqual(dataCalls.length, 1, 'no unsubscribe is sent for a subscription the host ended');
+			assert.strictEqual(unknownHandleLines().length, 1);
+		});
+	}
+
+	test('a non-terminal state frame keeps the handle: unsubscribe sends its invoke', async () => {
+		dataImpl = async () => ({ ok: true, data: null });
+		const service = await createService();
+		received(service);
+
+		await service.subscribe(4, 'ticks', null, 1);
+		sendFrame({ handle: 4, epoch: 1, kind: 'state', state: { kind: 'reconnecting' } });
+		dataImpl = async () => null;
+		service.unsubscribe(4);
+
+		assert.strictEqual(dataCalls.length, 2);
+		assert.strictEqual(dataCalls[1].channel, QUANTLAB_HOST_DATA_UNSUBSCRIBE_CHANNEL);
+	});
+
 	// Security-relevant: frames are only delivered for handles this window subscribed.
 	// Planted negative control: drop the openHandles check in onFrame and `frames` is no longer empty.
 	test('a frame for an unknown handle is logged once and dropped', async () => {

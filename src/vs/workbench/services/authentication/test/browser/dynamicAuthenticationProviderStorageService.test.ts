@@ -133,84 +133,242 @@ suite('DynamicAuthenticationProviderStorageService', () => {
 		{ name: 'a valid entry followed by an invalid entry', raw: `[{"providerId":"p1","clientId":"${LIST_MARKER}","label":"Label","authorizationServer":"https://as.example"},{"providerId":"p2","clientId":7,"label":"Other","authorizationServer":"https://as.example"}]`, reason: 'entry 1 field clientId is not a string (number)' },
 	];
 
+	/** Puts an invalid stored list, credentials and sessions in place, then clears every recorder so only the call under test is seen. */
+	async function seedInvalidStoredList(raw: string): Promise<void> {
+		storeRaw(raw);
+		await secretStorageService.set(CREDENTIALS_KEY, CREDENTIALS_VALUE);
+		await secretStorageService.set(SESSIONS_KEY, SESSIONS_VALUE);
+		// Let the service's secret-change listener finish reading the seeded sessions before recording starts.
+		await timeout(0);
+		storageService.mutations.length = 0;
+		secretStorageService.mutations.length = 0;
+		logService.lines.length = 0;
+		logService.errors.length = 0;
+		logService.argumentTexts.length = 0;
+	}
+
+	/**
+	 * The three halves of "a read of an invalid stored list fails safely", each its own assertion so that none can hide behind
+	 * another: the named error, the storage left untouched, the log clean.
+	 */
+	function checksFor(raw: string, reason: string) {
+		/** The named error, carrying the key and reason through its placeholders, and no marker anywhere. */
+		function isSafeNamedError(error: unknown): true {
+			assert.ok(error instanceof InvalidStoredProviderListError, `expected InvalidStoredProviderListError, got ${error}`);
+			assert.strictEqual(error.name, 'InvalidStoredProviderListError');
+			assert.strictEqual(error.storageKey, PROVIDERS_STORAGE_KEY);
+			assert.strictEqual(error.reason, reason);
+			// The localized message (the English default here) carries the key and the reason through its placeholders.
+			assert.strictEqual(error.message, `Stored dynamic authentication provider list '${PROVIDERS_STORAGE_KEY}' is invalid: ${reason}. It was left unchanged.`);
+			assert.strictEqual(error.cause, undefined, 'the error carries no cause');
+			for (const text of errorTexts(error)) {
+				for (const marker of MARKERS) {
+					assert.ok(!text.includes(marker), `the propagated error holds marker ${marker}`);
+				}
+			}
+			return true;
+		}
+
+		/** The stored list, credentials and sessions are byte-identical, and nothing was stored, removed, set or deleted. */
+		async function assertStoragePreserved(): Promise<void> {
+			assert.strictEqual(readRaw(), raw, 'the stored list must stay byte-identical');
+			assert.deepStrictEqual(storageService.mutations, [], 'no list store or remove after a failed read');
+			assert.deepStrictEqual(secretStorageService.mutations, [], 'no secret set or delete after a failed read');
+			assert.strictEqual(await secretStorageService.get(CREDENTIALS_KEY), CREDENTIALS_VALUE, 'the stored credentials must stay byte-identical');
+			assert.strictEqual(await secretStorageService.get(SESSIONS_KEY), SESSIONS_VALUE, 'the stored sessions must stay byte-identical');
+		}
+
+		/** One error line naming the key and the reason, no other line, and neither the stored text nor a marker in any log argument. */
+		function assertLogClean(): void {
+			assert.strictEqual(logService.errors.length, 1, 'one error line per failed read');
+			assert.strictEqual(logService.lines.length, 1, 'no other log line');
+			const [line] = logService.lines;
+			assert.ok(!line.includes(raw), `log line holds the stored text: ${line}`);
+			assert.ok(line.includes(PROVIDERS_STORAGE_KEY), `log line names the key: ${line}`);
+			assert.ok(line.includes(reason), `log line names the reason: ${line}`);
+			for (const text of logService.argumentTexts) {
+				for (const marker of MARKERS) {
+					assert.ok(!text.includes(marker), `a log argument holds marker ${marker}: ${text}`);
+				}
+			}
+		}
+
+		/**
+		 * Runs `call`, then ALL THREE checks whatever any of them found, and throws one AggregateError naming every check that
+		 * failed: a wrong error never stops the storage and log checks from being reached.
+		 */
+		async function assertNamedErrorAndPreservation(call: () => unknown): Promise<void> {
+			let threw = false;
+			let thrown: unknown;
+			try {
+				await call();
+			} catch (error) {
+				threw = true;
+				thrown = error;
+			}
+			const failures: { check: string; error: Error }[] = [];
+			const run = async (check: string, assertion: () => unknown): Promise<void> => {
+				try {
+					await assertion();
+				} catch (error) {
+					failures.push({ check, error: error as Error });
+				}
+			};
+			await run('named error', () => {
+				assert.ok(threw, 'the call resolved instead of throwing the named error');
+				isSafeNamedError(thrown);
+			});
+			await run('storage preserved', assertStoragePreserved);
+			await run('log clean', assertLogClean);
+			if (failures.length > 0) {
+				throw new AggregateError(failures.map(f => f.error), failures.map(f => `${f.check}: ${f.error.message}`).join(' | '));
+			}
+		}
+
+		return { isSafeNamedError, assertStoragePreserved, assertLogClean, assertNamedErrorAndPreservation };
+	}
+
 	for (const { name, raw, reason } of invalidStoredValues) {
 		suite(`stored list is ${name}`, () => {
-			setup(async () => {
-				storeRaw(raw);
-				await secretStorageService.set(CREDENTIALS_KEY, CREDENTIALS_VALUE);
-				await secretStorageService.set(SESSIONS_KEY, SESSIONS_VALUE);
-				// Let the service's secret-change listener finish reading the seeded sessions before recording starts.
-				await timeout(0);
-				storageService.mutations.length = 0;
-				secretStorageService.mutations.length = 0;
-				logService.lines.length = 0;
-				logService.errors.length = 0;
-				logService.argumentTexts.length = 0;
-			});
+			const checks = checksFor(raw, reason);
 
-			/** The named error, carrying the key and reason through its placeholders, and no marker anywhere. */
-			function isSafeNamedError(error: unknown): true {
-				assert.ok(error instanceof InvalidStoredProviderListError, `expected InvalidStoredProviderListError, got ${error}`);
-				assert.strictEqual(error.name, 'InvalidStoredProviderListError');
-				assert.strictEqual(error.storageKey, PROVIDERS_STORAGE_KEY);
-				assert.strictEqual(error.reason, reason);
-				// The localized message (the English default here) carries the key and the reason through its placeholders.
-				assert.strictEqual(error.message, `Stored dynamic authentication provider list '${PROVIDERS_STORAGE_KEY}' is invalid: ${reason}. It was left unchanged.`);
-				assert.strictEqual(error.cause, undefined, 'the error carries no cause');
-				for (const text of errorTexts(error)) {
-					for (const marker of MARKERS) {
-						assert.ok(!text.includes(marker), `the propagated error holds marker ${marker}`);
-					}
-				}
-				return true;
-			}
-
-			async function assertNothingMutatedOrLeaked(): Promise<void> {
-				assert.strictEqual(readRaw(), raw, 'the stored list must stay byte-identical');
-				assert.deepStrictEqual(storageService.mutations, [], 'no list store or remove after a failed read');
-				assert.deepStrictEqual(secretStorageService.mutations, [], 'no secret set or delete after a failed read');
-				assert.strictEqual(await secretStorageService.get(CREDENTIALS_KEY), CREDENTIALS_VALUE, 'the stored credentials must stay byte-identical');
-				assert.strictEqual(await secretStorageService.get(SESSIONS_KEY), SESSIONS_VALUE, 'the stored sessions must stay byte-identical');
-
-				assert.strictEqual(logService.errors.length, 1, 'one error line per failed read');
-				assert.strictEqual(logService.lines.length, 1, 'no other log line');
-				const [line] = logService.lines;
-				assert.ok(!line.includes(raw), `log line holds the stored text: ${line}`);
-				assert.ok(line.includes(PROVIDERS_STORAGE_KEY), `log line names the key: ${line}`);
-				assert.ok(line.includes(reason), `log line names the reason: ${line}`);
-				for (const text of logService.argumentTexts) {
-					for (const marker of MARKERS) {
-						assert.ok(!text.includes(marker), `a log argument holds marker ${marker}: ${text}`);
-					}
-				}
-			}
+			setup(() => seedInvalidStoredList(raw));
 
 			test('getClientId throws the named error', async () => {
-				assert.throws(() => service.getClientId('p1'), isSafeNamedError);
-				await assertNothingMutatedOrLeaked();
+				await checks.assertNamedErrorAndPreservation(() => service.getClientId('p1'));
 			});
 
 			test('getInteractedProviders throws the named error', async () => {
-				assert.throws(() => service.getInteractedProviders(), isSafeNamedError);
-				await assertNothingMutatedOrLeaked();
+				await checks.assertNamedErrorAndPreservation(() => service.getInteractedProviders());
 			});
 
 			test('getClientRegistration for a provider with no stored credentials rejects with the named error', async () => {
-				await assert.rejects(service.getClientRegistration('p0'), isSafeNamedError);
-				await assertNothingMutatedOrLeaked();
+				await checks.assertNamedErrorAndPreservation(() => service.getClientRegistration('p0'));
 			});
 
 			test('storeClientRegistration rejects with the named error and writes nothing', async () => {
-				await assert.rejects(service.storeClientRegistration('p1', 'https://as.example', 'client-1', 'secret-new', 'Label', 0), isSafeNamedError);
-				await assertNothingMutatedOrLeaked();
+				await checks.assertNamedErrorAndPreservation(() => service.storeClientRegistration('p1', 'https://as.example', 'client-1', 'secret-new', 'Label', 0));
 			});
 
 			test('removeDynamicProvider rejects with the named error and deletes nothing', async () => {
-				await assert.rejects(service.removeDynamicProvider('p1', unregisterNothing), isSafeNamedError);
-				await assertNothingMutatedOrLeaked();
+				await checks.assertNamedErrorAndPreservation(() => service.removeDynamicProvider('p1', unregisterNothing));
 			});
 		});
 	}
+
+	// review-c1 item 10 (second paragraph): the storage-preservation and no-log assertions must be able to fail on their own. Each
+	// plant below is a subclass or a log wrapper in THIS file (the product is untouched) that lets the call still raise the
+	// named error, so the named-error assertion passes, and adds one forbidden effect, so exactly one preservation assertion fails.
+	suite('the preservation assertions fail on their own', () => {
+		const { raw, reason } = invalidStoredValues[1];
+		const checks = checksFor(raw, reason);
+
+		class PlantedService extends DynamicAuthenticationProviderStorageService {
+			syncPlant: () => void = () => { };
+			asyncPlant: () => Promise<void> = async () => { };
+			// The plant runs AFTER the product call has raised the named error (and is not allowed to replace it).
+			override getInteractedProviders(): ReturnType<DynamicAuthenticationProviderStorageService['getInteractedProviders']> {
+				try {
+					return super.getInteractedProviders();
+				} finally {
+					this.syncPlant();
+				}
+			}
+			override async removeDynamicProvider(providerId: string, unregister: () => void): Promise<void> {
+				try {
+					return await super.removeDynamicProvider(providerId, unregister);
+				} finally {
+					await this.asyncPlant();
+				}
+			}
+		}
+
+		/** The log wrapper of a "marker log" plant: the product's own one error line also carries a marker. */
+		class MarkerInErrorLineLogService extends RecordingLogService {
+			override error(message: string | Error, ...args: unknown[]): void { super.error(message, ...args, CREDENTIAL_MARKER); }
+		}
+
+		function plantedService(log: RecordingLogService = logService): PlantedService {
+			return disposables.add(new PlantedService(storageService, secretStorageService, log));
+		}
+
+		const storeList = (value: string) => storageService.store(PROVIDERS_STORAGE_KEY, value, StorageScope.APPLICATION, StorageTarget.MACHINE);
+
+		setup(() => seedInvalidStoredList(raw));
+
+		test('control: the unplanted service passes all three checks', async () => {
+			await checks.assertNamedErrorAndPreservation(() => service.getInteractedProviders());
+		});
+
+		test('planted list rewrite to []: the named error passes, only the storage assertion fails', async () => {
+			const planted = plantedService();
+			planted.syncPlant = () => storeList('[]');
+
+			assert.throws(() => planted.getInteractedProviders(), checks.isSafeNamedError);
+			await assert.rejects(checks.assertStoragePreserved(), /the stored list must stay byte-identical/);
+			checks.assertLogClean();
+		});
+
+		test('planted list store of the identical bytes: the named error passes, only the mutation assertion fails', async () => {
+			const planted = plantedService();
+			planted.syncPlant = () => storeList(raw);
+
+			assert.throws(() => planted.getInteractedProviders(), checks.isSafeNamedError);
+			await assert.rejects(checks.assertStoragePreserved(), /no list store or remove after a failed read/);
+			checks.assertLogClean();
+		});
+
+		test('planted credential delete: the named error passes, only the secret-mutation assertion fails', async () => {
+			const planted = plantedService();
+			planted.asyncPlant = () => secretStorageService.delete(CREDENTIALS_KEY);
+
+			await assert.rejects(planted.removeDynamicProvider('p1', unregisterNothing), checks.isSafeNamedError);
+			await assert.rejects(checks.assertStoragePreserved(), /no secret set or delete after a failed read/);
+			checks.assertLogClean();
+		});
+
+		test('planted marker in the one error line: the named error and the storage pass, only the log assertion fails', async () => {
+			const leaky = disposables.add(new MarkerInErrorLineLogService());
+			const planted = plantedService(leaky);
+			logService = leaky;
+
+			assert.throws(() => planted.getInteractedProviders(), checks.isSafeNamedError);
+			await checks.assertStoragePreserved();
+			assert.throws(() => checks.assertLogClean(), new RegExp(`a log argument holds marker ${CREDENTIAL_MARKER}`));
+		});
+
+		test('planted extra log line carrying a marker: the named error and the storage pass, only the log assertion fails', async () => {
+			const planted = plantedService();
+			planted.syncPlant = () => logService.info(`session ${SESSION_MARKER}`);
+
+			assert.throws(() => planted.getInteractedProviders(), checks.isSafeNamedError);
+			await checks.assertStoragePreserved();
+			assert.throws(() => checks.assertLogClean(), /no other log line/);
+		});
+
+		test('a call that swallows the error is reported by the named-error check while the storage and log checks are still reached', async () => {
+			const swallowing = plantedService();
+			swallowing.getInteractedProviders = () => [];
+
+			await assert.rejects(checks.assertNamedErrorAndPreservation(() => swallowing.getInteractedProviders()), (error: unknown) => {
+				assert.ok(error instanceof AggregateError);
+				// the swallowing call logged nothing, so the log check fails with it: the named-error check is not the only one reached
+				assert.deepStrictEqual(error.message.split(' | ').map(part => part.split(':')[0]), ['named error', 'log clean']);
+				return true;
+			});
+		});
+
+		test('a call that swallows the error and rewrites the list fails the named-error, the storage and the log checks together', async () => {
+			const rewriting = plantedService();
+			rewriting.getInteractedProviders = () => { storeList('[]'); return []; };
+
+			await assert.rejects(checks.assertNamedErrorAndPreservation(() => rewriting.getInteractedProviders()), (error: unknown) => {
+				assert.ok(error instanceof AggregateError);
+				assert.deepStrictEqual(error.message.split(' | ').map(part => part.split(':')[0]), ['named error', 'storage preserved', 'log clean']);
+				return true;
+			});
+		});
+	});
 
 	suite('stored list is absent', () => {
 		test('getInteractedProviders returns an empty list', () => {

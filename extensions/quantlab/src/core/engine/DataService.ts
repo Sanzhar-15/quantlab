@@ -27,6 +27,14 @@ export interface MarketDataResult {
 }
 
 /**
+ * True for a host rejection: an Error carrying the string `code` the host gave it (and `status` for a server error).
+ * Classified by the code, never by the message text, as `isHostDataError` does for one named code.
+ */
+function isHostRefusal(error: unknown): error is Error & { readonly code: string; readonly status?: number } {
+	return typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string';
+}
+
+/**
  * Market data access for the extension.
  *
  * DT-3 (QL-DATA): this service holds NO market-data cache -- no server-bars
@@ -297,6 +305,11 @@ export class DataService {
 			return { requestId, data, meta };
 		} catch (error) {
 			if (error instanceof Error && error.message === 'Cancelled') {
+				throw error;
+			}
+			if (isHostRefusal(error)) {
+				// A host refusal (identity-changed, cancelled, not-signed-in, a server error with its status...) goes to the
+				// caller unchanged: wrapping it in a fresh Error would drop the code/status callers classify by.
 				throw error;
 			}
 			const message = error instanceof Error ? error.message : String(error);

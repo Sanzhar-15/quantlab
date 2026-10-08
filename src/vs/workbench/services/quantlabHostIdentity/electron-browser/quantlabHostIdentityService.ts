@@ -75,7 +75,7 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 	/** Source of request ids: unique for the life of this service (IPC-DATA `request.id`). */
 	private requestCounter = 0;
 
-	/** Handles subscribed and not yet ended (by `unsubscribe`, a refused subscribe or a `closed` frame). */
+	/** Handles subscribed and not yet ended (by `unsubscribe`, a refused subscribe, or a terminal `closed` or `error` frame). */
 	private readonly openHandles = new Set<number>();
 
 	/** Settles when the legacy-key purge has finished; it never rejects (every failure is logged and shown). */
@@ -278,8 +278,9 @@ export class QuantlabHostIdentityService extends Disposable implements IQuantlab
 			return;
 		}
 
-		if (frame.kind === 'state' && frame.state.kind === 'closed') {
+		if (frame.kind === 'state' && (frame.state.kind === 'closed' || frame.state.kind === 'error')) {
 			// The host ends the subscription with this frame and forgets it (IPC-DATA, rules): so does the service.
+			// Whatever its epoch: the service holds no identity, and a terminal frame must always release the handle.
 			this.openHandles.delete(frame.handle);
 		}
 		this._onDidReceiveFrame.fire(frame);
