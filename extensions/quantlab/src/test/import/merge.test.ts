@@ -29,4 +29,43 @@ suite('import – merge', () => {
 		assert.strictEqual(result.duplicates, 2);
 		assert.deepStrictEqual(result.merged, [{ key: 'cmd+a', command: 'one' }, { key: 'cmd+b', command: 'two' }]);
 	});
+
+	// Later entries win in VS Code: the winner of a key is the LAST entry bound to it.
+	const A = { key: 'cmd+k', command: 'one' };
+	const B = { key: 'cmd+k', command: 'two' };
+	const winner = (entries: unknown[], key: string) => [...entries].reverse().find(e => (e as { key: string }).key === key);
+
+	test('keybindings: mergeKeybindings([A,B],[A]) resolves to A, which is after B', () => {
+		const result = mergeKeybindings([A, B], [{ command: 'one', key: 'cmd+k' }]);
+		assert.deepStrictEqual(result.merged, [B, A]);
+		assert.deepStrictEqual(winner(result.merged, 'cmd+k'), A);
+		assert.strictEqual(result.added, 0);
+		assert.strictEqual(result.duplicates, 1);
+	});
+
+	test('keybindings: importing [A,B,A] resolves to A, as the source itself does', () => {
+		const result = mergeKeybindings([], [A, B, A]);
+		assert.deepStrictEqual(result.merged, [B, A]);
+		assert.deepStrictEqual(winner(result.merged, 'cmd+k'), A);
+		assert.strictEqual(result.added, 2);
+		assert.strictEqual(result.duplicates, 1);
+	});
+
+	test('keybindings: an identical re-import with no conflicting binding in between adds nothing and moves nothing', () => {
+		const C = { key: 'cmd+j', command: 'three' };
+		for (const existing of [[A], [A, C], [C, A], [B, A], [A, B]]) {
+			const result = mergeKeybindings(existing, [A]);
+			assert.strictEqual(result.added, 0);
+			// Only the case where B sits after the existing A may reorder (A must beat B again); every other case is untouched.
+			if (existing[0] === A && existing.includes(B)) {
+				assert.deepStrictEqual(result.merged, [B, A]);
+			} else {
+				assert.deepStrictEqual(result.merged, existing);
+			}
+		}
+		const twice = mergeKeybindings(mergeKeybindings([], [A, B, A]).merged, [A, B, A]);
+		assert.deepStrictEqual(twice.merged, [B, A]);
+		assert.strictEqual(twice.added, 0);
+	});
 });
+

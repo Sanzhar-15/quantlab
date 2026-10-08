@@ -59,24 +59,61 @@ export interface KeybindingsMerge {
 	duplicates: number;
 }
 
+/** The `key` string of a keybinding entry, or undefined when the entry has none (then it conflicts with nothing). */
+function keybindingKey(entry: unknown): string | undefined {
+	return isPlainObject(entry) && typeof entry.key === 'string' ? entry.key : undefined;
+}
+
 /**
- * Existing entries first, then the imported entries not already present (later entries win in VS Code,
- * so the imported ones go last).
+ * Existing entries first, then the imported ones; later entries win in VS Code, so order is precedence.
+ * An imported entry equal to one already present is not added again, but it is not allowed to lose
+ * precedence either: when a different entry bound to the same key sits between its first and its last
+ * occurrence in existing + imported (`[A, B, A]` for two commands on one key), the LAST occurrence is
+ * kept and the earlier ones dropped, so A still wins over B; when nothing conflicts between them, the
+ * first occurrence stays where it is, so an identical re-import changes nothing. Existing entries that
+ * the import does not repeat are never touched.
  */
 export function mergeKeybindings(existing: unknown[], imported: unknown[]): KeybindingsMerge {
-	const merged: unknown[] = [...existing];
-	const present = new Set<string>(existing.map(canonicalJson));
+	const sequence = [...existing, ...imported];
+	const canon = sequence.map(canonicalJson);
+	const importedCanon = new Set<string>(canon.slice(existing.length));
+	const occurrences = new Map<string, number[]>();
+	canon.forEach((c, index) => occurrences.set(c, [...(occurrences.get(c) ?? []), index]));
+
+	const dropped = new Set<number>();
+	for (const [c, indices] of occurrences) {
+		if (indices.length === 1 || !importedCanon.has(c)) {
+			continue;
+		}
+		const first = indices[0];
+		const last = indices[indices.length - 1];
+		const key = keybindingKey(sequence[first]);
+		let conflictBetween = false;
+		for (let j = first + 1; j < last && key !== undefined; j++) {
+			if (canon[j] !== c && keybindingKey(sequence[j]) === key) {
+				conflictBetween = true;
+				break;
+			}
+		}
+		const kept = conflictBetween ? last : first;
+		for (const index of indices) {
+			if (index !== kept) {
+				dropped.add(index);
+			}
+		}
+	}
+
+	const present = new Set<string>(canon.slice(0, existing.length));
 	let added = 0;
 	let duplicates = 0;
 	for (const entry of imported) {
-		const key = canonicalJson(entry);
-		if (present.has(key)) {
+		const c = canonicalJson(entry);
+		if (present.has(c)) {
 			duplicates++;
 		} else {
-			present.add(key);
-			merged.push(entry);
+			present.add(c);
 			added++;
 		}
 	}
-	return { merged, added, duplicates };
+	return { merged: sequence.filter((_, index) => !dropped.has(index)), added, duplicates };
 }
