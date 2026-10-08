@@ -134,11 +134,14 @@ function assertParses(content: string): void {
 	}
 }
 
-/**
- * Counts the full-document passes (a tokenizer or parser traversal of the whole content) that {@link removeNeverSyncedSettings}
- * makes. The function takes it as an argument, so that a test reads the count off the real function, whatever the content.
- */
-export interface INeverSyncedPasses {
+/** What {@link removeNeverSyncedSettings} returns: the content, and how many full-document passes (a tokenizer or parser traversal of the whole content) it made. */
+export interface INeverSyncedRemoval {
+	readonly content: string;
+	readonly fullDocumentPasses: number;
+}
+
+/** The running count of full-document passes of one removal. */
+interface IPassCount {
 	fullDocumentPasses: number;
 }
 
@@ -163,7 +166,7 @@ interface IRootScan {
  * errors. The tokenizer recovers from syntax errors, so this also reads content the ordinary ignored-settings removal left
  * with errors (all settings removed from `{ "a": 1, }` leaves `{ , }`, which upstream uploads as it is).
  */
-function scanRoot(content: string, passes: INeverSyncedPasses): IRootScan {
+function scanRoot(content: string, passes: IPassCount): IRootScan {
 	passes.fullDocumentPasses++;
 	const properties: IRootProperty[] = [];
 	let rootOffset: number | undefined;
@@ -271,13 +274,14 @@ function applySortedEdits(content: string, edits: Edit[]): string {
  * Removes EVERY top-level occurrence of each {@link NEVER_SYNCED_SETTINGS} key, however often the raw text writes it, in a
  * bounded number of full-document passes whatever the duplicate count: one traversal collects the ranges of all of them, one
  * batch of edits removes them, one traversal checks the result, and the parsed object is read once more (at most three
- * passes, counted in `passes`). Content that holds no key comes back as it came in. A throw ({@link NeverSyncedSettingsError})
+ * passes, returned as `fullDocumentPasses`). Content that holds no key comes back as it came in. A throw ({@link NeverSyncedSettingsError})
  * means a key is still there, or the removal left the content with more syntax errors than it had (counts are compared; a new
  * error that replaced an old one is not detected): content that leaves
  * this machine is never passed on unchecked. The last check, on the parsed object, is a second property-presence check, not an
  * independent parser (`parse` runs on the same tokenizer).
  */
-export function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions, passes: INeverSyncedPasses = { fullDocumentPasses: 0 }): string {
+export function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions): INeverSyncedRemoval {
+	const passes: IPassCount = { fullDocumentPasses: 0 };
 	const before = scanRoot(content, passes);
 	if (before.properties.some(property => NEVER_SYNCED_SETTINGS.includes(property.name))) {
 		const { batch, leading } = planRemovals(before);
@@ -305,7 +309,7 @@ export function removeNeverSyncedSettings(content: string, formattingOptions: Fo
 			throw new NeverSyncedSettingsError(`Settings content still holds never-synced settings after their removal: ${left.join(', ')}`);
 		}
 	}
-	return content;
+	return { content, fullDocumentPasses: passes.fullDocumentPasses };
 }
 
 /**
@@ -372,8 +376,8 @@ export function updateIgnoredSettingsForRemote(targetContent: string, sourceCont
 	assertParses(targetContent);
 	// The keys go first, whole: updateIgnoredSettings would remove one occurrence of each and, from an object whose only
 	// setting is a key followed by a comma, leave `{ , }`. Content that holds no key comes back from this as it is.
-	targetContent = removeNeverSyncedSettings(targetContent, formattingOptions);
-	return removeNeverSyncedSettings(updateIgnoredSettings(targetContent, sourceContent, ignoredSettings, formattingOptions), formattingOptions);
+	targetContent = removeNeverSyncedSettings(targetContent, formattingOptions).content;
+	return removeNeverSyncedSettings(updateIgnoredSettings(targetContent, sourceContent, ignoredSettings, formattingOptions), formattingOptions).content;
 }
 
 export function merge(originalLocalContent: string, originalRemoteContent: string, baseContent: string | null, ignoredSettings: string[], resolvedConflicts: { key: string; value: any | undefined }[], formattingOptions: FormattingOptions): IMergeResult {
@@ -403,7 +407,7 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 		return {
 			conflictsSettings: [],
 			localContent: updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions),
-			remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions) : null,
+			remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions).content : null,
 			hasConflicts: false
 		};
 	}
@@ -411,7 +415,7 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 	/* local is empty and not synced before */
 	if (baseContent === null && isEmpty(originalLocalContent)) {
 		const localContent = areSame(originalLocalContent, originalRemoteContent, ignoredSettings) ? null : updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions);
-		return { conflictsSettings: [], localContent, remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions) : null, hasConflicts: false };
+		return { conflictsSettings: [], localContent, remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions).content : null, hasConflicts: false };
 	}
 
 	/* remote and local has changed */
@@ -530,7 +534,7 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 		}
 	}
 
-	remoteContent = removeNeverSyncedSettings(remoteContent, formattingOptions);
+	remoteContent = removeNeverSyncedSettings(remoteContent, formattingOptions).content;
 
 	const hasConflicts = conflicts.size > 0 || !areSame(localContent, remoteContent, ignoredSettings);
 	const hasLocalChanged = hasConflicts || !areSame(localContent, originalLocalContent, []);

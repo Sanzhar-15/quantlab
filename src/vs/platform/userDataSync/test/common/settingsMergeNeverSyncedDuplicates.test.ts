@@ -9,7 +9,7 @@ import { FormattingOptions } from '../../../../base/common/jsonFormatter.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
 import * as contentUtil from '../../common/content.js';
-import { getIgnoredSettings, INeverSyncedPasses, merge, NEVER_SYNCED_SETTINGS, NeverSyncedSettingsError, removeNeverSyncedSettings, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
+import { getIgnoredSettings, merge, NEVER_SYNCED_SETTINGS, NeverSyncedSettingsError, removeNeverSyncedSettings, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
 import { assertNoNeverSynced, assertRawOccurrences, assertNoNeverSyncedProperty, assertOrdinaryKept, DEMO_EMAIL, DEMO_PASSWORD, IRawSettings, RawStyle, rawSettings, topLevelPropertyNames } from './rawNeverSyncedSettings.js';
 
 // QuantLab F-SYNC-STRIP-1 (M1): content built to leave the machine holds NO occurrence of a never-synced key and none of its
@@ -276,21 +276,20 @@ suite('SettingsMerge - never-synced settings written more than once (STRIP-1)', 
 		const counts: number[] = [];
 		for (const occurrences of [1, 4, 100, 2000]) {
 			const fixture = rawSettings([DEMO_EMAIL, DEMO_PASSWORD], occurrences, 'plain', 'SENTINEL', 'local');
-			const passes: INeverSyncedPasses = { fullDocumentPasses: 0 };
-			const actual = removeNeverSyncedSettings(fixture.text, formattingOptions, passes);
+			const { content: actual, fullDocumentPasses } = removeNeverSyncedSettings(fixture.text, formattingOptions);
 			// every sentinel value starts with the fixture tag: one scan for all of them
 			assertOutbound(actual, ['SENTINEL-'], fixture.ordinary, `${occurrences} duplicates of each key`);
-			assert.ok(passes.fullDocumentPasses <= MAX_FULL_DOCUMENT_PASSES, `${occurrences} duplicates of each key took ${passes.fullDocumentPasses} full-document passes`);
-			counts.push(passes.fullDocumentPasses);
+			assert.ok(fullDocumentPasses <= MAX_FULL_DOCUMENT_PASSES, `${occurrences} duplicates of each key took ${fullDocumentPasses} full-document passes`);
+			counts.push(fullDocumentPasses);
 		}
 		assert.deepStrictEqual(counts, [counts[0], counts[0], counts[0], counts[0]], 'the pass count must not depend on the duplicate count');
 	});
 
 	test('content that holds no key is read in at most 3 passes and comes back unchanged', () => {
-		const passes: INeverSyncedPasses = { fullDocumentPasses: 0 };
 		const content = '{\n\t// a comment\n\t"local.y": 2,\n}';
-		assert.strictEqual(removeNeverSyncedSettings(content, formattingOptions, passes), content);
-		assert.ok(passes.fullDocumentPasses >= 1 && passes.fullDocumentPasses <= MAX_FULL_DOCUMENT_PASSES, String(passes.fullDocumentPasses));
+		const removal = removeNeverSyncedSettings(content, formattingOptions);
+		assert.strictEqual(removal.content, content);
+		assert.ok(removal.fullDocumentPasses >= 1 && removal.fullDocumentPasses <= MAX_FULL_DOCUMENT_PASSES, String(removal.fullDocumentPasses));
 	});
 
 	test('2,000 duplicates of each key: the outbound content is clean through every outbound entry point', () => {
@@ -318,7 +317,7 @@ suite('SettingsMerge - never-synced settings written more than once (STRIP-1)', 
 			{ name: 'compact, the only property', input: `{${email}}`, expected: '{}' },
 		];
 		for (const { name, input, expected } of cases) {
-			assert.strictEqual(removeNeverSyncedSettings(input, formattingOptions), expected, name);
+			assert.strictEqual(removeNeverSyncedSettings(input, formattingOptions).content, expected, name);
 		}
 	});
 
