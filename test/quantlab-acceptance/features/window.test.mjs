@@ -13,7 +13,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import { test } from 'node:test';
 import { pressNativeDialog } from './native-dialog.mjs';
-import { awaitModal, checkDialogStyle, modalSurfaces, pressModal } from './window.mjs';
+import { awaitModal, checkDialogStyle, modalSurfaces, pressModal, readToasts, waitForWorkbench } from './window.mjs';
 
 const MESSAGE = 'Import settings, keybindings and extensions from VS Code?';
 const BUTTON = 'Import';
@@ -154,13 +154,9 @@ const TRUST_MESSAGE = 'Do you trust the publisher "ms-python"?';
 const TRUST_BUTTON = 'Trust Publisher & Install';
 const FAST = { ...LIMITS, waitMs: 200 };
 
-/**
- * A fake CDP connection onto a fake workbench: `box` is the open .monaco-dialog-box ({ text, buttons: [labels] }) or null, `clicked`
- * the labels pressed. Runtime.evaluate runs the expression window.mjs sends (the real in-page function) against a fake `document`.
- */
-function fakeWorkbench(box = null) {
-	const wb = { box, clicked: [], evaluations: 0 };
-	const document = {
+/** The fake `document` of a workbench frame holding the dialog `wb.box` ({ text, buttons: [labels] } or null); a press is recorded in `wb.clicked`. */
+function dialogDocument(wb) {
+	return {
 		querySelector: selector => {
 			if (selector !== '.monaco-dialog-box' || wb.box === null) {
 				return null;
@@ -171,6 +167,15 @@ function fakeWorkbench(box = null) {
 			};
 		},
 	};
+}
+
+/**
+ * A fake CDP connection onto a fake workbench: `box` is the open .monaco-dialog-box ({ text, buttons: [labels] }) or null, `clicked`
+ * the labels pressed. Runtime.evaluate runs the expression window.mjs sends (the real in-page function) against a fake `document`.
+ */
+function fakeWorkbench(box = null) {
+	const wb = { box, clicked: [], evaluations: 0 };
+	const document = dialogDocument(wb);
 	const url = 'vscode-file://vscode-app/workbench.html';
 	wb.cdp = {
 		send: async method => {
@@ -314,4 +319,100 @@ test('DOM surface: a dialog gone between the reading and the click throws [modal
 	const wb = fakeWorkbench(null);
 	await assert.rejects(modalSurfaces(wb.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST }).dom.press(), /\[modal_dom_changed\] .*nothing was clicked/);
 	assert.deepStrictEqual(wb.clicked, []);
+});
+
+// --- a failed observation in any frame fails the observation (review RULING c1, item 7) ---
+const WB_A = 'vscode-file://a/workbench.html';
+const WB_B = 'vscode-file://b/workbench.html';
+
+/** The fake `document` of a workbench frame that shows the notification toasts `texts`. */
+const toastDocument = texts => ({
+	querySelector: selector => selector === '.monaco-workbench' ? {} : null,
+	querySelectorAll: selector => selector === '.notifications-toasts .notification-list-item-message' ? texts.map(text => ({ textContent: ` ${text} ` })) : [],
+});
+
+/**
+ * A fake CDP connection onto several frames, each its own page target: `specs` = [{ url, document, exception?, reject?, attachFails? }].
+ * A frame with `exception` answers Runtime.evaluate with exceptionDetails, one with `reject` rejects the request, one with
+ * `attachFails` rejects Target.attachToTarget. `fx.frames` may change between calls (fx.add); `fx.asked` lists the frame URLs evaluated.
+ */
+function fakeFrames(specs) {
+	let seq = 0;
+	const fx = { frames: [], asked: [] };
+	fx.add = spec => {
+		const frame = { ...spec, targetId: `T${++seq}`, frameId: `F${seq}` };
+		fx.frames.push(frame);
+		return frame;
+	};
+	specs.forEach(fx.add);
+	fx.cdp = {
+		send: async (method, params, sessionId) => {
+			switch (method) {
+				case 'Target.getTargets': return { targetInfos: fx.frames.map(f => ({ type: 'page', url: f.url, targetId: f.targetId })) };
+				case 'Target.attachToTarget': {
+					if (fx.frames.find(f => f.targetId === params.targetId).attachFails) {
+						throw new Error('fake CDP: attach refused');
+					}
+					return { sessionId: `S-${params.targetId}` };
+				}
+				case 'Page.getFrameTree': {
+					const frame = fx.frames.find(f => `S-${f.targetId}` === sessionId);
+					return { frameTree: { frame: { id: frame.frameId, url: frame.url } } };
+				}
+				case 'Page.createIsolatedWorld': return { executionContextId: params.frameId };
+				case 'Runtime.evaluate': {
+					const frame = fx.frames.find(f => f.frameId === params.contextId);
+					fx.asked.push(frame.url);
+					if (frame.reject !== undefined) {
+						throw new Error(frame.reject);
+					}
+					if (frame.exception !== undefined) {
+						return { exceptionDetails: { text: 'Uncaught', exception: { description: frame.exception } } };
+					}
+					return { result: { value: new Function('document', `return ${params.expression}`)(frame.document) } };
+				}
+				case 'Target.detachFromTarget': return {};
+				default: throw new Error(`fake CDP: unexpected ${method}`);
+			}
+		},
+	};
+	return fx;
+}
+
+test('readToasts: one workbench frame answers [] and another reports exceptionDetails -> [workbench_observation_failed] naming the frame and the error, not []', async () => {
+	for (const order of [[0, 1], [1, 0]]) {
+		const specs = [{ url: WB_A, document: toastDocument([]) }, { url: WB_B, document: toastDocument([]), exception: 'ReferenceError: oops is not defined' }];
+		const fx = fakeFrames(order.map(i => specs[i]));
+		await assert.rejects(readToasts(fx.cdp), /^Error: \[workbench_observation_failed\] 1 frame\(s\) could not be observed \(1 answered\): vscode-file:\/\/b\/workbench\.html: ReferenceError: oops is not defined$/);
+		assert.strictEqual(fx.asked.length, 2, 'both frames were evaluated');
+	}
+	// Control: both answer -> the one frame's toasts.
+	assert.deepStrictEqual(await readToasts(fakeFrames([{ url: WB_A, document: toastDocument(['hello']) }, { url: WB_B, document: { querySelector: () => null } }]).cdp), ['hello']);
+});
+
+test('readToasts: a rejected CDP request in one frame fails the observation by name although another frame answered', async () => {
+	const fx = fakeFrames([{ url: WB_A, document: toastDocument([]) }, { url: WB_B, document: toastDocument([]), reject: 'Runtime.evaluate: Cannot find context with specified id' }]);
+	await assert.rejects(readToasts(fx.cdp), /^Error: \[workbench_observation_failed\] 1 frame\(s\) could not be observed \(1 answered\): vscode-file:\/\/b\/workbench\.html: Runtime\.evaluate: Cannot find context with specified id$/);
+});
+
+test('waitForWorkbench: a failed frame observation is thrown by name, not read as "the workbench is there"', async () => {
+	const fx = fakeFrames([{ url: WB_A, document: toastDocument([]) }, { url: WB_B, document: toastDocument([]), exception: 'TypeError: boom' }]);
+	await assert.rejects(waitForWorkbench(fx.cdp, 5000), /\[workbench_observation_failed\] .*vscode-file:\/\/b\/workbench\.html: TypeError: boom/);
+});
+
+test('observation: a target that is neither vscode-file:// nor vscode-webview:// stays excluded before evaluation (never attached, never an error)', async () => {
+	const fx = fakeFrames([{ url: WB_A, document: toastDocument(['x']) }, { url: '', document: null, attachFails: true, reject: 'must not be evaluated' }]);
+	assert.deepStrictEqual(await readToasts(fx.cdp), ['x']);
+	assert.deepStrictEqual(fx.asked, [WB_A]);
+});
+
+test('DOM surface: a failed frame observation fails read() and the modal wait by name even when another workbench frame shows the dialog; nothing is clicked', async () => {
+	const shown = { box: { text: MESSAGE, buttons: [BUTTON, 'Cancel'] }, clicked: [] };
+	for (const failure of [{ exception: 'Error: frame detached' }, { reject: 'Runtime.evaluate: Execution context was destroyed' }]) {
+		const fx = fakeFrames([{ url: WB_A, document: dialogDocument(shown) }, { url: WB_B, document: dialogDocument({ box: null, clicked: [] }), ...failure }]);
+		const surfaces = modalSurfaces(fx.cdp, importArgs, 4242, { scan: fakeApp({ present: [] }).scan, limits: FAST });
+		await assert.rejects(surfaces.dom.read(), /\[modal_observation_failed\] 1 frame\(s\) could not be observed \(1 answered\): vscode-file:\/\/b\/workbench\.html: /);
+		await assert.rejects(awaitModal(importArgs, surfaces, FAST), /\[modal_observation_failed\] .*vscode-file:\/\/b\/workbench\.html/);
+		assert.deepStrictEqual(shown.clicked, []);
+	}
 });

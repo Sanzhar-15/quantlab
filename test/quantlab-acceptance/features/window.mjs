@@ -30,14 +30,22 @@ async function until(what, timeoutMs, probe) {
 	throw new Error(`${what} (waited ${timeoutMs / 1000} s; last: ${last})`);
 }
 
-/** The values of `fn` in the frames where it reports `state` other than 'absent'; exactly one is required. */
+/**
+ * The values of `fn` in the frames where it reports `state` other than 'absent'; exactly one is required. Every frame that is
+ * evaluated must answer: an evaluation exception or a rejected CDP request in any of them throws [<what>_observation_failed]
+ * naming the frame and the error, even when another frame answered (an unread frame may hold the thing being looked for). Only
+ * the targets that are neither vscode-file:// nor vscode-webview:// are left out, and evaluateInFrames reports them as skipped.
+ */
 async function inOneFrame(cdp, matches, fn, arg, what) {
 	const { values, errors, skipped } = await evaluateInFrames(cdp, isAppSurface, matches, fn, arg);
+	if (errors.length > 0) {
+		throw new Error(`[${what}_observation_failed] ${errors.length} frame(s) could not be observed (${values.length} answered): ${errors.join(' | ')}`);
+	}
 	const present = values.filter(v => v.value.state !== 'absent');
 	if (present.length > 1) {
 		throw new Error(`[${what}_ambiguous] ${present.length} frames answer: ${present.map(v => v.url).join(', ')}`);
 	}
-	return { hit: present[0]?.value, observed: present.length === 0 ? `no frame (${values.length} evaluated; errors: ${errors.join(' | ') || 'none'}; targets not attached: ${skipped.join(', ') || 'none'})` : JSON.stringify(present[0].value) };
+	return { hit: present[0]?.value, observed: present.length === 0 ? `no frame (${values.length} evaluated; targets not attached: ${skipped.join(', ') || 'none'})` : JSON.stringify(present[0].value) };
 }
 
 // --- functions evaluated inside the Action view webview (serialised; no closures) ---
