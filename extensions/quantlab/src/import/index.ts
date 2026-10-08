@@ -6,7 +6,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { formatReport, ImportPorts, ImportTarget, runImport } from './importer';
+import { formatReport, ImportPorts, runImport } from './importer';
+import { importTarget } from './targets';
 import { EditorKind, editorExtensionsDir, editorLabel, editorUserDir, isEnoent, readEditorSnapshot } from './sources';
 
 interface EditorCandidate {
@@ -33,18 +34,7 @@ async function isAvailable(candidate: EditorCandidate): Promise<boolean> {
 		|| await exists(path.join(candidate.extensionsDir, 'extensions.json'));
 }
 
-/** The app's own `User` directory: `<userData>/User/globalStorage/<extension id>` is the extension's global storage. */
-function importTarget(context: vscode.ExtensionContext): ImportTarget {
-	const globalStorage = context.globalStorageUri.fsPath;
-	const parent = path.resolve(globalStorage, '..');
-	if (path.basename(parent) !== 'globalStorage') {
-		throw new Error(`Quantlab: cannot locate the user settings directory from the extension storage path ${globalStorage}`);
-	}
-	const userDir = path.resolve(parent, '..');
-	return { settingsPath: path.join(userDir, 'settings.json'), keybindingsPath: path.join(userDir, 'keybindings.json') };
-}
-
-async function importFromEditor(context: vscode.ExtensionContext): Promise<void> {
+async function importFromEditor(): Promise<void> {
 	const kinds: EditorKind[] = ['vscode', 'cursor'];
 	const candidates: EditorCandidate[] = kinds.map(kind => ({
 		kind,
@@ -78,7 +68,7 @@ async function importFromEditor(context: vscode.ExtensionContext): Promise<void>
 		source = picked.candidate;
 	}
 
-	const target = importTarget(context);
+	const target = await importTarget(command => vscode.commands.executeCommand(command));
 	const confirmed = await vscode.window.showWarningMessage(
 		`Import settings, keybindings and extensions from ${editorLabel(source.kind)}?`,
 		{
@@ -118,7 +108,7 @@ async function importFromEditor(context: vscode.ExtensionContext): Promise<void>
 export function registerImportCommands(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(vscode.commands.registerCommand('quantlab.importFromEditor', async () => {
 		try {
-			await importFromEditor(context);
+			await importFromEditor();
 		} catch (err: unknown) {
 			void vscode.window.showErrorMessage(`Quantlab: import failed. ${err instanceof Error ? err.message : String(err)}`);
 			throw err;
