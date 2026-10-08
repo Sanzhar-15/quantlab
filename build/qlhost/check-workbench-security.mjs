@@ -17,7 +17,8 @@
 // `return isWorkbenchFrame(parent, policy);`) -> rows 2, 7, 10, 10a, 12, 13, 14, 15, 16 RED;
 // (f) the `await this.qlRegisterFrame(encodedWebviewOrigin, targetWindow);` line removed from browser/webviewElement.ts ->
 // row 18 RED; (g) webviewRegistry.ts `bind` without its live-frame test (the `const bound` line and its `if` block) ->
-// rows 13, 16 RED.
+// rows 13, 16 RED; (h) c3: securityPolicy.ts isOwnedFrame's post-write branch (`return ownedIndexAuthority(parent, policy, webviews) ===
+// document.authority;` under the index.html rule) as `return false;` -> row 19 RED; (i) that branch as `return true;` -> row 19 RED.
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -207,14 +208,16 @@ expectAll('9 every other permission denied to owned documents', owned.flatMap(([
 	const app = read('code/electron-main/app.ts');
 	const body = app.slice(app.indexOf('private configureSession(): void {'), app.indexOf('//#region Request filtering'));
 	const request = /setPermissionRequestHandler\([^]*?isGrantedPermission\(webContents, permission, details\.requestingUrl, details\.isMainFrame, framePolicy\)[^]*?callback\(granted\)/.test(body);
-	const check = /setPermissionCheckHandler\([^]*?return isGrantedPermission\(webContents, permission, details\.requestingUrl, details\.isMainFrame, framePolicy\);/.test(body);
+	const check = /setPermissionCheckHandler\([^]*?const granted = isGrantedPermission\(webContents, permission, details\.requestingUrl, details\.isMainFrame, framePolicy\);[^]*?return granted;\n\t\t\}\);/.test(body);
+	// c3: the permission-frame lines are TEST-only (a product bundle drops them with the QL_TEST_BUILD define)
+	const testLines = count(body, /qlPermissionFrameLines\(/g) === 2 && count(body, /if \(globalThis\.QL_TEST_BUILD && !details\.isMainFrame\) \{\n\t+\/\/[^\n]*\n\t+this\.logService\.info\(`QuantLab host: test build: permission (request|check) \$\{permission\} granted=\$\{granted\} frames \$\{qlPermissionFrameLines\(webContents, details\.requestingUrl, framePolicy\)\}`\);\n\t+\}/g) === 2;
 	const stale = ['allowedPermissionsIn', 'alwaysAllowedPermissions', 'isUrlFromWebview', 'isUrlFromWindow', `'clipboard-read'`, `'local-fonts'`, `'pointerLock'`].filter(token => body.includes(token));
 	const windowImpl = read('platform/windows/electron-main/windowImpl.ts');
 	const doc = 'FileAccess.asBrowserUri(`vs/code/electron-browser/workbench/workbench${this.environmentMainService.isBuilt ? \'\' : \'-dev\'}.html`).toString(true)';
 	const sameDocument = app.includes(`workbenchDocument: ${doc}`) && windowImpl.includes(`windowUrl = ${doc}`);
 	const hostPolicy = /framePolicy: this\.qlFramePolicy\(\)/.test(app);
-	row('11 app.ts: both handlers call isGrantedPermission, no other set, workbench document as windowImpl loads it', request && check && stale.length === 0 && sameDocument && hostPolicy,
-		`request ${request}, check ${check}, stale tokens [${stale.join(', ')}], same document ${sameDocument}, host gets the policy ${hostPolicy}`);
+	row('11 app.ts: both handlers call isGrantedPermission, no other set, workbench document as windowImpl loads it; the frame lines are TEST-only', request && check && testLines && stale.length === 0 && sameDocument && hostPolicy,
+		`request ${request}, check ${check}, TEST-only frame lines ${testLines}, stale tokens [${stale.join(', ')}], same document ${sameDocument}, host gets the policy ${hostPolicy}`);
 }
 
 // ---- c2 M2 + M3: registration, not ancestry. Each case has its own contents (its own registrations) and fresh frames.
@@ -422,6 +425,34 @@ const securityOf = contents => {
 	row('18 wiring: one registry for the service and the policy; the element registers its frame name and authority and awaits it before the only src assignment; dispose unregisters',
 		oneRegistry && serviceWrites && awaited && srcSites === 1 && initCalls === 1 && registers && unregisters,
 		`one registry ${oneRegistry}; service writes it ${serviceWrites}; awaited before _initElement ${awaited}; src assignments ${srcSites}, _initElement calls ${initCalls}; element registers id + authority ${registers}; dispose unregisters ${unregisters}`);
+}
+
+{
+	// 19 (review c3 M2/M3): the content frame after stock index.html writes its document (contentDocument.open/write/close)
+	// reports its writer's URL, index.html, under the registered webview's own frame. Owned there, one level only, same authority.
+	const s = scene();
+	registry.register(s.contents, 'a', 'aaaa');
+	const bound = s.add('', s.top, 'a');
+	s.go(bound, INDEX_A);
+	const content = s.add('', bound, '');
+	const loads = s.go(content, FAKE_A);
+	content.url = INDEX_A; // the write: no navigation event, the frame now reports index.html
+	const blank = s.add('about:blank', content, '');
+	const deeper = s.add(INDEX_A, content, '');
+	const otherAuthority = s.add(INDEX_B, bound, '');
+	const navToIndex = s.go(s.add('', bound, ''), INDEX_A);
+	const twin = s.add(INDEX_A, s.top, 'twin');
+	const twinContent = s.add(INDEX_A, twin, '');
+	const webviews = registry.of(s.contents);
+	const owned = f => policyMod.isOwnedFrame(f, policy, webviews);
+	const grants = frames => GRANTED.map(p => policyMod.isGrantedPermission(contentsOf(s.top, frames), p, INDEX_A, false, { ...policy, webviews: () => webviews }));
+	const legit = grants([bound, content]);
+	const withTwin = grants([bound, content, twin, twinContent]);
+	const twinAlone = grants([twin, twinContent]);
+	const ok = loads && owned(content) && owned(blank) && !owned(deeper) && !owned(otherAuthority) && !navToIndex && !owned(twinContent)
+		&& legit.every(v => v === true) && withTwin.every(v => v === false) && twinAlone.every(v => v === false);
+	row('19 post-write content frame (index.html under the bound index.html) is owned, both permissions granted; deeper, other-authority, navigated-to and twin-held ones are not', ok,
+		`fake.html load ${loads}; content owned ${owned(content)}; blank under it ${owned(blank)}; deeper index.html ${owned(deeper)}; other authority ${owned(otherAuthority)}; navigation to index.html ${navToIndex}; twin content ${owned(twinContent)}; granted legit [${legit}], with twin [${withTwin}], twin alone [${twinAlone}]`);
 }
 
 console.log(rows.join('\n'));

@@ -107,7 +107,10 @@ const same = (got, want) => got.length === want.length && got.every((line, index
 	const end = app.indexOf('\n\t\t}\n', start);
 	const block = start < 0 ? '' : app.slice(start, end);
 	const outside = start < 0 ? app : app.slice(0, start) + app.slice(end);
-	const oneBlock = count(app, /globalThis\.QL_TEST_BUILD/g) === 2; // the comment above the block and the block's condition
+	// the comment above the block and the block's condition, plus (review c3 M2/M3) the two permission-frame guards in
+	// configureSession, which name no qlHost module but securityPolicy's line helper
+	const permissionGuards = count(app, /\t\t\tif \(globalThis\.QL_TEST_BUILD && !details\.isMainFrame\) \{\n\t+\/\/[^\n]*\n\t+this\.logService\.info\(`QuantLab host: test build: permission (request|check) /g);
+	const oneBlock = count(app, /globalThis\.QL_TEST_BUILD/g) === 2 + permissionGuards && permissionGuards === 2;
 	const dynamicInside = count(block, /const \{ qlProcessRoleLines \} = await import\('\.\/qlHost\/processRoles\.js'\);/g) === 1;
 	const routeInside = count(block, /event\.message === 'ql-test:process-roles'/g) === 1 && block.includes('utilities: UtilityProcess.getAll(),') && block.includes('metrics: app.getAppMetrics()') && block.includes('view.webContents.getOSProcessId()') && block.includes('this.logService.info(`QuantLab host: test build: ${line}`);');
 	const nothingOutside = !/processRoles|process-roles|qlProcessRoleLines/.test(outside);

@@ -98,14 +98,17 @@ function isWorkbenchFrame(frame: IQlFrame, policy: IQlFramePolicy): boolean {
 	return frame.parent === null && isWorkbenchDocument(frame.url, policy);
 }
 
-/** The webview authority of an owned `index.html` frame, or undefined when `frame` is not one. */
+/**
+ * The webview authority of a registered webview's own frame (an `index.html` directly under the workbench document, bound to
+ * that authority), or undefined when `frame` is not one. Only this frame's children are its content.
+ */
 function ownedIndexAuthority(frame: IQlFrame, policy: IQlFramePolicy, webviews: IQlWebviewRegistrations): string | undefined {
 	const document = parseDocument(frame.url);
-	if (!document || document.scheme !== policy.webviewScheme || document.path !== '/index.html') {
+	if (!document || document.scheme !== policy.webviewScheme || document.path !== '/index.html' || frame.parent === null || !isWorkbenchFrame(frame.parent, policy)) {
 		return undefined;
 	}
 
-	return isOwnedFrame(frame, policy, webviews) ? document.authority : undefined;
+	return webviews.boundAuthority(frame.frameTreeNodeId) === document.authority ? document.authority : undefined;
 }
 
 /** Whether `frame`, as it is now, is an owned document. A top frame is owned only as the workbench document. */
@@ -129,7 +132,14 @@ export function isOwnedFrame(frame: IQlFrame, policy: IQlFramePolicy, webviews: 
 	}
 
 	if (document.path === '/index.html') {
-		return isWorkbenchFrame(parent, policy) && webviews.boundAuthority(frame.frameTreeNodeId) === document.authority;
+		if (isWorkbenchFrame(parent, policy)) {
+			return webviews.boundAuthority(frame.frameTreeNodeId) === document.authority;
+		}
+
+		// review c3 M2/M3: the webview's content frame. Stock index.html loads it at fake.html and then writes its document
+		// (`contentDocument.open/write/close`), after which the frame reports its writer's URL: this index.html. It is owned
+		// under the registered webview's own frame of the same authority, one level only (a deeper index.html is not).
+		return ownedIndexAuthority(parent, policy, webviews) === document.authority;
 	}
 
 	if (document.path === '/fake.html') {
@@ -137,6 +147,20 @@ export function isOwnedFrame(frame: IQlFrame, policy: IQlFramePolicy, webviews: 
 	}
 
 	return false;
+}
+
+/**
+ * TEST builds only (app.ts, `globalThis.QL_TEST_BUILD`): one line per sub-frame of `contents` whose URL is `requestingUrl`,
+ * as the permission decision reads it (frame id, URL, parent id and URL, owned), for the package rows of review c3 M2/M3.
+ */
+export function qlPermissionFrameLines(contents: IQlContents | null, requestingUrl: string | undefined, policy: IQlFramePolicy): string {
+	if (!contents || !requestingUrl) {
+		return `no contents or no requesting URL (${requestingUrl})`;
+	}
+
+	const webviews = policy.webviews(contents);
+	const frames = contents.mainFrame.framesInSubtree.filter(frame => frame.parent !== null && frame.url === requestingUrl);
+	return frames.length === 0 ? 'no sub-frame has the requesting URL' : frames.map(frame => `[frame ${frame.frameTreeNodeId} ${frame.url} parent ${frame.parent?.frameTreeNodeId} ${frame.parent?.url} owned=${isOwnedFrame(frame, policy, webviews)}]`).join(' ');
 }
 
 /**

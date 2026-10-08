@@ -133,7 +133,7 @@ import { bakedBuildValues, createUpdater, isQuitDuringStart, startTerminalHost, 
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
 import { QlWorkbenchHost } from './qlHost/workbenchHost.js';
-import { IQlFramePolicy, isGrantedPermission } from './qlHost/securityPolicy.js';
+import { IQlFramePolicy, isGrantedPermission, qlPermissionFrameLines } from './qlHost/securityPolicy.js';
 import { QlWebviewRegistry } from './qlHost/webviewRegistry.js';
 // QuantLab host (U6): the chrome seed (the four chrome settings of a fresh default profile)
 import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
@@ -210,11 +210,20 @@ export class CodeApplication extends Disposable {
 			if (!granted) {
 				this.logService.warn(`QuantLab host: denied permission request ${permission} from ${details.requestingUrl} (${details.isMainFrame ? 'main frame' : 'sub-frame'})`);
 			}
+			if (globalThis.QL_TEST_BUILD && !details.isMainFrame) {
+				// TEST BUILDS ONLY (review c3 M2/M3): the frames the decision read, as Electron reports them
+				this.logService.info(`QuantLab host: test build: permission request ${permission} granted=${granted} frames ${qlPermissionFrameLines(webContents, details.requestingUrl, framePolicy)}`);
+			}
 			return callback(granted);
 		});
 
 		session.defaultSession.setPermissionCheckHandler((webContents, permission, _origin, details) => {
-			return isGrantedPermission(webContents, permission, details.requestingUrl, details.isMainFrame, framePolicy);
+			const granted = isGrantedPermission(webContents, permission, details.requestingUrl, details.isMainFrame, framePolicy);
+			if (globalThis.QL_TEST_BUILD && !details.isMainFrame) {
+				// TEST BUILDS ONLY (review c3 M2/M3): as the request handler's line
+				this.logService.info(`QuantLab host: test build: permission check ${permission} granted=${granted} frames ${qlPermissionFrameLines(webContents, details.requestingUrl, framePolicy)}`);
+			}
+			return granted;
 		});
 
 		//#endregion
