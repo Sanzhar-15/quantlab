@@ -26,10 +26,11 @@ export interface IMergeResult {
  * value left in a user's settings.json must not be synced. They are appended AFTER the user's `-key` opt-back-in
  * entries in {@link getIgnoredSettings}, so no `settingsSync.ignoredSettings` entry can bring them back.
  *
- * Unlike ordinary ignored settings (whose value on the other side is PRESERVED), these are never copied from the
- * other side: {@link updateIgnoredSettings} removes them from the content it returns, and {@link merge} turns a
- * remote that still holds them into a remote change that removes them. Any content built by either function
- * therefore holds neither key, whatever the remote, the base or the ignored-settings list say.
+ * They never cross the boundary in either direction. Outbound: content built to leave this machine
+ * ({@link updateIgnoredSettingsForRemote} and every `remoteContent` of {@link merge}) holds neither key, whatever the
+ * remote, the base or the ignored-settings list say, and a remote that still holds them receives a change that
+ * removes them. Local-bound: content built for the local file ({@link updateIgnoredSettings} with the local content
+ * as source, every `localContent` of {@link merge}) keeps the local values and never takes the other side's.
  * Remove this list after the first user-facing release that includes QuantLab.
  */
 export const NEVER_SYNCED_SETTINGS: readonly string[] = Object.freeze(['qic.demo.email', 'qic.demo.password']);
@@ -100,13 +101,14 @@ function removeNeverSyncedSettings(content: string, formattingOptions: Formattin
 }
 
 /**
- * Ordinary ignored settings take the value they have in `sourceContent` (or are removed when the source lacks them).
- * {@link NEVER_SYNCED_SETTINGS} are removed from the result whatever the source holds, so they cannot be copied back
- * from the other side.
+ * Ignored settings, {@link NEVER_SYNCED_SETTINGS} always among them, take the value they have in `sourceContent` (or are
+ * removed when the source lacks them). Built for the local file with the local content as source, the result keeps the
+ * local values; built with `'{}'` as source, it holds none. Content that leaves this machine and is rebuilt against
+ * the remote is built with {@link updateIgnoredSettingsForRemote}.
  */
 export function updateIgnoredSettings(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
-	const ordinaryIgnoredSettings = ignoredSettings.filter(key => !NEVER_SYNCED_SETTINGS.includes(key));
-	if (ordinaryIgnoredSettings.length) {
+	ignoredSettings = distinct([...ignoredSettings, ...NEVER_SYNCED_SETTINGS]);
+	if (ignoredSettings.length) {
 		const sourceTree = parseSettings(sourceContent);
 		const source = parse(sourceContent) || {};
 		const target = parse(targetContent);
@@ -114,7 +116,7 @@ export function updateIgnoredSettings(targetContent: string, sourceContent: stri
 			return targetContent;
 		}
 		const settingsToAdd: INode[] = [];
-		for (const key of ordinaryIgnoredSettings) {
+		for (const key of ignoredSettings) {
 			const sourceValue = source[key];
 			const targetValue = target[key];
 
@@ -136,7 +138,15 @@ export function updateIgnoredSettings(targetContent: string, sourceContent: stri
 		settingsToAdd.sort((a, b) => a.startOffset - b.startOffset);
 		settingsToAdd.forEach(s => targetContent = addSetting(s.setting!.key, sourceContent, targetContent, formattingOptions));
 	}
-	return removeNeverSyncedSettings(targetContent, formattingOptions);
+	return targetContent;
+}
+
+/**
+ * Outbound content (it leaves this machine): {@link updateIgnoredSettings}, then {@link NEVER_SYNCED_SETTINGS} are removed
+ * whatever `sourceContent` holds, so a remote that holds them never has them copied back into an upload.
+ */
+export function updateIgnoredSettingsForRemote(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
+	return removeNeverSyncedSettings(updateIgnoredSettings(targetContent, sourceContent, ignoredSettings, formattingOptions), formattingOptions);
 }
 
 export function merge(originalLocalContent: string, originalRemoteContent: string, baseContent: string | null, ignoredSettings: string[], resolvedConflicts: { key: string; value: any | undefined }[], formattingOptions: FormattingOptions): IMergeResult {
@@ -146,7 +156,8 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 	// A remote that holds them must receive a change that removes them, even when nothing else differs.
 	const remoteHoldsNeverSynced = holdsNeverSyncedSettings(originalRemoteContent);
 
-	const localContentWithoutIgnoredSettings = updateIgnoredSettings(originalLocalContent, originalRemoteContent, ignoredSettings, formattingOptions);
+	// Outbound: it is compared with the base (the last uploaded content) and uploaded as is when only local moved.
+	const localContentWithoutIgnoredSettings = updateIgnoredSettingsForRemote(originalLocalContent, originalRemoteContent, ignoredSettings, formattingOptions);
 	const localForwarded = baseContent !== localContentWithoutIgnoredSettings;
 	const remoteForwarded = baseContent !== originalRemoteContent;
 

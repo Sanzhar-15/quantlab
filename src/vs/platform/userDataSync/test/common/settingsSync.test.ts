@@ -593,6 +593,63 @@ suite('SettingsSync - Manual', () => {
 
 });
 
+// QuantLab carry SYNC-1, c1 repair M2: the synchroniser never uploads the never-synced pair, also when the remote already holds
+// it (applyResult rebuilds the upload against the remote), and content it writes to the local file keeps the local values.
+suite('SettingsSync - never-synced settings (SYNC-1)', () => {
+
+	const server = new UserDataSyncTestServer();
+	let client: UserDataSyncClient;
+	let testObject: SettingsSynchroniser;
+
+	teardown(async () => {
+		await client.instantiationService.get(IUserDataSyncStoreService).clear();
+	});
+
+	const disposableStore = ensureNoDisposablesAreLeakedInTestSuite();
+
+	setup(async () => {
+		client = disposableStore.add(new UserDataSyncClient(server));
+		await client.setUp(true);
+		testObject = client.getSynchronizer(SyncResource.Settings) as SettingsSynchroniser;
+	});
+
+	const remotePair = { 'qic.demo.email': 'SENTINEL-remote-not-a-real-address', 'qic.demo.password': 'SENTINEL-remote-not-a-real-value' };
+	const localPair = { 'qic.demo.email': 'SENTINEL-local-not-a-real-address', 'qic.demo.password': 'SENTINEL-local-not-a-real-value' };
+
+	// What a client from before SYNC-1 left on the server.
+	async function seedRemote(settings: Record<string, unknown>): Promise<void> {
+		const syncData: ISyncData = { version: 2, machineId: 'client-before-sync-1', content: JSON.stringify({ settings: JSON.stringify(settings, null, '\t') }) };
+		await client.instantiationService.get(IUserDataSyncStoreService).writeResource(SyncResource.Settings, JSON.stringify(syncData), null);
+	}
+
+	test('accepting local uploads content without the pair the remote holds', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await seedRemote({ 'a': 1, ...remotePair });
+		await updateSettings(JSON.stringify({ 'b': 2 }), client);
+
+		const preview = await testObject.sync(await client.getLatestRef(SyncResource.Settings), true);
+		await testObject.accept(preview!.resourcePreviews[0].localResource);
+		await testObject.apply(false);
+
+		const { content } = await client.read(testObject.resource);
+		assert.ok(content !== null);
+		assert.deepStrictEqual(JSON.parse(parseSettings(content)), { 'b': 2 });
+	}));
+
+	test('accepting the remote keeps the local values of the pair, never the remote ones', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await seedRemote({ 'a': 1, ...remotePair });
+		await updateSettings(JSON.stringify({ 'b': 2, ...localPair }), client);
+
+		const preview = await testObject.sync(await client.getLatestRef(SyncResource.Settings), true);
+		await testObject.accept(preview!.resourcePreviews[0].remoteResource);
+		await testObject.apply(false);
+
+		const settingsResource = client.instantiationService.get(IUserDataProfilesService).defaultProfile.settingsResource;
+		const local = (await client.instantiationService.get(IFileService).readFile(settingsResource)).value.toString();
+		assert.deepStrictEqual(JSON.parse(local), { 'a': 1, ...localPair });
+	}));
+
+});
+
 function parseSettings(content: string): string {
 	const syncData: ISyncData = JSON.parse(content);
 	const settingsSyncContent: ISettingsSyncContent = JSON.parse(syncData.content);
