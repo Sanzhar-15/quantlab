@@ -14,8 +14,7 @@ import { NativeParsedArgs } from '../common/argv.js';
 const helpCategories = {
 	o: localize('optionsUpperCase', "Options"),
 	e: localize('extensionsManagement', "Extensions Management"),
-	t: localize('troubleshooting', "Troubleshooting"),
-	m: localize('mcp', "Model Context Protocol")
+	t: localize('troubleshooting', "Troubleshooting")
 };
 
 export interface Option<OptionType> {
@@ -56,6 +55,53 @@ export const REFUSED_CLI_COMMANDS = [...NATIVE_CLI_COMMANDS, 'chat'] as const;
 
 export function refusedCliCommand(args: NativeParsedArgs): typeof REFUSED_CLI_COMMANDS[number] | undefined {
 	return REFUSED_CLI_COMMANDS.find(subcommand => !!args[subcommand]);
+}
+
+/**
+ * Options of the areas Quantlab removed: Model Context Protocol servers (`--add-mcp`), settings sync (`--sync`), the telemetry
+ * report (`--telemetry`) and remote windows (`--remote`). Like the subcommands above they still parse, so that a removed option
+ * is never taken for a path or passed on to Electron, carry no description, so that the help does not offer them, and are
+ * refused by name, before any service is created and before any window is opened.
+ */
+export const REFUSED_CLI_OPTIONS = ['add-mcp', 'sync', 'telemetry', 'remote'] as const;
+
+/** URIs of the remote route: `--folder-uri` and `--file-uri` take any scheme, `vscode-remote` opens a remote window. */
+const REFUSED_CLI_URI_SCHEME = 'vscode-remote://';
+const REFUSED_CLI_URI_OPTIONS = ['folder-uri', 'file-uri'] as const;
+
+/**
+ * The option to refuse, as it is written on the command line, or `undefined` when none of the removed options was passed.
+ * A boolean the parser defaults to `false` is not passed; a string (even an empty one) is.
+ */
+export function refusedCliOption(args: NativeParsedArgs): string | undefined {
+	const option = REFUSED_CLI_OPTIONS.find(optionId => args[optionId] !== undefined && args[optionId] !== false);
+	if (option) {
+		return `--${option}`;
+	}
+
+	const uriOption = REFUSED_CLI_URI_OPTIONS.find(optionId => args[optionId]?.some(uri => uri.toLowerCase().startsWith(REFUSED_CLI_URI_SCHEME)));
+	if (uriOption) {
+		return `--${uriOption} ${REFUSED_CLI_URI_SCHEME}`;
+	}
+
+	return undefined;
+}
+
+/**
+ * Refuses a command line that asks for a removed subcommand or option by throwing an error that names it. A refusal is a
+ * failure, never a result: the CLI reports the error and exits non-zero, so a script that asked for a removed area never
+ * sees success.
+ */
+export function refuseRemovedCliArgs(args: NativeParsedArgs, applicationName: string): void {
+	const command = refusedCliCommand(args);
+	if (command) {
+		throw new Error(`'${command}' command not supported in ${applicationName}`);
+	}
+
+	const option = refusedCliOption(args);
+	if (option) {
+		throw new Error(`'${option}' option not supported in ${applicationName}`);
+	}
 }
 
 export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
@@ -126,8 +172,6 @@ export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'update-extensions': { type: 'boolean', cat: 'e', description: localize('updateExtensions', "Update the installed extensions.") },
 	'enable-proposed-api': { type: 'string[]', allowEmptyValue: true, cat: 'e', args: 'ext-id', description: localize('experimentalApis', "Enables proposed API features for extensions. Can receive one or more extension IDs to enable individually.") },
 
-	'add-mcp': { type: 'string[]', cat: 'm', args: 'json', description: localize('addMcp', "Adds a Model Context Protocol server definition to the user profile. Accepts JSON input in the form '{\"name\":\"server-name\",\"command\":...}'") },
-
 	'version': { type: 'boolean', cat: 't', alias: 'v', description: localize('version', "Print version.") },
 	'verbose': { type: 'boolean', cat: 't', global: true, description: localize('verbose', "Print verbose output (implies --wait).") },
 	'log': { type: 'string[]', cat: 't', args: 'level', global: true, description: localize('log', "Log level to use. Default is 'info'. Allowed values are 'critical', 'error', 'warn', 'info', 'debug', 'trace', 'off'. You can also configure the log level of an extension by passing extension id and log level in the following format: '${publisher}.${name}:${logLevel}'. For example: 'vscode.csharp:trace'. Can receive one or more such entries.") },
@@ -141,7 +185,8 @@ export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'prof-v8-extensions': { type: 'boolean' },
 	'disable-extensions': { type: 'boolean', deprecates: ['disableExtensions'], cat: 't', description: localize('disableExtensions', "Disable all installed extensions. This option is not persisted and is effective only when the command opens a new window.") },
 	'disable-extension': { type: 'string[]', cat: 't', args: 'ext-id', description: localize('disableExtension', "Disable the provided extension. This option is not persisted and is effective only when the command opens a new window.") },
-	'sync': { type: 'string', cat: 't', description: localize('turn sync', "Turn sync on or off."), args: ['on | off'] },
+	'add-mcp': { type: 'string[]', allowEmptyValue: true },
+	'sync': { type: 'string', allowEmptyValue: true },
 
 	'inspect-extensions': { type: 'string', allowEmptyValue: true, deprecates: ['debugPluginHost'], args: 'port', cat: 't', description: localize('inspect-extensions', "Allow debugging and profiling of extensions. Check the developer tools for the connection URI.") },
 	'inspect-brk-extensions': { type: 'string', allowEmptyValue: true, deprecates: ['debugBrkPluginHost'], args: 'port', cat: 't', description: localize('inspect-brk-extensions', "Allow debugging and profiling of extensions with the extension host being paused after start. Check the developer tools for the connection URI.") },
@@ -150,7 +195,7 @@ export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'disable-chromium-sandbox': { type: 'boolean', cat: 't', description: localize('disableChromiumSandbox', "Use this option only when there is requirement to launch the application as sudo user on Linux or when running as an elevated user in an applocker environment on Windows.") },
 	'sandbox': { type: 'boolean' },
 	'locate-shell-integration-path': { type: 'string', cat: 't', args: ['shell'], description: localize('locateShellIntegrationPath', "Print the path to a terminal shell integration script. Allowed values are 'bash', 'pwsh', 'zsh' or 'fish'.") },
-	'telemetry': { type: 'boolean', cat: 't', description: localize('telemetry', "Shows all telemetry events which VS code collects.") },
+	'telemetry': { type: 'boolean' },
 
 	'remote': { type: 'string', allowEmptyValue: true },
 	'folder-uri': { type: 'string[]', cat: 'o', args: 'uri' },

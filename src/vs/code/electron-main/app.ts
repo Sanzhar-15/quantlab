@@ -14,7 +14,7 @@ import { parse } from '../../base/common/jsonc.js';
 import { getPathLabel } from '../../base/common/labels.js';
 import { Disposable, DisposableStore } from '../../base/common/lifecycle.js';
 import { FileAccess, Schemas, VSCODE_AUTHORITY } from '../../base/common/network.js';
-import { join, posix } from '../../base/common/path.js';
+import { join } from '../../base/common/path.js';
 import { IProcessEnvironment, isLinux, isLinuxSnap, isMacintosh, isWindows, OS } from '../../base/common/platform.js';
 import { assertType } from '../../base/common/types.js';
 import { URI } from '../../base/common/uri.js';
@@ -60,6 +60,7 @@ import { IMenubarMainService, MenubarMainService } from '../../platform/menubar/
 import { INativeHostMainService, NativeHostMainService } from '../../platform/native/electron-main/nativeHostMainService.js';
 import { IProductService } from '../../platform/product/common/productService.js';
 import { getRemoteAuthority } from '../../platform/remote/common/remoteHosts.js';
+import { isRemoteAuthorityProtocolUrl } from './remoteProtocolUrl.js';
 import { SharedProcess } from '../../platform/sharedProcess/electron-main/sharedProcess.js';
 import { ISignService } from '../../platform/sign/common/sign.js';
 import { IStateService } from '../../platform/state/node/state.js';
@@ -758,6 +759,10 @@ export class CodeApplication extends Disposable {
 				continue; // invalid
 			}
 
+			if (this.refuseRemoteProtocolUrl(protocolUrl.uri)) {
+				continue; // refused
+			}
+
 			const windowOpenable = this.getWindowOpenableFromProtocolUrl(protocolUrl.uri);
 			if (windowOpenable) {
 				if (await this.shouldBlockOpenable(windowOpenable, windowsMainService, dialogMainService)) {
@@ -859,51 +864,26 @@ export class CodeApplication extends Disposable {
 			return { fileUri };
 		}
 
-		// Remote path
-		else if (uri.authority === Schemas.vscodeRemote) {
-
-			// Example conversion:
-			// From: vscode://vscode-remote/wsl+ubuntu/mnt/c/GitDevelopment/monaco
-			//   To: vscode-remote://wsl+ubuntu/mnt/c/GitDevelopment/monaco
-
-			const secondSlash = uri.path.indexOf(posix.sep, 1 /* skip over the leading slash */);
-			let authority: string;
-			let path: string;
-			if (secondSlash !== -1) {
-				authority = uri.path.substring(1, secondSlash);
-				path = uri.path.substring(secondSlash);
-			} else {
-				authority = uri.path.substring(1);
-				path = '/';
-			}
-
-			let query = uri.query;
-			const params = new URLSearchParams(uri.query);
-			if (params.get('windowId') === '_blank') {
-				// Make sure to unset any `windowId=_blank` here
-				// https://github.com/microsoft/vscode/issues/191902
-				params.delete('windowId');
-				query = params.toString();
-			}
-
-			const remoteUri = URI.from({ scheme: Schemas.vscodeRemote, authority, path, query, fragment: uri.fragment });
-
-			if (hasWorkspaceFileExtension(path)) {
-				return { workspaceUri: remoteUri };
-			}
-
-			if (/:[\d]+$/.test(path)) {
-				// path with :line:column syntax
-				return { fileUri: remoteUri };
-			}
-
-			return { folderUri: remoteUri };
-		}
 		return undefined;
+	}
+
+	// A link asking for a remote authority is refused by name, before any window opens and without a dialog.
+	private refuseRemoteProtocolUrl(uri: URI): boolean {
+		if (!isRemoteAuthorityProtocolUrl(uri)) {
+			return false;
+		}
+
+		this.logService.warn(`'${Schemas.vscodeRemote}' protocol link not supported in ${this.productService.applicationName}:`, uri.toString(true));
+
+		return true;
 	}
 
 	private async handleProtocolUrl(windowsMainService: IWindowsMainService, dialogMainService: IDialogMainService, urlService: IURLService, uri: URI, options?: IOpenURLOptions): Promise<boolean> {
 		this.logService.trace('app#handleProtocolUrl():', uri.toString(true), options);
+
+		if (this.refuseRemoteProtocolUrl(uri)) {
+			return true; // refused, behave as if it was handled
+		}
 
 		// Support 'workspace' URLs (https://github.com/microsoft/vscode/issues/124263)
 		if (uri.scheme === this.productService.urlProtocol && uri.path === 'workspace') {
@@ -1577,7 +1557,6 @@ export class CodeApplication extends Disposable {
 		const hasFileURIs = !!args['file-uri'];
 		const noRecentEntry = args['skip-add-to-recently-opened'] === true;
 		const waitMarkerFileURI = args.wait && args.waitMarkerFilePath ? URI.file(args.waitMarkerFilePath) : undefined;
-		const remoteAuthority = args.remote || undefined;
 		const forceProfile = args.profile;
 		const forceTempProfile = args['profile-temp'];
 
@@ -1594,7 +1573,6 @@ export class CodeApplication extends Disposable {
 					noRecentEntry,
 					waitMarkerFileURI,
 					initialStartup: true,
-					remoteAuthority,
 					forceProfile,
 					forceTempProfile
 				});
@@ -1629,7 +1607,6 @@ export class CodeApplication extends Disposable {
 			waitMarkerFileURI,
 			gotoLineMode: args.goto,
 			initialStartup: true,
-			remoteAuthority,
 			forceProfile,
 			forceTempProfile
 		});

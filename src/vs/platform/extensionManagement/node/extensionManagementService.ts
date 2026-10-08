@@ -41,6 +41,7 @@ import { areSameExtensions, computeTargetPlatform, ExtensionKey, getGalleryExten
 import { IExtensionsProfileScannerService, IScannedProfileExtension } from '../common/extensionsProfileScannerService.js';
 import { IExtensionsScannerService, IScannedExtension, ManifestMetadata, UserExtensionsScanOptions } from '../common/extensionsScannerService.js';
 import { ExtensionsDownloader } from './extensionDownloader.js';
+import { extensionSignatureVerificationOffMessage, extensionSignatureVerificationOffReason } from '../common/extensionSignatureVerificationPolicy.js';
 import { ExtensionsLifecycle } from './extensionLifecycle.js';
 import { fromExtractError, getManifest } from './extensionManagementUtil.js';
 import { ExtensionsManifestCache } from './extensionsManifestCache.js';
@@ -76,6 +77,7 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 	private readonly extensionsDownloader: ExtensionsDownloader;
 
 	private readonly extractingGalleryExtensions = new Map<string, Promise<ExtractExtensionResult>>();
+	private loggedSignatureVerificationOff = false;
 
 	constructor(
 		@IExtensionGalleryService galleryService: IExtensionGalleryService,
@@ -338,10 +340,13 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 	}
 
 	private async downloadExtension(extension: IGalleryExtension, operation: InstallOperation, verifySignature: boolean, clientTargetPlatform?: TargetPlatform): Promise<{ readonly location: URI; readonly verificationStatus: ExtensionSignatureVerificationCode | undefined }> {
-		if (verifySignature) {
-			const value = this.configurationService.getValue(VerifyExtensionSignatureConfigKey);
-			verifySignature = isBoolean(value) ? value : true;
+		const offReason = extensionSignatureVerificationOffReason(this.productService, () => this.configurationService.getValue(VerifyExtensionSignatureConfigKey));
+		const verificationOn = offReason === undefined;
+		if (offReason && !this.loggedSignatureVerificationOff) {
+			this.loggedSignatureVerificationOff = true;
+			this.logService.info(extensionSignatureVerificationOffMessage(offReason, VerifyExtensionSignatureConfigKey));
 		}
+		verifySignature = verifySignature && verificationOn;
 		const { location, verificationStatus } = await this.extensionsDownloader.download(extension, operation, verifySignature, clientTargetPlatform);
 		const shouldRequireSignature = shouldRequireRepositorySignatureFor(extension.private, await this.extensionGalleryManifestService.getExtensionGalleryManifest());
 

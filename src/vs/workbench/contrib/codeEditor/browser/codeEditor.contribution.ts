@@ -24,4 +24,3 @@ import './toggleWordWrap.js';
 import './emptyTextEditorHint/emptyTextEditorHint.js';
 import './workbenchReferenceSearch.js';
 import './editorLineNumberMenu.js';
-import './dictation/editorDictation.js';

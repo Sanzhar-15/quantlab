@@ -1736,20 +1736,6 @@ export class SearchView extends ViewPane {
 		}
 	}
 
-	private appendSearchWithAIButton(messageEl: HTMLElement) {
-		const searchWithAIButtonTooltip = appendKeyBindingLabel(
-			nls.localize('triggerAISearch.tooltip', "Search with AI."),
-			this.keybindingService.lookupKeybinding(Constants.SearchCommandIds.SearchWithAIActionId)
-		);
-		const searchWithAIButtonText = nls.localize('searchWithAIButtonTooltip', "Search with AI");
-		const searchWithAIButton = this.messageDisposables.add(new SearchLinkButton(
-			searchWithAIButtonText,
-			() => {
-				this.commandService.executeCommand(Constants.SearchCommandIds.SearchWithAIActionId);
-			}, this.hoverService, searchWithAIButtonTooltip));
-		dom.append(messageEl, searchWithAIButton.element);
-	}
-
 	private async onSearchComplete(
 		progressComplete: () => void,
 		excludePatternText?: string,
@@ -1819,11 +1805,6 @@ export class SearchView extends ViewPane {
 
 			const messageEl = this.clearMessage();
 			dom.append(messageEl, message);
-
-			if (this.shouldShowAIResults()) {
-				this.appendSearchWithAIButton(messageEl);
-				dom.append(messageEl, $('span', undefined, ' - '));
-			}
 
 			if (!completed) {
 				const searchAgainButton = this.messageDisposables.add(new SearchLinkButton(
@@ -2047,11 +2028,6 @@ export class SearchView extends ViewPane {
 				() => this.instantiationService.invokeFunction(createEditorFromSearchResult, this.searchResult, this.searchIncludePattern.getValue(), this.searchExcludePattern.getValue(), this.searchIncludePattern.onlySearchInOpenEditors()), this.hoverService,
 				openInEditorTooltip));
 			dom.append(messageEl, openInEditorButton.element);
-
-			if (this.shouldShowAIResults()) {
-				dom.append(messageEl, ' - ');
-				this.appendSearchWithAIButton(messageEl);
-			}
 
 			this.reLayout();
 		} else if (!msgWasHidden) {

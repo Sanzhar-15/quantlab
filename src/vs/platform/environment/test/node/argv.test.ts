@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { buildHelpMessage, formatOptions, Option, OptionDescriptions, OPTIONS, Subcommand, parseArgs, ErrorReporter, REFUSED_CLI_COMMANDS, refusedCliCommand } from '../../node/argv.js';
+import { buildHelpMessage, formatOptions, Option, OptionDescriptions, OPTIONS, Subcommand, parseArgs, ErrorReporter, REFUSED_CLI_COMMANDS, REFUSED_CLI_OPTIONS, refusedCliCommand, refusedCliOption, refuseRemovedCliArgs } from '../../node/argv.js';
 import { addArg } from '../../node/argvHelper.js';
 
 function o(description: string, type: 'boolean' | 'string' | 'string[]' = 'string'): Option<any> {
@@ -78,6 +78,77 @@ suite('formatOptions', () => {
 		const help = buildHelpMessage('Product', 'product', '1.0.0', OPTIONS);
 		assert.ok(help.includes('--wait'), 'control: the help lists options');
 		assert.ok(!/tunnel|serve-web|chat|Subcommands/.test(help), help);
+	});
+
+	test('options of removed areas are refused by name and are not offered in the help', () => {
+		const reporter: ErrorReporter = { onUnknownOption: () => { }, onMultipleValues: () => { }, onEmptyValue: () => { }, onDeprecatedOption: () => { } };
+		assert.deepStrictEqual([...REFUSED_CLI_OPTIONS], ['add-mcp', 'sync', 'telemetry', 'remote']);
+
+		const refused: [string[], string][] = [
+			[['--add-mcp', '{"name":"server-name","command":"x"}'], '--add-mcp'],
+			[['--add-mcp='], '--add-mcp'],
+			[['--sync', 'on'], '--sync'],
+			[['--sync'], '--sync'],
+			[['--telemetry'], '--telemetry'],
+			[['--remote', 'ssh-remote+host'], '--remote'],
+			[['--remote='], '--remote'],
+			[['--folder-uri', 'vscode-remote://ssh-remote+host/home/user'], '--folder-uri vscode-remote://'],
+			[['--file-uri', 'VSCODE-REMOTE://wsl+distro/home/file.txt'], '--file-uri vscode-remote://'],
+			[['--folder-uri', 'file:///home/user', '--folder-uri', 'vscode-remote://ssh-remote+host/x'], '--folder-uri vscode-remote://'],
+		];
+		for (const [argv, expected] of refused) {
+			assert.strictEqual(refusedCliOption(parseArgs(argv, OPTIONS, reporter)), expected, argv.join(' '));
+		}
+
+		// controls: the extension install CLI, local URIs and ordinary invocations are not refused
+		const allowed: string[][] = [
+			['--install-extension', 'publisher.name'],
+			['--install-extension', 'publisher.name', '--force', '--pre-release', '--do-not-sync'],
+			['--uninstall-extension', 'publisher.name'],
+			['--list-extensions', '--show-versions'],
+			['--update-extensions'],
+			['--folder-uri', 'file:///home/user'],
+			['--file-uri', 'vscode-userdata:///settings.json'],
+			['--disable-telemetry'],
+			['--wait', 'remote.txt', 'sync.md', 'telemetry.log'],
+			[]
+		];
+		for (const argv of allowed) {
+			assert.strictEqual(refusedCliOption(parseArgs(argv, OPTIONS, reporter)), undefined, argv.join(' '));
+		}
+
+		const help = buildHelpMessage('Product', 'product', '1.0.0', OPTIONS);
+		assert.ok(help.includes('--install-extension'), 'control: the help lists the extension install option');
+		assert.ok(!/--add-mcp|--sync|--telemetry|--remote|Model Context Protocol/.test(help), help);
+	});
+
+	test('a refused command line is an error naming what it refuses, never a result (the CLI exits non-zero)', () => {
+		const reporter: ErrorReporter = { onUnknownOption: () => { }, onMultipleValues: () => { }, onEmptyValue: () => { }, onDeprecatedOption: () => { } };
+		const refused: [string[], string][] = [
+			[['tunnel'], `'tunnel' command not supported in product`],
+			[['serve-web'], `'serve-web' command not supported in product`],
+			[['chat'], `'chat' command not supported in product`],
+			[['--add-mcp', '{"name":"server-name","command":"x"}'], `'--add-mcp' option not supported in product`],
+			[['--sync', 'on'], `'--sync' option not supported in product`],
+			[['--telemetry'], `'--telemetry' option not supported in product`],
+			[['--remote', 'ssh-remote+host'], `'--remote' option not supported in product`],
+			[['--folder-uri', 'vscode-remote://ssh-remote+host/home/user'], `'--folder-uri vscode-remote://' option not supported in product`],
+		];
+		for (const [argv, expected] of refused) {
+			assert.throws(() => refuseRemovedCliArgs(parseArgs(argv, OPTIONS, reporter), 'product'), (error: Error) => error.message === expected, argv.join(' '));
+		}
+
+		// controls: the extension install CLI, local URIs and ordinary invocations are not refused
+		const allowed: string[][] = [
+			['--install-extension', 'publisher.name'],
+			['--list-extensions', '--show-versions'],
+			['--folder-uri', 'file:///home/user'],
+			['--wait', 'tunnel.txt', 'chat.md', 'remote.txt'],
+			[]
+		];
+		for (const argv of allowed) {
+			assert.doesNotThrow(() => refuseRemovedCliArgs(parseArgs(argv, OPTIONS, reporter), 'product'), argv.join(' '));
+		}
 	});
 
 	test('addArg', () => {

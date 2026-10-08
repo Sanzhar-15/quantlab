@@ -9,13 +9,12 @@ import { addUNCHostToAllowlist } from '../../../base/node/unc.js';
 import { hostname, release, arch } from 'os';
 import { coalesce, distinct } from '../../../base/common/arrays.js';
 import { CancellationToken } from '../../../base/common/cancellation.js';
-import { CharCode } from '../../../base/common/charCode.js';
 import { Emitter, Event } from '../../../base/common/event.js';
-import { isWindowsDriveLetter, parseLineAndColumnAware, sanitizeFilePath, toSlashes } from '../../../base/common/extpath.js';
+import { parseLineAndColumnAware, sanitizeFilePath } from '../../../base/common/extpath.js';
 import { getPathLabel } from '../../../base/common/labels.js';
 import { Disposable, DisposableStore, IDisposable } from '../../../base/common/lifecycle.js';
 import { Schemas } from '../../../base/common/network.js';
-import { basename, join, normalize, posix } from '../../../base/common/path.js';
+import { basename, join, normalize } from '../../../base/common/path.js';
 import { getMarks, mark } from '../../../base/common/performance.js';
 import { IProcessEnvironment, isMacintosh, isWindows, OS } from '../../../base/common/platform.js';
 import { cwd } from '../../../base/common/process.js';
@@ -856,7 +855,6 @@ export class WindowsMainService extends Disposable implements IWindowsMainServic
 		const pathResolveOptions: IPathResolveOptions = {
 			ignoreFileNotFound: true,
 			gotoLineMode: cli.goto,
-			remoteAuthority: cli.remote || undefined,
 			forceOpenWorkspaceAsFile:
 				// special case diff / merge mode to force open
 				// workspace as file
@@ -897,7 +895,7 @@ export class WindowsMainService extends Disposable implements IWindowsMainServic
 
 		// folder or file paths
 		const resolvedCliPaths = await Promise.all(cli._.map(cliPath => {
-			return pathResolveOptions.remoteAuthority ? this.doResolveRemotePath(cliPath, pathResolveOptions) : this.doResolveFilePath(cliPath, pathResolveOptions);
+			return this.doResolveFilePath(cliPath, pathResolveOptions);
 		}));
 
 		pathsToOpen.push(...coalesce(resolvedCliPaths));
@@ -1219,65 +1217,6 @@ export class WindowsMainService extends Disposable implements IWindowsMainServic
 		}
 
 		return undefined;
-	}
-
-	private doResolveRemotePath(path: string, options: IPathResolveOptions): IPathToOpen<ITextEditorOptions> | undefined {
-		const first = path.charCodeAt(0);
-		const remoteAuthority = options.remoteAuthority;
-
-		// Extract line/col information from path
-		let lineNumber: number | undefined;
-		let columnNumber: number | undefined;
-
-		if (options.gotoLineMode) {
-			({ path, line: lineNumber, column: columnNumber } = parseLineAndColumnAware(path));
-		}
-
-		// make absolute
-		if (first !== CharCode.Slash) {
-			if (isWindowsDriveLetter(first) && path.charCodeAt(path.charCodeAt(1)) === CharCode.Colon) {
-				path = toSlashes(path);
-			}
-
-			path = `/${path}`;
-		}
-
-		const uri = URI.from({ scheme: Schemas.vscodeRemote, authority: remoteAuthority, path: path });
-
-		// guess the file type:
-		// - if it ends with a slash it's a folder
-		// - if in goto line mode or if it has a file extension, it's a file or a workspace
-		// - by defaults it's a folder
-		if (path.charCodeAt(path.length - 1) !== CharCode.Slash) {
-
-			// file name ends with .code-workspace
-			if (hasWorkspaceFileExtension(path)) {
-				if (options.forceOpenWorkspaceAsFile) {
-					return {
-						fileUri: uri,
-						options: {
-							selection: lineNumber ? { startLineNumber: lineNumber, startColumn: columnNumber || 1 } : undefined
-						},
-						remoteAuthority: options.remoteAuthority
-					};
-				}
-
-				return { workspace: getWorkspaceIdentifier(uri), remoteAuthority };
-			}
-
-			// file name starts with a dot or has an file extension
-			else if (options.gotoLineMode || posix.basename(path).indexOf('.') !== -1) {
-				return {
-					fileUri: uri,
-					options: {
-						selection: lineNumber ? { startLineNumber: lineNumber, startColumn: columnNumber || 1 } : undefined
-					},
-					remoteAuthority
-				};
-			}
-		}
-
-		return { workspace: getSingleFolderWorkspaceIdentifier(uri), remoteAuthority };
 	}
 
 	private shouldOpenNewWindow(openConfig: IOpenConfiguration): { openFolderInNewWindow: boolean; openFilesInNewWindow: boolean } {

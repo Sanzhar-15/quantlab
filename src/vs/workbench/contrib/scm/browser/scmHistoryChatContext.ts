@@ -9,23 +9,20 @@ import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { fromNow } from '../../../../base/common/date.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { basename } from '../../../../base/common/resources.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
 import { URI, UriComponents } from '../../../../base/common/uri.js';
 import { ITextModel } from '../../../../editor/common/model.js';
 import { IModelService } from '../../../../editor/common/services/model.js';
 import { ITextModelContentProvider, ITextModelService } from '../../../../editor/common/services/resolverService.js';
 import { localize } from '../../../../nls.js';
-import { Action2, MenuId, registerAction2 } from '../../../../platform/actions/common/actions.js';
 import { CodeDataTransfers } from '../../../../platform/dnd/browser/dnd.js';
-import { IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
-import { IChatWidget, IChatWidgetService } from '../../chat/browser/chat.js';
+import { IChatWidget } from '../../chat/browser/chat.js';
 import { IChatContextPickerItem, IChatContextPickerPickItem, IChatContextPickService, picksWithPromiseFn } from '../../chat/browser/attachments/chatContextPickService.js';
-import { ChatContextKeys } from '../../chat/common/actions/chatContextKeys.js';
-import { ISCMHistoryItemChangeVariableEntry, ISCMHistoryItemVariableEntry } from '../../chat/common/attachments/chatVariableEntries.js';
+import { ISCMHistoryItemVariableEntry } from '../../chat/common/attachments/chatVariableEntries.js';
 import { ScmHistoryItemResolver } from '../../multiDiffEditor/browser/scmMultiDiffSourceResolver.js';
-import { ISCMHistoryItem, ISCMHistoryItemChange } from '../common/history.js';
+import { ISCMHistoryItem } from '../common/history.js';
 import { ISCMProvider, ISCMService, ISCMViewService } from '../common/scm.js';
 
 export interface SCMHistoryItemTransferData {
@@ -250,88 +247,3 @@ export class SCMHistoryItemChangeRangeContentProvider implements ITextModelConte
 		return { repositoryId, start, end };
 	}
 }
-
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: 'workbench.scm.action.graph.addHistoryItemToChat',
-			title: localize('chat.action.scmHistoryItemContext', 'Add to Chat'),
-			f1: false,
-			menu: {
-				id: MenuId.SCMHistoryItemContext,
-				group: 'z_chat',
-				order: 1,
-				when: ChatContextKeys.enabled
-			}
-		});
-	}
-
-	override async run(accessor: ServicesAccessor, provider: ISCMProvider, historyItem: ISCMHistoryItem): Promise<void> {
-		const chatWidgetService = accessor.get(IChatWidgetService);
-		const widget = await chatWidgetService.revealWidget();
-		if (!provider || !historyItem || !widget) {
-			return;
-		}
-
-		widget.attachmentModel.addContext(SCMHistoryItemContext.asAttachment(provider, historyItem));
-	}
-});
-
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: 'workbench.scm.action.graph.summarizeHistoryItem',
-			title: localize('chat.action.scmHistoryItemSummarize', 'Explain Changes'),
-			f1: false,
-			menu: {
-				id: MenuId.SCMHistoryItemContext,
-				group: 'z_chat',
-				order: 2,
-				when: ChatContextKeys.enabled
-			}
-		});
-	}
-
-	override async run(accessor: ServicesAccessor, provider: ISCMProvider, historyItem: ISCMHistoryItem): Promise<void> {
-		const chatWidgetService = accessor.get(IChatWidgetService);
-		const widget = await chatWidgetService.revealWidget();
-		if (!provider || !historyItem || !widget) {
-			return;
-		}
-
-		widget.attachmentModel.addContext(SCMHistoryItemContext.asAttachment(provider, historyItem));
-		await widget.acceptInput('Summarize the attached history item');
-	}
-});
-
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: 'workbench.scm.action.graph.addHistoryItemChangeToChat',
-			title: localize('chat.action.scmHistoryItemContext', 'Add to Chat'),
-			f1: false,
-			menu: {
-				id: MenuId.SCMHistoryItemChangeContext,
-				group: 'z_chat',
-				order: 1,
-				when: ChatContextKeys.enabled
-			}
-		});
-	}
-
-	override async run(accessor: ServicesAccessor, historyItem: ISCMHistoryItem, historyItemChange: ISCMHistoryItemChange): Promise<void> {
-		const chatWidgetService = accessor.get(IChatWidgetService);
-		const widget = await chatWidgetService.revealWidget();
-		if (!historyItem || !historyItemChange.modifiedUri || !widget) {
-			return;
-		}
-
-		widget.attachmentModel.addContext({
-			id: historyItemChange.uri.toString(),
-			name: `${basename(historyItemChange.modifiedUri)}`,
-			value: historyItemChange.modifiedUri,
-			historyItem: historyItem,
-			kind: 'scmHistoryItemChange',
-		} satisfies ISCMHistoryItemChangeVariableEntry);
-	}
-});

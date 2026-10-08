@@ -13,7 +13,7 @@ import { LoggerGroup } from '../../log/common/log.js';
 import { IProductService } from '../../product/common/productService.js';
 import { getRemoteName } from '../../remote/common/remoteHosts.js';
 import { verifyMicrosoftInternalDomain } from './commonProperties.js';
-import { ICustomEndpointTelemetryService, ITelemetryData, ITelemetryEndpoint, ITelemetryService, TelemetryConfiguration, TelemetryLevel, TELEMETRY_CRASH_REPORTER_SETTING_ID, TELEMETRY_OLD_SETTING_ID, TELEMETRY_SETTING_ID } from './telemetry.js';
+import { ICustomEndpointTelemetryService, ITelemetryData, ITelemetryEndpoint, ITelemetryService, TelemetryLevel } from './telemetry.js';
 
 /**
  * A special class used to denoting a telemetry value which should not be clean.
@@ -134,27 +134,10 @@ export function isLoggingOnly(productService: IProductService, environmentServic
  * @param configurationService
  * @returns OFF, ERROR, ON
  */
-export function getTelemetryLevel(configurationService: IConfigurationService): TelemetryLevel {
-	const newConfig = configurationService.getValue<TelemetryConfiguration>(TELEMETRY_SETTING_ID);
-	const crashReporterConfig = configurationService.getValue<boolean | undefined>(TELEMETRY_CRASH_REPORTER_SETTING_ID);
-	const oldConfig = configurationService.getValue<boolean | undefined>(TELEMETRY_OLD_SETTING_ID);
-
-	// If `telemetry.enableCrashReporter` is false or `telemetry.enableTelemetry' is false, disable telemetry
-	if (oldConfig === false || crashReporterConfig === false) {
-		return TelemetryLevel.NONE;
-	}
-
-	// Maps new telemetry setting to a telemetry level
-	switch (newConfig ?? TelemetryConfiguration.ON) {
-		case TelemetryConfiguration.ON:
-			return TelemetryLevel.USAGE;
-		case TelemetryConfiguration.ERROR:
-			return TelemetryLevel.ERROR;
-		case TelemetryConfiguration.CRASH:
-			return TelemetryLevel.CRASH;
-		case TelemetryConfiguration.OFF:
-			return TelemetryLevel.NONE;
-	}
+// QL-STRIP (census C2): the telemetry settings are not registered in this product; telemetry is never collected,
+// so the level is NONE and no setting (registered or hand-written in settings.json) can raise it.
+export function getTelemetryLevel(_configurationService: IConfigurationService): TelemetryLevel {
+	return TelemetryLevel.NONE;
 }
 
 export interface Properties {

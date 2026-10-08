@@ -19,7 +19,7 @@ export class UserDataSyncLogService extends AbstractLogger implements IUserDataS
 		@IEnvironmentService environmentService: IEnvironmentService,
 	) {
 		super();
-		this.logger = this._register(loggerService.createLogger(joinPath(environmentService.logsHome, `${USER_DATA_SYNC_LOG_ID}.log`), { id: USER_DATA_SYNC_LOG_ID, name: localize('userDataSyncLog', "Settings Sync") }));
+		this.logger = this._register(loggerService.createLogger(joinPath(environmentService.logsHome, `${USER_DATA_SYNC_LOG_ID}.log`), { id: USER_DATA_SYNC_LOG_ID, name: localize('userDataSyncLog', "Settings Sync"), hidden: true }));
 	}
 
 	trace(message: string, ...args: unknown[]): void {

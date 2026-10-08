@@ -134,18 +134,6 @@ const configuration: IConfigurationNode = {
 			description: localize('verbosity.diffEditor.description', 'Provide information about how to navigate changes in the diff editor when it is focused.'),
 			...baseVerbosityProperty
 		},
-		[AccessibilityVerbositySettingId.Chat]: {
-			description: localize('verbosity.chat.description', 'Provide information about how to access the chat help menu when the chat input is focused.'),
-			...baseVerbosityProperty
-		},
-		[AccessibilityVerbositySettingId.InlineChat]: {
-			description: localize('verbosity.interactiveEditor.description', 'Provide information about how to access the inline editor chat accessibility help menu and alert with hints that describe how to use the feature when the input is focused.'),
-			...baseVerbosityProperty
-		},
-		[AccessibilityVerbositySettingId.TerminalChatOutput]: {
-			description: localize('verbosity.terminalChatOutput.description', 'Provide information about how to open the chat terminal output in the Accessible View.'),
-			...baseVerbosityProperty
-		},
 		[AccessibilityVerbositySettingId.InlineCompletions]: {
 			description: localize('verbosity.inlineCompletions.description', 'Provide information about how to access the inline completions hover and Accessible View.'),
 			...baseVerbosityProperty
@@ -184,10 +172,6 @@ const configuration: IConfigurationNode = {
 		},
 		[AccessibilityVerbositySettingId.Debug]: {
 			description: localize('verbosity.debug', 'Provide information about how to access the debug console accessibility help dialog when the debug console or run and debug viewlet is focused. Note that a reload of the window is required for this to take effect.'),
-			...baseVerbosityProperty
-		},
-		[AccessibilityVerbositySettingId.Walkthrough]: {
-			description: localize('verbosity.walkthrough', 'Provide information about how to open the walkthrough in an Accessible View.'),
 			...baseVerbosityProperty
 		},
 		[AccessibilityWorkbenchSettingId.AccessibleViewCloseOnKeyPress]: {
@@ -527,16 +511,6 @@ const configuration: IConfigurationNode = {
 				}
 			}
 		},
-		'accessibility.signals.chatEditModifiedFile': {
-			...defaultNoAnnouncement,
-			'description': localize('accessibility.signals.chatEditModifiedFile', "Plays a sound / audio cue when revealing a file with changes from chat edits"),
-			'properties': {
-				'sound': {
-					'description': localize('accessibility.signals.chatEditModifiedFile.sound', "Plays a sound when revealing a file with changes from chat edits"),
-					...soundFeatureBase
-				}
-			}
-		},
 		'accessibility.signals.notebookCellCompleted': {
 			...signalFeatureBase,
 			'description': localize('accessibility.signals.notebookCellCompleted', "Plays a signal - sound (audio cue) and/or announcement (alert) - when a notebook cell execution is successfully completed."),
@@ -582,30 +556,6 @@ const configuration: IConfigurationNode = {
 					...announcementFeatureBase
 				},
 			},
-		},
-		'accessibility.signals.chatRequestSent': {
-			...signalFeatureBase,
-			'description': localize('accessibility.signals.chatRequestSent', "Plays a signal - sound (audio cue) and/or announcement (alert) - when a chat request is made."),
-			'properties': {
-				'sound': {
-					'description': localize('accessibility.signals.chatRequestSent.sound', "Plays a sound when a chat request is made."),
-					...soundFeatureBase
-				},
-				'announcement': {
-					'description': localize('accessibility.signals.chatRequestSent.announcement', "Announces when a chat request is made."),
-					...announcementFeatureBase
-				},
-			}
-		},
-		'accessibility.signals.chatResponseReceived': {
-			...defaultNoAnnouncement,
-			'description': localize('accessibility.signals.chatResponseReceived', "Plays a sound / audio cue when the response has been received."),
-			'properties': {
-				'sound': {
-					'description': localize('accessibility.signals.chatResponseReceived.sound', "Plays a sound on when the response has been received."),
-					...soundFeatureBase
-				},
-			}
 		},
 		'accessibility.signals.codeActionTriggered': {
 			...defaultNoAnnouncement,
@@ -761,31 +711,6 @@ const configuration: IConfigurationNode = {
 				'announcement': 'never'
 			}
 		},
-		'accessibility.signals.chatUserActionRequired': {
-			...signalFeatureBase,
-			'markdownDescription': localize('accessibility.signals.chatUserActionRequired', "Plays a signal - sound (audio cue) and/or announcement (alert) - when user action is required in the chat."),
-			'properties': {
-				'sound': {
-					'description': localize('accessibility.signals.chatUserActionRequired.sound', "Plays a sound when user action is required in the chat."),
-					'type': 'string',
-					'enum': ['auto', 'on', 'off'],
-					'enumDescriptions': [
-						localize('sound.enabled.autoWindow', "Enable sound when a screen reader is attached."),
-						localize('sound.enabled.on', "Enable sound."),
-						localize('sound.enabled.off', "Disable sound.")
-					],
-				},
-				'announcement': {
-					'description': localize('accessibility.signals.chatUserActionRequired.announcement', "Announces when a user action is required in the chat - including information about the action and how to take it."),
-					...announcementFeatureBase
-				},
-			},
-			default: {
-				'sound': 'auto',
-				'announcement': 'auto'
-			},
-			tags: ['accessibility']
-		},
 		'accessibility.underlineLinks': {
 			'type': 'boolean',
 			'description': localize('accessibility.underlineLinks', "Controls whether links should be underlined in the workbench."),
@@ -811,16 +736,6 @@ const configuration: IConfigurationNode = {
 			'type': 'boolean',
 			'default': true,
 			'markdownDescription': localize('accessibility.windowTitleOptimized', "Controls whether the {0} should be optimized for screen readers when in screen reader mode. When enabled, the window title will have {1} appended to the end.", '`#window.title#`', '`activeEditorState`')
-		},
-		'accessibility.openChatEditedFiles': {
-			'type': 'boolean',
-			'default': false,
-			'markdownDescription': localize('accessibility.openChatEditedFiles', "Controls whether files should be opened when the chat agent has applied edits to them.")
-		},
-		'accessibility.verboseChatProgressUpdates': {
-			'type': 'boolean',
-			'default': true,
-			'markdownDescription': localize('accessibility.verboseChatProgressUpdates', "Controls whether verbose progress announcements should be made when a chat request is in progress, including information like searched text for <search term> with X results, created file <file_name>, or read file <file path>.")
 		}
 	}
 };
@@ -853,11 +768,6 @@ export function registerAccessibilityConfiguration() {
 				type: 'boolean',
 				default: false,
 				tags: ['accessibility']
-			},
-			[AccessibilityWorkbenchSettingId.VerboseChatProgressUpdates]: {
-				'type': 'boolean',
-				'default': true,
-				'markdownDescription': localize('accessibility.verboseChatProgressUpdates', "Controls whether verbose progress announcements should be made when a chat request is in progress, including information like searched text for <search term> with X results, created file <file_name>, or read file <file path>.")
 			}
 		}
 	});

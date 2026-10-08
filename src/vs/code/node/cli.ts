@@ -15,7 +15,7 @@ import { whenDeleted, writeFileSync } from '../../base/node/pfs.js';
 import { findFreePort } from '../../base/node/ports.js';
 import { watchFileContents } from '../../platform/files/node/watcher/nodejs/nodejsWatcherLib.js';
 import { NativeParsedArgs } from '../../platform/environment/common/argv.js';
-import { buildHelpMessage, buildStdinMessage, buildVersionMessage, OPTIONS, refusedCliCommand } from '../../platform/environment/node/argv.js';
+import { buildHelpMessage, buildStdinMessage, buildVersionMessage, OPTIONS, refuseRemovedCliArgs } from '../../platform/environment/node/argv.js';
 import { addArg, parseCLIProcessArgv } from '../../platform/environment/node/argvHelper.js';
 import { getStdinFilePath, hasStdinWithoutTty, readFromStdin, stdinDataListener } from '../../platform/environment/node/stdin.js';
 import { createWaitMarkerFileSync } from '../../platform/environment/node/wait.js';
@@ -34,9 +34,7 @@ function shouldSpawnCliProcess(argv: NativeParsedArgs): boolean {
 		|| !!argv['install-extension']
 		|| !!argv['uninstall-extension']
 		|| !!argv['update-extensions']
-		|| !!argv['locate-extension']
-		|| !!argv['add-mcp']
-		|| !!argv['telemetry'];
+		|| !!argv['locate-extension'];
 }
 
 export async function main(argv: string[]): Promise<void> {
@@ -49,12 +47,10 @@ export async function main(argv: string[]): Promise<void> {
 		return;
 	}
 
-	// No tunnel binary is shipped and there is no chat: these subcommands are refused before anything is spawned.
-	const refused = refusedCliCommand(args);
-	if (refused) {
-		console.error(`'${refused}' command not supported in ${product.applicationName}`);
-		return;
-	}
+	// No tunnel binary is shipped, there is no chat, and MCP servers, sync, the telemetry report and remote windows are removed:
+	// these subcommands and options are refused before anything is spawned. The refusal rejects `main`; its caller prints the
+	// refusal and exits 1.
+	refuseRemovedCliArgs(args, product.applicationName);
 
 	// Help (general)
 	if (args.help) {
