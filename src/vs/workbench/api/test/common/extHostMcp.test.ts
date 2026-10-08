@@ -1433,7 +1433,9 @@ suite('QL-G-LOGIN-SECRETS c1: no configured path, foreign error text or provider
 		assertNoMarker(marked);
 		assert.ok(errors(marked).includes(`Error sending message to ${LOGGED}: ${UNEXPECTED}`), errors(marked).join('\n'));
 
-		const nonError = make(async () => { throw { name: ERR_NAME, message: ERR_MESSAGE }; }, { url: HARNESS_MCP_URL });
+		// Deliberately not an Error: the transport must handle a thrown non-error value.
+		const nonErrorValue: unknown = { name: ERR_NAME, message: ERR_MESSAGE };
+		const nonError = make(async () => { throw nonErrorValue; }, { url: HARNESS_MCP_URL });
 		await send(nonError);
 		assertNoMarker(nonError);
 		assert.ok(errors(nonError).includes(`Error sending message to ${LOGGED}: unexpected non-error value (details not logged)`), errors(nonError).join('\n'));

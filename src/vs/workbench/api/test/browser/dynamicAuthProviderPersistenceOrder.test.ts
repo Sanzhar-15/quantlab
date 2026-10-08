@@ -157,10 +157,11 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 			$promptForClientRegistration: async () => { calls.registrationPrompts++; return { clientId: 'client-typed' }; },
 			$sendDidChangeSessions: async () => { calls.forwardedSessionEvents++; },
 		};
-		let extHost: TestExtHostAuthentication | undefined;
+		// The ext host is created after the main thread it talks to; the main thread's proxy reads it through this holder.
+		const extHostRef: { current?: TestExtHostAuthentication } = {};
 		const extHostContext = {
 			extensionHostKind: ExtensionHostKind.LocalProcess,
-			getProxy: () => rpcProxy<ExtHostAuthenticationShape>(() => extHost!),
+			getProxy: () => rpcProxy<ExtHostAuthenticationShape>(() => extHostRef.current!),
 		} as unknown as IExtHostContext;
 		const mainThread: MainThreadAuthentication = store.add(new MainThreadAuthentication(
 			extHostContext,
@@ -180,7 +181,7 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 			{} as IClipboardService,
 			{} as IQuickInputService,
 		));
-		extHost = new TestExtHostAuthentication(
+		const extHost = new TestExtHostAuthentication(
 			{ getProxy: () => rpcProxy<MainThreadAuthenticationShape>(() => mainThread as unknown as MainThreadAuthenticationShape, mainOverrides) } as unknown as IExtHostRpcService,
 			{ environment: { appName: 'Test', appUriScheme: 'test' } } as unknown as IExtHostInitDataService,
 			{} as IExtHostWindow,
@@ -189,6 +190,7 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 			{ createLogger: () => new NullLogger() } as unknown as ILoggerService,
 			logService,
 		);
+		extHostRef.current = extHost;
 		const registeredEvents: string[] = [];
 		store.add(authenticationService.onDidRegisterAuthenticationProvider(e => registeredEvents.push(e.id)));
 		/** The stored provider list and every secret, byte for byte. */
@@ -207,7 +209,7 @@ suite('Dynamic authentication providers - persistence before publication', () =>
 		const createWithClientIdMetadata = () => authenticationService.createDynamicAuthenticationProvider(URI.parse(AUTH_SERVER), { ...serverMetadata, client_id_metadata_document_supported: true }, undefined);
 		/** Unregisters on both sides, so each test leaves nothing registered. */
 		const cleanUp = async () => {
-			await extHost!.$onDidUnregisterAuthenticationProvider(PROVIDER_ID);
+			await extHost.$onDidUnregisterAuthenticationProvider(PROVIDER_ID);
 			await mainThread.$unregisterAuthenticationProvider(PROVIDER_ID);
 		};
 		return { extHost, mainThread, authenticationService, dynamicStorage, storageService, secrets, calls, registeredEvents, snapshot, seedStoredClient, corruptList, create, createWithClientIdMetadata, cleanUp };
