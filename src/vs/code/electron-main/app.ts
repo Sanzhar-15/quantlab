@@ -103,7 +103,7 @@ import { IExtensionsScannerService } from '../../platform/extensionManagement/co
 import { ExtensionsScannerService } from '../../platform/extensionManagement/node/extensionsScannerService.js';
 import { UserDataProfilesHandler } from '../../platform/userDataProfile/electron-main/userDataProfilesHandler.js';
 import { ProfileStorageChangesListenerChannel } from '../../platform/userDataProfile/electron-main/userDataProfileStorageIpc.js';
-import { Promises, RunOnceScheduler, runWhenGlobalIdle } from '../../base/common/async.js';
+import { DeferredPromise, Promises, RunOnceScheduler, runWhenGlobalIdle } from '../../base/common/async.js';
 import { resolveMachineId, resolveSqmId, resolveDevDeviceId, validateDevDeviceId } from '../../platform/telemetry/electron-main/telemetryUtils.js';
 import { ExtensionsProfileScannerService } from '../../platform/extensionManagement/node/extensionsProfileScannerService.js';
 import { LoggerChannel } from '../../platform/log/electron-main/logIpc.js';
@@ -129,7 +129,7 @@ import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetr
 // electron-updater is CommonJS with getter-defined exports: node's ESM loader finds no named export (`autoUpdater`), and
 // out/main.js is ESM, so a named import throws SyntaxError before `ready` (package 5, folds/HOST/U5-LAUNCH-1.md). Default import.
 import electronUpdater from 'electron-updater';
-import { bakedBuildValues, createUpdater, isQuitDuringStart, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
+import { bakedBuildValues, createUpdater, isQuitDuringStart, onBeforeShowAwaited, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
 // QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
@@ -143,6 +143,12 @@ import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
  * The main VS Code application. There will only ever be one instance,
  * even if the user starts many instances (e.g. from the command line).
  */
+/** QuantLab host (F-PERF-LZ1-1): what the early-started terminal host waits for from initServices. */
+interface QlStartServices {
+	readonly qlWorkbenchHost: QlWorkbenchHost;
+	readonly encryptionMainService: EncryptionMainService;
+}
+
 export class CodeApplication extends Disposable {
 
 	private static readonly SECURITY_PROTOCOL_HANDLING_CONFIRMATION_SETTING_KEY = {
@@ -602,46 +608,68 @@ export class CodeApplication extends Disposable {
 			}
 		});
 
-		// Resolve unique machine ID
-		const [machineId, sqmId, devDeviceId] = await Promise.all([
-			resolveMachineId(this.stateService, this.logService),
-			resolveSqmId(this.stateService, this.logService),
-			resolveDevDeviceId(this.stateService, this.logService)
-		]);
-		mark('code/ql/didResolveMachineIds');
+		// QuantLab host (F-PERF-LZ1-1): the terminal host starts NOW, before the machine-ids await and initServices (it needs neither;
+		// MARKS-1: the ids alone took 28-239 ms). Its `onBeforeShow` waits for the services below (`qlServices`), so the window stays
+		// hidden until they exist; a failure below rejects them and the start fails at `before-show`, by name. The early start's
+		// outcome is held as a value: it can neither go unhandled while the services are awaited nor be lost.
+		const qlServices = new DeferredPromise<QlStartServices>();
+		const qlStart = this.startQlTerminalHost(qlServices.p).then(terminalHost => ({ failed: false as const, terminalHost }), (error: unknown) => ({ failed: true as const, error }));
+		let qlStartServices: QlStartServices;
+		let initialProtocolUrls: IInitialProtocolUrls | undefined;
+		try {
+			// Resolve unique machine ID
+			const [machineId, sqmId, devDeviceId] = await Promise.all([
+				resolveMachineId(this.stateService, this.logService),
+				resolveSqmId(this.stateService, this.logService),
+				resolveDevDeviceId(this.stateService, this.logService)
+			]);
+			mark('code/ql/didResolveMachineIds');
 
-		// Shared process
-		const { sharedProcessReady, sharedProcessClient } = this.setupSharedProcess(machineId, sqmId, devDeviceId);
+			// Shared process
+			const { sharedProcessReady, sharedProcessClient } = this.setupSharedProcess(machineId, sqmId, devDeviceId);
 
-		// Services
-		const appInstantiationService = await this.initServices(machineId, sqmId, devDeviceId, sharedProcessReady);
-		mark('code/ql/didInitServices');
+			// Services
+			const appInstantiationService = await this.initServices(machineId, sqmId, devDeviceId, sharedProcessReady);
+			mark('code/ql/didInitServices');
 
-		// Error telemetry
-		appInstantiationService.invokeFunction(accessor => this._register(new ErrorTelemetry(accessor.get(ILogService), accessor.get(ITelemetryService))));
+			// Error telemetry
+			appInstantiationService.invokeFunction(accessor => this._register(new ErrorTelemetry(accessor.get(ILogService), accessor.get(ITelemetryService))));
 
-		// Auth Handler
-		appInstantiationService.invokeFunction(accessor => accessor.get(IProxyAuthService));
+			// Auth Handler
+			appInstantiationService.invokeFunction(accessor => accessor.get(IProxyAuthService));
 
-		// Transient profiles handler
-		this._register(appInstantiationService.createInstance(UserDataProfilesHandler));
+			// Transient profiles handler
+			this._register(appInstantiationService.createInstance(UserDataProfilesHandler));
 
-		// Init Channels
-		appInstantiationService.invokeFunction(accessor => this.initChannels(accessor, mainProcessElectronServer, sharedProcessClient));
+			// Init Channels
+			appInstantiationService.invokeFunction(accessor => this.initChannels(accessor, mainProcessElectronServer, sharedProcessClient));
 
-		// Setup Protocol URL Handlers
-		const initialProtocolUrls = await appInstantiationService.invokeFunction(accessor => this.setupProtocolUrlHandlers(accessor, mainProcessElectronServer));
-		mark('code/ql/didSetupProtocolUrlHandlers');
+			// Setup Protocol URL Handlers
+			initialProtocolUrls = await appInstantiationService.invokeFunction(accessor => this.setupProtocolUrlHandlers(accessor, mainProcessElectronServer));
+			mark('code/ql/didSetupProtocolUrlHandlers');
 
-		// Setup vscode-remote-resource protocol handler
-		this.setupManagedRemoteResourceUrlHandler(mainProcessElectronServer);
+			// Setup vscode-remote-resource protocol handler
+			this.setupManagedRemoteResourceUrlHandler(mainProcessElectronServer);
 
-		// Signal phase: ready - before opening first window
-		this.lifecycleMainService.phase = LifecycleMainPhase.Ready;
+			// Signal phase: ready - before opening first window
+			this.lifecycleMainService.phase = LifecycleMainPhase.Ready;
+
+			// QuantLab host (F-PERF-LZ1-1): what the started host's `onBeforeShow` waits for, taken from the accessor synchronously
+			const protocolUrls = initialProtocolUrls;
+			qlStartServices = appInstantiationService.invokeFunction(accessor => this.createQlStartServices(accessor, protocolUrls));
+		} catch (error) {
+			qlServices.error(error);
+			throw error;
+		}
+		qlServices.complete(qlStartServices);
 
 		// Open Windows
-		// QuantLab host (U3): start the terminal host instead of the first window (`openFirstWindow` stays for U5's lazy gate)
-		if (!await appInstantiationService.invokeFunction(accessor => this.startQlTerminalHost(accessor, initialProtocolUrls))) {
+		// QuantLab host (U3): the terminal host instead of the first window (`openFirstWindow` stays for U5's lazy gate)
+		const started = await qlStart;
+		if (started.failed) {
+			throw started.error;
+		}
+		if (started.terminalHost === false || !await this.finishQlTerminalHost(started.terminalHost, qlStartServices.qlWorkbenchHost, initialProtocolUrls)) {
 			return;
 		}
 
@@ -1315,7 +1343,11 @@ export class CodeApplication extends Disposable {
 
 	// QuantLab host (U3): starts the terminal host in place of `openFirstWindow`. Returns false when the start
 	// failed and the app is exiting (the client start has already logged `exit 1` and unwound).
-	private async startQlTerminalHost(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): Promise<boolean> {
+	/**
+	 * QuantLab host (F-PERF-LZ1-1): what the terminal host's `onBeforeShow` and `openQuantlab` need from initServices, taken once the
+	 * services exist (synchronously, from the accessor); the host itself started before them (`startQlTerminalHost`).
+	 */
+	private createQlStartServices(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): QlStartServices {
 
 		// What `openFirstWindow` assigned and later code reads. EVERY service is taken from the accessor here, before the first
 		// `await`: a ServicesAccessor is valid only during the synchronous invocation of its function ("Illegal state: service
@@ -1325,15 +1357,6 @@ export class CodeApplication extends Disposable {
 		const instantiationService = accessor.get(IInstantiationService);
 		const dialogMainService = accessor.get(IDialogMainService);
 		const encryptionMainService = this.requireQlEncryptionMainService(accessor.get(IEncryptionMainService));
-
-		// QuantLab host (U6): the chrome seed, first of all: before the terminal host starts and so before the gate, a launch request or
-		// a key can open a workbench window that reads the default profile's settings. A failure to create or read the file is not
-		// caught: `main.ts` quits with the error (a seed that is present but differs is logged by the seed and the launch goes on)
-		await seedQlChromeSettings(this.userDataProfilesMainService.defaultProfile.settingsResource, this.logService);
-
-		// Throws when the build holds no baked values: not caught, `main.ts` quits with the error
-		const { backendOrigin, version } = bakedBuildValues();
-		const { preloadPath, rendererDir } = this.qlTerminalPaths();
 
 		// QuantLab host (U5): the workbench is a lazy sibling view (qlHost/): the gate (it IS the windows service) opens and
 		// adopts it on first use. The launch's protocol urls and openables are handed to the first window that opens, once.
@@ -1360,6 +1383,30 @@ export class CodeApplication extends Disposable {
 			}
 		});
 
+		return { qlWorkbenchHost, encryptionMainService };
+	}
+
+	/**
+	 * QuantLab host (F-PERF-LZ1-1): the terminal host's start, run at the top of `startup()` before the machine-ids await and
+	 * initServices: it needs only what CodeMain made. `onBeforeShow` (and `openQuantlab`) wait for `services`; the client awaits the
+	 * hook before it shows the window. Resolves the started host, or `false` after a quit during the start or a failed start
+	 * (handled here as before: quit through the lifecycle, or exit 1).
+	 */
+	private async startQlTerminalHost(services: Promise<QlStartServices>): Promise<TerminalHost | false> {
+		// The pairing (HOST condition 1): a client that does not await `onBeforeShow` would show the window before the services exist
+		if (onBeforeShowAwaited() !== true) {
+			throw new Error('QuantLab host (F-PERF-LZ1-1): the client does not await onBeforeShow (no onBeforeShowAwaited marker): fork and client are not a pair');
+		}
+
+		// QuantLab host (U6): the chrome seed, first of all: before the terminal host starts and so before the gate, a launch request or
+		// a key can open a workbench window that reads the default profile's settings. A failure to create or read the file is not
+		// caught: `main.ts` quits with the error (a seed that is present but differs is logged by the seed and the launch goes on)
+		await seedQlChromeSettings(this.userDataProfilesMainService.defaultProfile.settingsResource, this.logService);
+
+		// Throws when the build holds no baked values: not caught, `main.ts` quits with the error
+		const { backendOrigin, version } = bakedBuildValues();
+		const { preloadPath, rendererDir } = this.qlTerminalPaths();
+
 		const ports: Ports = {
 			electron: { app, BaseWindow, WebContentsView, session, protocol, ipcMain, shell, safeStorage, dialog, screen },
 			validatedIpcMain,
@@ -1369,13 +1416,15 @@ export class CodeApplication extends Disposable {
 			devTools: !this.environmentMainService.isBuilt,
 			preloadPath,
 			rendererDir,
-			openQuantlab: intent => qlWorkbenchHost.openQuantlab(intent),
+			openQuantlab: async intent => (await services).qlWorkbenchHost.openQuantlab(intent),
 			// QuantLab host (review c1 M7): the workbench host takes over the window's close (the quit handshake runs through the
 			// lifecycle before the window goes), the toggle key and the gate's requests while the window is still hidden and nothing
 			// is loaded: no key at the first did-finish-load and no close during the start reaches a host without them
 			// QuantLab host (review c1 M8): the start's Keychain phase (token store, launch cookie; behind its painted waiting window
 			// on macOS) has settled by now: only from here may the fork's own encryption service make its synchronous safeStorage calls
-			onBeforeShow: started => {
+			// F-PERF-LZ1-1: the host started before the services; the client awaits this hook before it shows the window
+			onBeforeShow: async started => {
+				const { qlWorkbenchHost, encryptionMainService } = await services;
 				qlWorkbenchHost.attach(started);
 				encryptionMainService.terminalHostKeychainPhaseSettled();
 			}
@@ -1422,6 +1471,15 @@ export class CodeApplication extends Disposable {
 		}
 		startJoiner.dispose();
 		this.qlTerminalHost = terminalHost;
+
+		return terminalHost;
+	}
+
+	/**
+	 * QuantLab host (F-PERF-LZ1-1): the started host's remaining steps, after both the start and the services settled (as before
+	 * the split: the updater, the test build's driver hooks, the launch request, the quit listeners). No accessor here.
+	 */
+	private async finishQlTerminalHost(terminalHost: TerminalHost, qlWorkbenchHost: QlWorkbenchHost, initialProtocolUrls: IInitialProtocolUrls | undefined): Promise<boolean> {
 
 		// QuantLab updater (PACK, folds/HOST/PACK-UPDATER-HUNK.md): the ONE updater, electron-updater injected into the client
 		// module; install on Electron's quit only (autoInstallOnAppQuit), no quitAndInstall and no restart UI in v1
