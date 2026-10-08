@@ -185,8 +185,9 @@ suite('SettingsMerge - never-synced settings written more than once (STRIP-1)', 
 		assertOutbound(result.remoteContent, ['SENTINEL-broken'], { 'remote.x': 1 }, 'broken remote');
 	});
 
-	// What upstream uploads for content without a never-synced key is not changed, syntax errors included: removing every
-	// ordinary setting from `{ "a": 1, }` leaves `{ , }` and upstream uploads it.
+	// What upstream uploads for content without a never-synced key, built against a source without them, is not changed, syntax
+	// errors included: removing every ordinary setting from `{ "a": 1, }` leaves `{ , }` and upstream uploads it. (With a source
+	// that holds the keys the base's output is compared in the STRIP-2 tests below.)
 	test('content without the keys, against a source without them, comes back byte for byte as the ordinary ignored settings alone build it', () => {
 		const contents = [
 			'{\n\t// Machine\n\t"machine.a": 1,\n\t"machine.b": 2,\n}',

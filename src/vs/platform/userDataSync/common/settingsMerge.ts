@@ -106,7 +106,8 @@ function neverSyncedSettingsHeld(targetContent: string, sourceContent: string): 
 /**
  * Thrown when content that would leave this machine cannot be shown to be free of {@link NEVER_SYNCED_SETTINGS}: the
  * content handed to {@link updateIgnoredSettingsForRemote} does not parse, a key is still there after every occurrence was
- * removed, or the removal itself left the content with more syntax errors than it had. The message names keys and offsets
+ * removed, or the removal itself left the content with more syntax errors than it had (a comparison of counts: it cannot tell
+ * whether a new error replaced an old one). The message names keys and offsets
  * only, never a value or any part of the content.
  */
 export class NeverSyncedSettingsError extends Error {
@@ -271,7 +272,8 @@ function applySortedEdits(content: string, edits: Edit[]): string {
  * bounded number of full-document passes whatever the duplicate count: one traversal collects the ranges of all of them, one
  * batch of edits removes them, one traversal checks the result, and the parsed object is read once more (at most three
  * passes, counted in `passes`). Content that holds no key comes back as it came in. A throw ({@link NeverSyncedSettingsError})
- * means a key is still there, or the removal left the content with more syntax errors than it had: content that leaves
+ * means a key is still there, or the removal left the content with more syntax errors than it had (counts are compared; a new
+ * error that replaced an old one is not detected): content that leaves
  * this machine is never passed on unchecked. The last check, on the parsed object, is a second property-presence check, not an
  * independent parser (`parse` runs on the same tokenizer).
  */
@@ -289,6 +291,7 @@ export function removeNeverSyncedSettings(content: string, formattingOptions: Fo
 		if (remaining.length) {
 			throw new NeverSyncedSettingsError(`A never-synced setting could not be removed from the settings content: ${distinct(remaining).join(', ')}`);
 		}
+		// Counts only: a new syntax error that replaced an old one is not seen.
 		if (after.errorCount > before.errorCount) {
 			throw new NeverSyncedSettingsError('Removing the never-synced settings left the settings content with syntax errors it did not have');
 		}
