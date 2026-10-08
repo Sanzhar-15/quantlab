@@ -49,6 +49,25 @@ export const STATUSES = ['PASS', 'FAIL', 'NOT RUN'];
  */
 export const DIALOG_MODES = ['import', 'pack-trigger'];
 
+/**
+ * Asks the app to close (`send('Browser.close')`) and waits up to `limitMs` for `exit`. The app closes its debugging
+ * socket while it shuts down, often before it answers, so a lost answer ([cdp_closed]) is no failure: only an app still
+ * running after the limit is. Returns undefined when the app exited, else the reason, naming what Browser.close got.
+ */
+export async function closeApp(send, exit, limitMs) {
+	const closing = send('Browser.close').then(() => 'answered', err => err instanceof Error ? err.message : String(err));
+	let timer;
+	const how = await Promise.race([exit.then(() => 'exited'), new Promise(resolve => { timer = setTimeout(() => resolve('timeout'), limitMs); })]);
+	clearTimeout(timer);
+	if (how === 'exited') {
+		return undefined;
+	}
+	let answerTimer;
+	const answer = await Promise.race([closing, new Promise(resolve => { answerTimer = setTimeout(() => resolve('no answer'), 1000); })]);
+	clearTimeout(answerTimer);
+	return `the app did not exit ${limitMs / 1000} s after Browser.close (${answer})`;
+}
+
 /** The driver's launch arguments for `mode`: --extensionTestsPath only for the modes that need no dialog. */
 export function driverArgs(mode, driverDir) {
 	const modes = ['all', 'pins', ...DIALOG_MODES];

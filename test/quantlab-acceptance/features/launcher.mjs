@@ -16,7 +16,7 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { connect, waitForEndpoint } from './cdp.mjs';
 import * as net from 'node:net';
-import { assemble, assertNoAsarEnvAbsent, checkIdsFor, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
+import { assemble, assertNoAsarEnvAbsent, checkIdsFor, closeApp, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
 import { backtestForm, pressModal, readToasts, waitForWorkbench } from './window.mjs';
 
 // This process only: Electron's asar-patched fs refuses to read a FILE named *.asar as bytes (ENOENT ", not found in
@@ -115,10 +115,9 @@ async function launch(bundle, dir, mode, python, network) {
 		if (exited) {
 			return;
 		}
-		await (await window()).send('Browser.close').catch(err => { closeError = err.message; });
-		const how = await Promise.race([exit.then(() => 'exited'), sleep(30_000).then(() => 'timeout')]);
-		if (how === 'timeout') {
-			closeError = `the app did not exit 30 s after Browser.close${closeError === undefined ? '' : ` (${closeError})`}`;
+		const driverWindow = await window();
+		closeError = await closeApp(method => driverWindow.send(method), exit, 30_000);
+		if (closeError !== undefined) {
 			child.kill('SIGKILL');
 		}
 	})().catch(err => { closeError = err instanceof Error ? err.message : String(err); child.kill('SIGKILL'); });
@@ -248,10 +247,9 @@ async function plainLaunch(bundle, dir) {
 			await poll();
 			await sleep(2000);
 		}
-		const closing = cdp.send('Browser.close').then(() => 'answered', err => err.message);
-		const how = await Promise.race([exit.then(() => 'exited'), sleep(30_000).then(() => 'timeout')]);
-		if (how === 'timeout') {
-			throw new Error(`[app_no_exit] the app did not exit 30 s after Browser.close (${await Promise.race([closing, sleep(1000).then(() => 'no answer')])})`);
+		const noExit = await closeApp(method => cdp.send(method), exit, 30_000);
+		if (noExit !== undefined) {
+			throw new Error(`[app_no_exit] ${noExit}`);
 		}
 	} catch (err) {
 		launchError = `[pack_launch_failed] ${err instanceof Error ? err.message : String(err)}`;

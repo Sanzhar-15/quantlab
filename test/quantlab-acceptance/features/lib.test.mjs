@@ -15,7 +15,7 @@ import { test } from 'node:test';
 import { createRequire } from 'node:module';
 import { connect, evaluateInFrames } from './cdp.mjs';
 import { isAppSurface } from './window.mjs';
-import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
+import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, closeApp, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
 
@@ -441,6 +441,28 @@ test('judgeQuantbookMcpAbsent: PASS on a clean extension; the server module, the
 	for (const t of [clean, server, sdk, manifest, tree, none]) {
 		fs.rmSync(t.extensions, { recursive: true });
 	}
+});
+
+test('closeApp: an app that exits passes even when its socket closes unanswered; one still running fails, naming the answer', async () => {
+	const never = new Promise(() => { });
+	const exited = Promise.resolve({ code: 0 });
+	const closed = () => Promise.reject(new Error('[cdp_closed] Browser.close: the connection closed'));
+	// the guest's P1e import and pack-trigger launches: a normal exit, the socket closed before the answer
+	assert.strictEqual(await closeApp(closed, exited, 200), undefined);
+	assert.strictEqual(await closeApp(() => Promise.resolve({}), exited, 200), undefined);
+	// controls: an app that does not exit fails whatever Browser.close got
+	assert.strictEqual(await closeApp(() => Promise.resolve({}), never, 50), 'the app did not exit 0.05 s after Browser.close (answered)');
+	assert.strictEqual(await closeApp(closed, never, 50), 'the app did not exit 0.05 s after Browser.close ([cdp_closed] Browser.close: the connection closed)');
+	assert.strictEqual(await closeApp(() => never, never, 50), 'the app did not exit 0.05 s after Browser.close (no answer)');
+	let asked;
+	await closeApp(method => { asked = method; return Promise.resolve({}); }, exited, 50);
+	assert.strictEqual(asked, 'Browser.close');
+});
+
+test('every Browser.close in launcher.mjs goes through closeApp', () => {
+	const source = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
+	assert.strictEqual(source.split('\'Browser.close\'').length - 1, 0, 'launcher.mjs sends Browser.close itself');
+	assert.strictEqual(source.split('await closeApp(').length - 1, 2, 'the dialog-mode launch and the plain launch');
 });
 
 test('every app launch in launcher.mjs carries the mock keychain flag (R-24)', () => {
