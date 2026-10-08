@@ -1059,9 +1059,6 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		const signals = artifacts.signals?.map(({ price, ...signal }): SignalMarker => price === null ? signal : { ...signal, price });
 		const droppedPoints = artifacts.equity === undefined || equity === undefined ? 0 : artifacts.equity.length - equity.length;
 		const droppedPrices = artifacts.signals === undefined ? 0 : artifacts.signals.filter(signal => signal.price === null).length;
-		if (droppedPoints > 0 || droppedPrices > 0) {
-			this.setBanner(session, 'run', `${droppedPoints} equity point(s) and ${droppedPrices} signal price(s) of this run are not finite and are not drawn.`, 'warning');
-		}
 		if (signals) {
 			session.webview.postMessage({ type: 'setSignals', requestId: 0, signals });
 		}
@@ -1071,9 +1068,18 @@ export class ChartViewProvider implements vscode.CustomTextEditorProvider {
 		this.setArtifactCache(session.key, { signals, equity });
 		this.executeWithErrorBoundary(() => this.refreshVisualization(session), 'refreshVisualization');
 
+		// One lasting 'run' banner decides what the user reads: the omission warning is part of it, never overwritten
+		// by the "Showing results" line, and a fully finite run leaves no warning from the run loaded before it.
 		const entry = this.historyState.getEntry(runId);
-		if (entry) {
+		const omitted = droppedPoints > 0 || droppedPrices > 0
+			? `${droppedPoints} equity point(s) and ${droppedPrices} signal price(s) of this run are not finite and are not drawn.`
+			: undefined;
+		if (omitted !== undefined) {
+			this.setBanner(session, 'run', entry ? `Showing results for ${entry.type} run ${entry.id}. ${omitted}` : omitted, 'warning');
+		} else if (entry) {
 			this.setBanner(session, 'run', `Showing results for ${entry.type} run ${entry.id}.`, 'info');
+		} else {
+			this.setBanner(session, 'run', '');
 		}
 	}
 
