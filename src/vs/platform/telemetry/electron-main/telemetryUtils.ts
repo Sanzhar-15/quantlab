@@ -5,7 +5,7 @@
 
 import { ILogService } from '../../log/common/log.js';
 import { IStateService } from '../../state/node/state.js';
-import { machineIdKey, sqmIdKey, devDeviceIdKey } from '../common/telemetry.js';
+import { machineIdKey, sqmIdKey, quantlabDevDeviceIdKey } from '../common/telemetry.js';
 import { resolveMachineId as resolveNodeMachineId, resolveSqmId as resolveNodeSqmId, resolveDevDeviceId as resolveNodeDevDeviceId } from '../node/telemetryUtils.js';
 
 export async function resolveMachineId(stateService: IStateService, logService: ILogService): Promise<string> {
@@ -27,7 +27,7 @@ export async function resolveSqmId(stateService: IStateService, logService: ILog
 export async function resolveDevDeviceId(stateService: IStateService, logService: ILogService): Promise<string> {
 	logService.trace('Resolving devDevice identifier...');
 	const devDeviceId = await resolveNodeDevDeviceId(stateService, logService);
-	stateService.setItem(devDeviceIdKey, devDeviceId);
+	stateService.setItem(quantlabDevDeviceIdKey, devDeviceId);
 	logService.trace(`Resolved devDevice identifier: ${devDeviceId}`);
 	return devDeviceId;
 }

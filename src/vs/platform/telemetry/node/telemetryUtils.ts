@@ -7,7 +7,7 @@ import { isMacintosh } from '../../../base/common/platform.js';
 import { getMachineId, getSqmMachineId, generateDevDeviceId } from '../../../base/node/id.js';
 import { ILogService } from '../../log/common/log.js';
 import { IStateReadService } from '../../state/node/state.js';
-import { machineIdKey, sqmIdKey, devDeviceIdKey } from '../common/telemetry.js';
+import { machineIdKey, sqmIdKey, quantlabDevDeviceIdKey } from '../common/telemetry.js';
 
 
 export async function resolveMachineId(stateService: IStateReadService, logService: ILogService): Promise<string> {
@@ -30,8 +30,10 @@ export async function resolveSqmId(stateService: IStateReadService, logService: 
 	return sqmId;
 }
 
+// Quantlab (F-STRIP-DEVID-1): only the app-local key is read; the upstream `telemetry.devDeviceId` is ignored.
+// A read-only state (the CLI) gets a generated id here and persists nothing; the desktop resolver persists it.
 export async function resolveDevDeviceId(stateService: IStateReadService, logService: ILogService): Promise<string> {
-	let devDeviceId = stateService.getItem<string>(devDeviceIdKey);
+	let devDeviceId = stateService.getItem<string>(quantlabDevDeviceIdKey);
 	if (typeof devDeviceId !== 'string') {
 		devDeviceId = generateDevDeviceId();
 	}

@@ -78,7 +78,10 @@ export const firstSessionDateStorageKey = 'telemetry.firstSessionDate';
 export const lastSessionDateStorageKey = 'telemetry.lastSessionDate';
 export const machineIdKey = 'telemetry.machineId';
 export const sqmIdKey = 'telemetry.sqmId';
-export const devDeviceIdKey = 'telemetry.devDeviceId';
+// Quantlab (F-STRIP-DEVID-1): the developer device id lives under this app-local key. The upstream key
+// `telemetry.devDeviceId` is never read: profiles created before this fold hold, under it, the id that
+// `@vscode/deviceid` took from the shared Microsoft developer-tools file, and reusing it would keep that identity.
+export const quantlabDevDeviceIdKey = 'quantlab.devDeviceId';
 
 // Configuration Keys
 export const TELEMETRY_SECTION_ID = 'telemetry';
