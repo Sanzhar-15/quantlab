@@ -26,11 +26,12 @@ function snapshot(): EditorSnapshot {
 	};
 }
 
-function harness(files: Record<string, string>, gallery: GalleryPort, readError?: { file: string; code: string }) {
+function harness(files: Record<string, string>, gallery: GalleryPort, readError?: { file: string; code: string }, readGate?: Promise<void>) {
 	const calls: string[] = [];
 	const ports: ImportPorts = {
 		fs: {
 			async readFile(file) {
+				await readGate;
 				if (readError && readError.file === file) {
 					throw Object.assign(new Error(`${readError.code}: ${file}`), { code: readError.code });
 				}
@@ -40,7 +41,14 @@ function harness(files: Record<string, string>, gallery: GalleryPort, readError?
 				return files[file];
 			},
 			async writeFile(file, text) { calls.push(`write ${file}`); files[file] = text; },
-			async copyFile(from, to) { calls.push(`copy ${from} -> ${to}`); files[to] = files[from]; },
+			async copyFile(from, to) {
+				// The port's contract (COPYFILE_EXCL): an existing destination is never overwritten.
+				if (Object.hasOwn(files, to)) {
+					throw Object.assign(new Error(`EEXIST: ${to}`), { code: 'EEXIST' });
+				}
+				calls.push(`copy ${from} -> ${to}`);
+				files[to] = files[from];
+			},
 		},
 		gallery,
 		now: () => new Date('2026-10-05T14:16:53.000Z'),
@@ -129,4 +137,64 @@ suite('import – importer (IM-1)', () => {
 		assert.deepStrictEqual(h.calls, ['write /app/User/keybindings.json']);
 		assert.match(formatReport(report), /Source files not found \(nothing imported from them\):\n  \/src\/User\/settings\.json\n/);
 	});
+
+	// A backup is named to the second, so imports with one clock value meet the same name. Settings and
+	// keybindings both go through the same helper; both are exercised.
+	test('two imports with an identical clock value keep both pre-import versions in distinct backups (settings.json and keybindings.json)', async () => {
+		const spy = spyGallery([], []);
+		const h = harness({
+			[target.settingsPath]: '{"editor.fontSize":11}',
+			[target.keybindingsPath]: '[{"key":"cmd+j","command":"original"}]',
+		}, spy.gallery);
+		const first = { ...snapshot(), extensionIds: [], settings: { 'editor.fontSize': 13 }, keybindings: [{ key: 'cmd+k', command: 'one' }] };
+		const second = { ...snapshot(), extensionIds: [], settings: { 'editor.fontSize': 17 }, keybindings: [{ key: 'cmd+k', command: 'two' }] };
+
+		const r1 = await runImport(first, target, h.ports);
+		const r2 = await runImport(second, target, h.ports);
+
+		const stamp = '20261005T141653Z';
+		assert.strictEqual(r1.settings?.backup, `${target.settingsPath}.pre-import-${stamp}`);
+		assert.strictEqual(r2.settings?.backup, `${target.settingsPath}.pre-import-${stamp}-1`);
+		assert.strictEqual(r1.keybindings?.backup, `${target.keybindingsPath}.pre-import-${stamp}`);
+		assert.strictEqual(r2.keybindings?.backup, `${target.keybindingsPath}.pre-import-${stamp}-1`);
+		// Both pre-import versions survive: the user's original, and the file as the first import left it.
+		assert.strictEqual(h.files[r1.settings!.backup!], '{"editor.fontSize":11}');
+		assert.strictEqual(JSON.parse(h.files[r2.settings!.backup!])['editor.fontSize'], 13);
+		assert.deepStrictEqual(JSON.parse(h.files[r1.keybindings!.backup!]), [{ key: 'cmd+j', command: 'original' }]);
+		assert.deepStrictEqual(JSON.parse(h.files[r2.keybindings!.backup!]), [{ key: 'cmd+j', command: 'original' }, { key: 'cmd+k', command: 'one' }]);
+		assert.strictEqual(JSON.parse(h.files[target.settingsPath])['editor.fontSize'], 17);
+	});
+
+	test('a copy that fails for any reason other than an existing name propagates and nothing is written', async () => {
+		const spy = spyGallery([], []);
+		const h = harness({ [target.settingsPath]: '{}' }, spy.gallery);
+		h.ports.fs.copyFile = async () => { throw Object.assign(new Error('ENOSPC: no space'), { code: 'ENOSPC' }); };
+		await assert.rejects(runImport({ ...snapshot(), extensionIds: [] }, target, h.ports), /ENOSPC/);
+		assert.deepStrictEqual(h.calls, []);
+	});
+
+	test('one import at a time: a second one started while the first runs is refused by name and writes nothing', async () => {
+		const spy = spyGallery([], []);
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		const h = harness({ [target.settingsPath]: '{"editor.fontSize":11}' }, spy.gallery, undefined, gate);
+		const single = { ...snapshot(), extensionIds: [], keybindings: undefined };
+
+		const running = runImport(single, target, h.ports);
+		let outcome: unknown = 'still waiting';
+		const second = runImport(single, target, h.ports).then(() => { outcome = 'ran'; }, (err: unknown) => { outcome = err; });
+		try {
+			await new Promise(resolve => setTimeout(resolve, 20));
+			assert.ok(outcome instanceof Error && /^\[import_in_progress\] Quantlab: another import is still running/.test(outcome.message), `second import: ${String(outcome)}`);
+			assert.deepStrictEqual(h.calls, []);
+		} finally {
+			release();
+		}
+		await second;
+		const report = await running;
+		assert.strictEqual(report.settings?.backup, `${target.settingsPath}.pre-import-20261005T141653Z`);
+		// Once the first has finished, the next import runs.
+		await runImport(single, target, harness({}, spy.gallery).ports);
+	});
 });
+

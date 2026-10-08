@@ -96,7 +96,8 @@ async function importFromEditor(context: vscode.ExtensionContext): Promise<void>
 		fs: {
 			readFile: file => fs.promises.readFile(file, 'utf8'),
 			writeFile: (file, text) => fs.promises.writeFile(file, text, 'utf8'),
-			copyFile: (from, to) => fs.promises.copyFile(from, to),
+			// COPYFILE_EXCL: a backup is never overwritten (EEXIST makes the importer pick the next name).
+			copyFile: (from, to) => fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL),
 		},
 		gallery: {
 			isInstalled: id => vscode.extensions.getExtension(id) !== undefined,
