@@ -3,11 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// The NATIVE route of window.mjs pressModal. The packaged app enforces the policy window.dialogStyle "native" over the
-// user setting the runner writes ("custom"), so its modals (the import confirmation, the publisher-trust prompt) are macOS
-// sheets or alert windows, not DOM, and CDP never sees them. They are answered here as a user would, through macOS
-// accessibility (System Events), by native-dialog.jxa.js: osascript -l JavaScript native-dialog.jxa.js <pid> <required
-// button titles JSON> <message fragment> <title to click | @@none@@>, one `QLNATIVE <json>` line out.
+// The NATIVE surface of window.mjs pressModal. The packaged app enforces the policy window.dialogStyle "native" over the
+// user setting the runner writes ("custom"), so a dialog without custom options (the import confirmation) is a macOS sheet or
+// alert window, not DOM, and CDP never sees it; one with custom options (the publisher-trust prompt) is still a DOM dialog,
+// because the workbench decides per dialog. pressModal looks on both surfaces. The native one is answered here as a user
+// would, through macOS accessibility (System Events), by native-dialog.jxa.js: osascript -l JavaScript native-dialog.jxa.js
+// <pid> <required button titles JSON> <message fragment> <title to click | @@none@@>, one `QLNATIVE <json>` line out.
 //
 // native-dialog.jxa.js is the LOGIN+DATA kit's file, VERBATIM below the fork's licence header (the header is the only
 // addition: the hygiene check requires it); the sha256 below is the source file's, i.e. of the copy's bytes after the header:
@@ -107,7 +108,7 @@ export async function nativeScan({ pid, required, message, click }) {
 }
 
 /** The process's windows as text: roles, names, direct children and the buttons/texts of every container (failure evidence). */
-function windowsText(result) {
+export function windowsText(result) {
 	if (result.windows.length === 0) {
 		return `process pid ${result.pid} (${fmt(result.procName)}) has 0 windows`;
 	}
@@ -117,13 +118,17 @@ function windowsText(result) {
 const matchesText = result => `${result.matches.length} matching: ${result.matches.map(m => `${m.kind}${m.path} of window ${m.window} buttons ${fmt(m.buttons)} texts ${fmt(m.texts)}`).join(' | ')}`;
 
 /**
- * Answers the native dialog of the app process `pid` whose message contains `message` by pressing `button`.
- * `scan` (nativeScan, or a fake in the tests) and `limits` (NATIVE_LIMITS) are required. Polls limits.pollMs for up to limits.waitMs
- * for a container holding `button`; exactly one must match and its static texts must contain `message`, else nothing is clicked.
- * Clicks by title, then waits up to limits.closeMs for the dialog to be gone. Returns
- * { route: 'native', text, labels, clicked, texts, container }; throws by name otherwise (see the head of this file).
+ * The native surface of the app process `pid` for the dialog whose message contains `message` and which holds `button`:
+ * { read, press, holders, observed }. `scan` (nativeScan, or a fake in the tests) and `limits` (NATIVE_LIMITS) are required.
+ *  - read(): one reading scan (click undefined); throws [native_process] unless System Events lists exactly one process with `pid`.
+ *  - holders(scanned): the containers of that reading which hold `button` AND whose static texts contain `message`.
+ *  - observed(scanned): the reading as text, for a failure message (the process's windows, and the dialogs that hold the
+ *    button with another message).
+ *  - press(scanned): presses `button` in a reading that has a match. Exactly one container may match and its static texts
+ *    must contain `message`, else nothing is clicked; clicks by title, then waits up to limits.closeMs for the dialog to be
+ *    gone. Returns { route: 'native', text, labels, clicked, texts, container }; throws by name otherwise (see the head of this file).
  */
-export async function pressNativeDialog({ pid, message, button }, { scan, limits }) {
+export function nativeSurface({ pid, message, button }, { scan, limits }) {
 	if (!Number.isInteger(pid) || pid <= 0) {
 		throw new Error(`[native_pid_missing] route native needs the app's process id (got ${fmt(pid)})`);
 	}
@@ -138,48 +143,66 @@ export async function pressNativeDialog({ pid, message, button }, { scan, limits
 		}
 		return scanned;
 	};
+	const holders = scanned => scanned.result.matches.filter(m => m.message.includes(message));
+	const observed = scanned => {
+		const others = scanned.result.matches.filter(m => !m.message.includes(message));
+		const holding = others.length === 0 ? '' : `${others.length} dialog(s) hold the button ${fmt(button)} with another message (texts: ${others.map(m => fmt(m.texts)).join(' | ')}); `;
+		return `${holding}${windowsText(scanned.result)}`;
+	};
+	const press = async last => {
+		if (last.result.matches.length !== 1) {
+			throw new Error(`[modal_ambiguous] route native: more than one native dialog holds "${button}" (${matchesText(last.result)}); nothing was clicked; windows: ${windowsText(last.result)}`);
+		}
+		if (!last.result.matches[0].message.includes(message)) {
+			throw new Error(`[modal_wrong_message] route native: the one dialog holding "${button}" has the static texts ${fmt(last.result.matches[0].texts)}, none containing ${fmt(message)}; nothing was clicked; windows: ${windowsText(last.result)}`);
+		}
 
+		// The click scan re-reads the tree and clicks only if exactly one dialog still matches.
+		await sleep(limits.settleMs);
+		const click = await scanApp(button);
+		if (click.result.refusal !== null) {
+			throw new Error(`[modal_click_refused] route native: the accessibility script refused to click "${button}": ${click.result.refusal}; ${matchesText(click.result)}; windows: ${windowsText(click.result)}`);
+		}
+		if (click.result.clicked === null || click.result.matches.length !== 1) {
+			throw new Error(`[modal_click_unreported] route native: the accessibility script reported neither a click nor a refusal (clicked ${fmt(click.result.clicked)}, ${matchesText(click.result)}); ${rawText(click.raw)}`);
+		}
+		const dialog = click.result.matches[0];
+		const closeBy = Date.now() + limits.closeMs;
+		for (;;) {
+			const after = await scanApp(undefined);
+			if (after.result.matches.length === 0) {
+				break;
+			}
+			if (Date.now() > closeBy) {
+				throw new Error(`[modal_still_present] route native: the dialog did not close ${limits.closeMs / 1000} s after "${button}" was clicked (${matchesText(after.result)})`);
+			}
+			await sleep(limits.pollMs);
+		}
+		return { route: 'native', text: dialog.message, labels: dialog.buttons, clicked: click.result.clicked.title, texts: dialog.texts, container: `${dialog.kind}${dialog.path} of window ${dialog.window} (clicked at ${click.result.clicked.path})` };
+	};
+	return { read: () => scanApp(undefined), press, holders, observed };
+}
+
+/**
+ * Answers the native dialog of the app process `pid` whose message contains `message` by pressing `button`, waiting for a container
+ * holding `button` (any message; the wrong message throws [modal_wrong_message]). Polls limits.pollMs for up to limits.waitMs.
+ * `scan` and `limits` are required (see nativeSurface). Returns { route: 'native', text, labels, clicked, texts, container }.
+ */
+export async function pressNativeDialog({ pid, message, button }, { scan, limits }) {
+	const surface = nativeSurface({ pid, message, button }, { scan, limits });
 	const started = Date.now();
 	let scans = 0;
 	let last;
 	for (;;) {
-		last = await scanApp(undefined);
+		last = await surface.read();
 		scans++;
 		if (last.result.matches.length > 0) {
 			break;
 		}
 		if (Date.now() - started > limits.waitMs) {
-			throw new Error(`[modal_missing] no dialog "${message}" with a button "${button}", route native: no sheet or window of pid ${pid} holding the button ${fmt(required)} in ${limits.waitMs / 1000} s (${scans} osascript scans); last osascript: ${rawText(last.raw)}; the process's windows (${last.result.windows.length}): ${windowsText(last.result)}`);
+			throw new Error(`[modal_missing] no dialog "${message}" with a button "${button}", route native: no sheet or window of pid ${pid} holding the button ${fmt([button])} in ${limits.waitMs / 1000} s (${scans} osascript scans); last osascript: ${rawText(last.raw)}; the process's windows (${last.result.windows.length}): ${windowsText(last.result)}`);
 		}
 		await sleep(limits.pollMs);
 	}
-	if (last.result.matches.length !== 1) {
-		throw new Error(`[modal_ambiguous] route native: more than one native dialog holds "${button}" (${matchesText(last.result)}); nothing was clicked; windows: ${windowsText(last.result)}`);
-	}
-	if (!last.result.matches[0].message.includes(message)) {
-		throw new Error(`[modal_wrong_message] route native: the one dialog holding "${button}" has the static texts ${fmt(last.result.matches[0].texts)}, none containing ${fmt(message)}; nothing was clicked; windows: ${windowsText(last.result)}`);
-	}
-
-	// The click scan re-reads the tree and clicks only if exactly one dialog still matches.
-	await sleep(limits.settleMs);
-	const click = await scanApp(button);
-	if (click.result.refusal !== null) {
-		throw new Error(`[modal_click_refused] route native: the accessibility script refused to click "${button}": ${click.result.refusal}; ${matchesText(click.result)}; windows: ${windowsText(click.result)}`);
-	}
-	if (click.result.clicked === null || click.result.matches.length !== 1) {
-		throw new Error(`[modal_click_unreported] route native: the accessibility script reported neither a click nor a refusal (clicked ${fmt(click.result.clicked)}, ${matchesText(click.result)}); ${rawText(click.raw)}`);
-	}
-	const dialog = click.result.matches[0];
-	const closeBy = Date.now() + limits.closeMs;
-	for (;;) {
-		const after = await scanApp(undefined);
-		if (after.result.matches.length === 0) {
-			break;
-		}
-		if (Date.now() > closeBy) {
-			throw new Error(`[modal_still_present] route native: the dialog did not close ${limits.closeMs / 1000} s after "${button}" was clicked (${matchesText(after.result)})`);
-		}
-		await sleep(limits.pollMs);
-	}
-	return { route: 'native', text: dialog.message, labels: dialog.buttons, clicked: click.result.clicked.title, texts: dialog.texts, container: `${dialog.kind}${dialog.path} of window ${dialog.window} (clicked at ${click.result.clicked.path})` };
+	return await surface.press(last);
 }

@@ -7,7 +7,7 @@
 // UI over CDP (see RUNNER-FLOW.md) and returns what it saw; a step that cannot finish throws by name.
 
 import { evaluateInFrames } from './cdp.mjs';
-import { NATIVE_LIMITS, nativeScan, pressNativeDialog } from './native-dialog.mjs';
+import { NATIVE_LIMITS, nativeScan, nativeSurface } from './native-dialog.mjs';
 
 const isWebview = url => url.startsWith('vscode-webview://');
 const isWorkbench = url => url.startsWith('vscode-file://');
@@ -84,8 +84,9 @@ function runStatus() {
 	return { state: 'card', status: status === undefined ? 'unknown' : status.slice('status-'.length), meta: meta ? meta.textContent.trim() : '', error: error ? error.textContent.trim() : '' };
 }
 
-// --- evaluated in the workbench (the effective window.dialogStyle "custom" renders modals in the DOM; "native" is native-dialog.mjs) ---
-function pressDialogButton(expected) {
+// --- evaluated in the workbench (a DOM dialog: the workbench renders one when the window's dialogStyle is "custom" or the dialog carries custom options; the others are native, see native-dialog.mjs) ---
+// Reads the open .monaco-dialog-box; with expected.click it also presses expected.button when the dialog is the wanted one.
+function dialogButton(expected) {
 	const box = document.querySelector('.monaco-dialog-box');
 	if (!box) {
 		return { state: 'absent' };
@@ -101,8 +102,11 @@ function pressDialogButton(expected) {
 	if (!button) {
 		return { state: 'no-button', text, labels };
 	}
-	button.click();
-	return { state: 'clicked', text, labels };
+	if (expected.click) {
+		button.click();
+		return { state: 'clicked', text, labels };
+	}
+	return { state: 'present', text, labels };
 }
 
 /** Fills the open Action view's form, presses Run Backtest, and waits for the run's status card. */
@@ -126,42 +130,94 @@ export async function backtestForm(cdp, args) {
 	return { missingFields: filled.hit.missing, submitted: submitted.label, ...status };
 }
 
-/** The DOM route (effective window.dialogStyle "custom"): a .monaco-dialog-box in the workbench frame, pressed over CDP. */
-async function pressDomModal(cdp, args) {
-	const hit = await until(`[modal_missing] no dialog "${args.message}" with a button "${args.button}", route custom`, 60_000, async () => {
-		const { hit, observed } = await inOneFrame(cdp, isWorkbench, pressDialogButton, args, 'modal');
-		return { value: hit?.state === 'clicked' ? hit : undefined, observed };
-	});
-	return { route: 'custom', text: hit.text, labels: hit.labels, clicked: args.button };
+/**
+ * The DOM surface for the dialog `args.message` / `args.button`: { read, press }. read() looks at the workbench frame without
+ * clicking: { found, observed }, found = a .monaco-dialog-box whose message contains args.message and which has the button.
+ * press() clicks the button over CDP; a dialog that is no longer there at the click throws [modal_dom_changed].
+ */
+function domSurface(cdp, args) {
+	const expected = click => ({ message: args.message, button: args.button, click });
+	return {
+		async read() {
+			const { hit, observed } = await inOneFrame(cdp, isWorkbench, dialogButton, expected(false), 'modal');
+			const found = hit?.state === 'present';
+			const text = hit === undefined ? `no dialog in the workbench frame (${observed})`
+				: found ? JSON.stringify(hit)
+				: hit.state === 'other-dialog' ? `a dialog with another message is open (not a match): ${JSON.stringify(hit)}`
+				: `the dialog has the message but no button "${args.button}": ${JSON.stringify(hit)}`;
+			return { found, observed: text };
+		},
+		async press() {
+			const { hit, observed } = await inOneFrame(cdp, isWorkbench, dialogButton, expected(true), 'modal');
+			if (hit?.state !== 'clicked') {
+				throw new Error(`[modal_dom_changed] the DOM dialog "${args.message}" with a button "${args.button}" was seen, but at the click: ${observed}; nothing was clicked`);
+			}
+			return { route: 'dom', text: hit.text, labels: hit.labels, clicked: args.button };
+		},
+	};
 }
 
 /**
- * Runs `routes[style]` for the effective window.dialogStyle. The packaged app enforces the policy "native" over the user setting
- * "custom" the runner writes, so the style is the one the workbench resolved (the driver reports it); any other value throws
- * before a dialog is waited for.
+ * The two surfaces a dialog can be on, { dom, native }, each { read, press }: the workbench decides per dialog (it renders a DOM
+ * dialog when the window's dialogStyle is "custom" or the dialog carries custom options, a native one otherwise), so both are asked.
+ * `native` = { scan, limits } of the native surface (nativeScan and NATIVE_LIMITS, or fakes in the tests). `pid` is the app's main process.
  */
-export async function routeModal(style, routes) {
-	if (style !== 'custom' && style !== 'native') {
-		throw new Error(`[dialog_style_unknown] window.dialogStyle is ${JSON.stringify(style)}, expected "custom" (DOM dialog, pressed over CDP) or "native" (macOS dialog, pressed through accessibility); no dialog was waited for`);
+export function modalSurfaces(cdp, args, pid, native) {
+	const surface = nativeSurface({ pid, message: args.message, button: args.button }, native);
+	return {
+		dom: domSurface(cdp, args),
+		native: {
+			async read() {
+				const scanned = await surface.read();
+				return { found: surface.holders(scanned).length > 0, observed: surface.observed(scanned), scanned };
+			},
+			press: observation => surface.press(observation.scanned),
+		},
+	};
+}
+
+/**
+ * Looks for the dialog on both surfaces in every poll (limits.pollMs, up to limits.waitMs) and presses the button on the one that
+ * holds it. Both holding it throws [modal_ambiguous] and nothing is clicked; neither in time throws [modal_missing] naming each
+ * surface's last observation. Returns the surface's record plus { surface, route (= surface), dialogStyle }.
+ */
+export async function awaitModal(args, surfaces, limits) {
+	const started = Date.now();
+	let polls = 0;
+	for (;;) {
+		const dom = await surfaces.dom.read();
+		const native = await surfaces.native.read();
+		polls++;
+		if (dom.found && native.found) {
+			throw new Error(`[modal_ambiguous] dialog "${args.message}" with a button "${args.button}" is on both surfaces (DOM: ${dom.observed}; native: ${native.observed}); nothing was clicked`);
+		}
+		if (dom.found || native.found) {
+			const surface = dom.found ? 'dom' : 'native';
+			const pressed = await surfaces[surface].press(dom.found ? dom : native);
+			return { ...pressed, surface, route: surface, dialogStyle: args.dialogStyle };
+		}
+		if (Date.now() - started > limits.waitMs) {
+			throw new Error(`[modal_missing] no dialog "${args.message}" with a button "${args.button}" on either surface (DOM: ${dom.observed}; native: ${native.observed}) after ${limits.waitMs / 1000} s (${polls} polls)`);
+		}
+		await new Promise(resolve => setTimeout(resolve, limits.pollMs));
 	}
-	return await routes[style]();
 }
 
 /**
  * Presses `args.button` on the modal whose message contains `args.message` (the import confirmation, the publisher-trust prompt),
- * on the route `args.dialogStyle` (the driver's reading of the effective window.dialogStyle) selects. `pid` is the app's main
- * process, for the native route. Returns { route, text, labels, clicked, ... }.
+ * wherever the workbench put it (see modalSurfaces). `pid` is the app's main process, for the native surface. `args.dialogStyle`
+ * is the driver's reading of the effective window.dialogStyle: evidence only, it routes nothing; a value other than "custom" or
+ * "native" signals a broken reading and throws [dialog_style_unknown] before a dialog is waited for.
  */
 export async function pressModal(cdp, args, pid) {
-	return await routeModal(args.dialogStyle, modalRoutes(cdp, args, pid, { scan: nativeScan, limits: NATIVE_LIMITS }));
+	checkDialogStyle(args.dialogStyle);
+	return await awaitModal(args, modalSurfaces(cdp, args, pid, { scan: nativeScan, limits: NATIVE_LIMITS }), NATIVE_LIMITS);
 }
 
-/** The two routes pressModal chooses between;  = { scan, limits } of the native route (nativeScan and NATIVE_LIMITS, or fakes in the tests). */
-export function modalRoutes(cdp, args, pid, native) {
-	return {
-		custom: () => pressDomModal(cdp, args),
-		native: () => pressNativeDialog({ pid, message: args.message, button: args.button }, native),
-	};
+export function checkDialogStyle(style) {
+	if (style !== 'custom' && style !== 'native') {
+		throw new Error(`[dialog_style_unknown] window.dialogStyle is ${JSON.stringify(style)}, expected "custom" or "native"; the reading is broken, no dialog was waited for`);
+	}
 }
 
 // --- notification toasts in the workbench (serialised; no closures) ---
