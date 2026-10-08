@@ -118,9 +118,13 @@ suite('Settings editor - the rendered row of the retired demo password (STRIP-2)
 		const container = mainWindow.document.createElement('div');
 		const template = renderer.renderTemplate(container);
 		const node = { element: row } as unknown as ITreeNode<SettingsTreeSettingElement, never>;
+		const disposeElement = renderer.disposeElement;
+		if (!disposeElement) {
+			throw new Error(`the renderer of ${templateId} has no disposeElement: the row could not be disposed`);
+		}
 		renderer.renderElement(node, 0, template);
 		disposables.add(toDisposable(() => {
-			renderer.disposeElement(node, 0, template);
+			disposeElement.call(renderer, node, 0, template);
 			renderer.disposeTemplate(template);
 			// the common template of settingsTree.ts does not put its toolbar in `toDispose` (the bool template does)
 			template.toolbar.dispose();
