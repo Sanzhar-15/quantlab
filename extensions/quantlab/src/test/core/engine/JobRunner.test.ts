@@ -290,6 +290,68 @@ suite('JobRunner - the engine result contract', () => {
 	});
 });
 
+// A success on stdout completes the job only when the engine also ended normally with exit code 0.
+suite('JobRunner - the engine process must end normally for a job to complete', () => {
+	let dir: string;
+
+	setup(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-jobrunner-exit-'));
+	});
+
+	teardown(() => {
+		fs.rmSync(dir, { recursive: true });
+	});
+
+	function terminal(events: EngineEvent[]): EngineEvent[] {
+		return events.filter(e => e.type === 'failed' || e.type === 'complete');
+	}
+
+	test('valid success stdout, then exit 3: exactly one named failure, no completion', async function () {
+		if (process.platform === 'win32') {
+			this.skip();
+		}
+		const exe = engineScript(dir, `cat >/dev/null\nprintf '%s' '${COMPLETE}'\nexit 3\n`);
+		const events = await runToEnd(makeRequest(), launch(exe));
+		assert.deepStrictEqual(terminal(events), [
+			{ type: 'failed', jobId: 'test-job-1', error: 'The engine exited with code 3 after printing a success result, so the job did not complete.' },
+		]);
+		assert.ok(events.some(e => e.type === 'log' && e.level === 'error' && e.message === 'The engine exited with code 3 after printing a success result; the result is discarded.'));
+	});
+
+	test('the same engine exiting 0 completes', async function () {
+		if (process.platform === 'win32') {
+			this.skip();
+		}
+		const exe = engineScript(dir, `cat >/dev/null\nprintf '%s' '${COMPLETE}'\nexit 0\n`);
+		const events = await runToEnd(makeRequest(), launch(exe));
+		const ended = terminal(events);
+		assert.strictEqual(ended.length, 1, JSON.stringify(ended));
+		assert.strictEqual(ended[0].type, 'complete');
+	});
+
+	test('valid success stdout, then termination by a signal: one named failure naming the signal', async function () {
+		if (process.platform === 'win32') {
+			this.skip();
+		}
+		const exe = engineScript(dir, `cat >/dev/null\nprintf '%s' '${COMPLETE}'\nkill -KILL $$\n`);
+		const events = await runToEnd(makeRequest(), launch(exe));
+		assert.deepStrictEqual(terminal(events), [
+			{ type: 'failed', jobId: 'test-job-1', error: 'The engine was terminated by signal SIGKILL after printing a success result, so the job did not complete.' },
+		]);
+	});
+
+	test('the engine\'s own failure detail is kept when it exits non-zero', async function () {
+		if (process.platform === 'win32') {
+			this.skip();
+		}
+		const exe = engineScript(dir, `cat >/dev/null\nprintf '%s' '{"success":false,"error":"strategy raised","stack":"Traceback"}'\nexit 1\n`);
+		const events = await runToEnd(makeRequest(), launch(exe));
+		assert.deepStrictEqual(terminal(events), [
+			{ type: 'failed', jobId: 'test-job-1', error: 'strategy raised', stack: 'Traceback' },
+		]);
+	});
+});
+
 /** A stand-in engine: a shell script whose body is `body`. */
 function engineScript(dir: string, body: string): string {
 	const exe = path.join(dir, 'quantlab-engine');
