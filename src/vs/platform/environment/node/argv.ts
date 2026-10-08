@@ -87,6 +87,23 @@ export function refusedCliOption(args: NativeParsedArgs): string | undefined {
 	return undefined;
 }
 
+/**
+ * Refuses a command line that asks for a removed subcommand or option by throwing an error that names it. A refusal is a
+ * failure, never a result: the CLI reports the error and exits non-zero, so a script that asked for a removed area never
+ * sees success.
+ */
+export function refuseRemovedCliArgs(args: NativeParsedArgs, applicationName: string): void {
+	const command = refusedCliCommand(args);
+	if (command) {
+		throw new Error(`'${command}' command not supported in ${applicationName}`);
+	}
+
+	const option = refusedCliOption(args);
+	if (option) {
+		throw new Error(`'${option}' option not supported in ${applicationName}`);
+	}
+}
+
 export const OPTIONS: OptionDescriptions<Required<NativeParsedArgs>> = {
 	'chat': {
 		type: 'subcommand',

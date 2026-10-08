@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { buildHelpMessage, formatOptions, Option, OptionDescriptions, OPTIONS, Subcommand, parseArgs, ErrorReporter, REFUSED_CLI_COMMANDS, REFUSED_CLI_OPTIONS, refusedCliCommand, refusedCliOption } from '../../node/argv.js';
+import { buildHelpMessage, formatOptions, Option, OptionDescriptions, OPTIONS, Subcommand, parseArgs, ErrorReporter, REFUSED_CLI_COMMANDS, REFUSED_CLI_OPTIONS, refusedCliCommand, refusedCliOption, refuseRemovedCliArgs } from '../../node/argv.js';
 import { addArg } from '../../node/argvHelper.js';
 
 function o(description: string, type: 'boolean' | 'string' | 'string[]' = 'string'): Option<any> {
@@ -120,6 +120,35 @@ suite('formatOptions', () => {
 		const help = buildHelpMessage('Product', 'product', '1.0.0', OPTIONS);
 		assert.ok(help.includes('--install-extension'), 'control: the help lists the extension install option');
 		assert.ok(!/--add-mcp|--sync|--telemetry|--remote|Model Context Protocol/.test(help), help);
+	});
+
+	test('a refused command line is an error naming what it refuses, never a result (the CLI exits non-zero)', () => {
+		const reporter: ErrorReporter = { onUnknownOption: () => { }, onMultipleValues: () => { }, onEmptyValue: () => { }, onDeprecatedOption: () => { } };
+		const refused: [string[], string][] = [
+			[['tunnel'], `'tunnel' command not supported in product`],
+			[['serve-web'], `'serve-web' command not supported in product`],
+			[['chat'], `'chat' command not supported in product`],
+			[['--add-mcp', '{"name":"server-name","command":"x"}'], `'--add-mcp' option not supported in product`],
+			[['--sync', 'on'], `'--sync' option not supported in product`],
+			[['--telemetry'], `'--telemetry' option not supported in product`],
+			[['--remote', 'ssh-remote+host'], `'--remote' option not supported in product`],
+			[['--folder-uri', 'vscode-remote://ssh-remote+host/home/user'], `'--folder-uri vscode-remote://' option not supported in product`],
+		];
+		for (const [argv, expected] of refused) {
+			assert.throws(() => refuseRemovedCliArgs(parseArgs(argv, OPTIONS, reporter), 'product'), (error: Error) => error.message === expected, argv.join(' '));
+		}
+
+		// controls: the extension install CLI, local URIs and ordinary invocations are not refused
+		const allowed: string[][] = [
+			['--install-extension', 'publisher.name'],
+			['--list-extensions', '--show-versions'],
+			['--folder-uri', 'file:///home/user'],
+			['--wait', 'tunnel.txt', 'chat.md', 'remote.txt'],
+			[]
+		];
+		for (const argv of allowed) {
+			assert.doesNotThrow(() => refuseRemovedCliArgs(parseArgs(argv, OPTIONS, reporter), 'product'), argv.join(' '));
+		}
 	});
 
 	test('addArg', () => {
