@@ -10,6 +10,7 @@ import { hostname, release } from 'os';
 import { VSBuffer } from '../../base/common/buffer.js';
 import { toErrorMessage } from '../../base/common/errorMessage.js';
 import { Event } from '../../base/common/event.js';
+import { getMarks, mark } from '../../base/common/performance.js';
 import { parse } from '../../base/common/jsonc.js';
 import { getPathLabel } from '../../base/common/labels.js';
 import { Disposable, DisposableStore } from '../../base/common/lifecycle.js';
@@ -559,6 +560,8 @@ export class CodeApplication extends Disposable {
 	}
 
 	async startup(): Promise<void> {
+		// QuantLab host (F-PERF-LZ1-1): marks placing the main process's time to the terminal host's start (logged at startTerminalHost)
+		mark('code/ql/willStartup');
 		this.logService.debug('Starting VS Code');
 		this.logService.debug(`from: ${this.environmentMainService.appRoot}`);
 		this.logService.debug('args:', this.environmentMainService.args);
@@ -605,12 +608,14 @@ export class CodeApplication extends Disposable {
 			resolveSqmId(this.stateService, this.logService),
 			resolveDevDeviceId(this.stateService, this.logService)
 		]);
+		mark('code/ql/didResolveMachineIds');
 
 		// Shared process
 		const { sharedProcessReady, sharedProcessClient } = this.setupSharedProcess(machineId, sqmId, devDeviceId);
 
 		// Services
 		const appInstantiationService = await this.initServices(machineId, sqmId, devDeviceId, sharedProcessReady);
+		mark('code/ql/didInitServices');
 
 		// Error telemetry
 		appInstantiationService.invokeFunction(accessor => this._register(new ErrorTelemetry(accessor.get(ILogService), accessor.get(ITelemetryService))));
@@ -626,6 +631,7 @@ export class CodeApplication extends Disposable {
 
 		// Setup Protocol URL Handlers
 		const initialProtocolUrls = await appInstantiationService.invokeFunction(accessor => this.setupProtocolUrlHandlers(accessor, mainProcessElectronServer));
+		mark('code/ql/didSetupProtocolUrlHandlers');
 
 		// Setup vscode-remote-resource protocol handler
 		this.setupManagedRemoteResourceUrlHandler(mainProcessElectronServer);
@@ -1379,6 +1385,12 @@ export class CodeApplication extends Disposable {
 		// window, the lifecycle's shutdown joiners settle in milliseconds and its final quit ended the process while the rejected
 		// start was still unwinding (exit 133, SIGTRAP in the isolate's disposal, no `exit 0`). The start is a shutdown joiner
 		// until it settles; the joiner only waits: the rejection itself is handled by the catch below.
+		mark('code/ql/willStartTerminalHost');
+		const timeOrigin = getMarks().find(m => m.name === 'code/timeOrigin');
+		if (!timeOrigin) {
+			throw new Error('QuantLab host: no code/timeOrigin mark: the startup marks cannot be placed');
+		}
+		this.logService.info(`QuantLab host: startup marks (ms from process start) ${getMarks().map(m => `${m.name}=${Math.round(m.startTime - timeOrigin.startTime)}`).join(' ')}`);
 		const starting = startTerminalHost(ports);
 		const startJoiner = Event.once(this.lifecycleMainService.onWillShutdown)(e => e.join('qlTerminalHostStart', starting.then(() => undefined, () => undefined)));
 		let terminalHost: TerminalHost;
