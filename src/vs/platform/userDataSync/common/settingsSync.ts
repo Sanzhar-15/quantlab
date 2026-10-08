@@ -155,6 +155,13 @@ export class SettingsSynchroniser extends AbstractJsonFileSynchroniser implement
 
 		const fileContent = await this.getLocalFileContent();
 		const localContent: string = fileContent ? fileContent.value.toString().trim() : '';
+		// QuantLab F-SYNC-STRIP-1: merge() refuses content that does not parse (never-synced settings are never passed on
+		// unchecked). A local file that does not parse yet (the user is typing) is a local change: the sync it triggers
+		// reports it visibly as LocalInvalidContent (validateContent), as before the strip.
+		if (this.hasErrors(localContent || '{}', false)) {
+			this.logService.info(`${this.syncResourceLogLabel}: Local settings do not parse; reporting a local change so that the sync reports the invalid content.`);
+			return true;
+		}
 		const ignoredSettings = await this.getIgnoredSettings();
 		const formattingOptions = await this.getFormattingOptions();
 		const result = merge(localContent || '{}', lastSettingsSyncContent.settings, lastSettingsSyncContent.settings, ignoredSettings, [], formattingOptions);

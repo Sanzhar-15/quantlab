@@ -19,6 +19,14 @@ import { Registry } from '../../../../platform/registry/common/platform.js';
  *   userDataSync.ts:29-32 and settingsMerge.ts `getIgnoredSettings`).
  * - `ignoreSync` alone yields to a user's `-key` entry in `settingsSync.ignoredSettings`; the hard stop is
  *   `NEVER_SYNCED_SETTINGS` in platform/userDataSync/common/settingsMerge.ts.
+ * - `qic.demo.password` is not `type: 'string'`. The Settings editor lists a configured deprecated setting
+ *   (settingsTreeModels.ts, createSettingsTreeGroupElement) and renders a `string` setting in a plain-text InputBox
+ *   (settingsTree.ts, SettingTextRenderer), which would show a password left in settings.json in the clear, in the
+ *   tree and in search results. A nullable string is read as `SettingValueType.Complex`
+ *   (settingsTreeModels.ts, initSettingValueType), whose row is only an "Edit in settings.json" button and holds no
+ *   value control. A string value still validates against the type, so the row shows no type error either. The
+ *   text of the user's own settings.json is not covered by this: the JSON editor shows what the user typed.
+ *   `qic.demo.email` stays a `string`: it is an address, not a credential.
  * No `default`, on purpose. Remove together with that list after the first user-facing release that includes QuantLab.
  */
 Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).registerConfiguration({
@@ -32,7 +40,7 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 			deprecationMessage: localize('quantlabRetiredSettings.demoEmail', "This setting is no longer used and is never synced. Sign-in happens in the Quantlab terminal view. Remove it from your settings."),
 		},
 		'qic.demo.password': {
-			type: 'string',
+			type: ['string', 'null'],
 			scope: ConfigurationScope.APPLICATION,
 			ignoreSync: true,
 			deprecationMessage: localize('quantlabRetiredSettings.demoPassword', "This setting is no longer used and is never synced. Sign-in happens in the Quantlab terminal view. Remove it from your settings."),
