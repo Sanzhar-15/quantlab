@@ -266,9 +266,10 @@ export class Menubar extends Disposable {
 		}
 
 		// If we don't have a menu yet, set it to null to avoid the electron menu.
-		// This should only happen on the first launch ever
+		// QuantLab host (F-HOST-APPMENU-1): this is every launch whose workbench has not sent its menus (the terminal view on a
+		// fresh profile); macOS gets the application menu and a Window menu instead of an empty menu.
 		if (Object.keys(this.menubarMenus).length === 0) {
-			this.doSetApplicationMenu(isMacintosh ? new Menu() : null);
+			this.doSetApplicationMenu(isMacintosh ? this.createQlNoWorkbenchMenu() : null);
 			return;
 		}
 
@@ -402,6 +403,47 @@ export class Menubar extends Disposable {
 		}
 	}
 
+	// QuantLab host (F-HOST-APPMENU-1): the stock Quit item's click, shared with the menu installed before the workbench sends its menus
+	private async quitFromMenu(event: KeyboardEvent): Promise<void> {
+		const lastActiveWindow = this.windowsMainService.getLastActiveWindow();
+		if (
+			this.windowsMainService.getWindowCount() === 0 || 	// allow to quit when no more windows are open
+			!!BaseWindow.getFocusedWindow() ||					// allow to quit when window has focus (fix for https://github.com/microsoft/vscode/issues/39191); QuantLab host (U5): any focused window, so also the host window while the terminal view has focus
+			lastActiveWindow?.win?.isMinimized()				// allow to quit when window has no focus but is minimized (https://github.com/microsoft/vscode/issues/63000)
+		) {
+			const confirmed = await this.confirmBeforeQuit(event);
+			if (confirmed) {
+				this.nativeHostMainService.quit(undefined);
+			}
+		}
+	}
+
+	// QuantLab host (F-HOST-APPMENU-1): macOS, before the workbench has sent its menus (no workbench yet, or a fresh profile). Native
+	// roles and the stock quit path only: no item runs a workbench action, so no item is a first use of the workbench. Accelerators
+	// are written out because the workbench's keybindings have not arrived either.
+	private createQlNoWorkbenchMenu(): Menu {
+		const name = this.productService.nameLong;
+		const applicationMenu = Menu.buildFromTemplate([
+			{ label: nls.localize('mAbout', "About {0}", name), role: 'about' },
+			{ type: 'separator' },
+			{ label: nls.localize('mHide', "Hide {0}", name), role: 'hide', accelerator: 'Command+H' },
+			{ label: nls.localize('mHideOthers', "Hide Others"), role: 'hideOthers', accelerator: 'Command+Alt+H' },
+			{ label: nls.localize('mShowAll', "Show All"), role: 'unhide' },
+			{ type: 'separator' },
+			{ label: nls.localize('miQuit', "Quit {0}", name), accelerator: 'Command+Q', click: (item, window, event) => this.quitFromMenu(event) }
+		]);
+		const windowMenu = Menu.buildFromTemplate([
+			{ label: nls.localize('mMinimize', "Minimize"), role: 'minimize', accelerator: 'Command+M' },
+			{ label: nls.localize('mZoom', "Zoom"), role: 'zoom' },
+			{ type: 'separator' },
+			{ label: nls.localize('mBringToFront', "Bring All to Front"), role: 'front' }
+		]);
+		const menubar = new Menu();
+		menubar.append(new MenuItem({ label: this.productService.nameShort, submenu: applicationMenu }));
+		menubar.append(new MenuItem({ label: nls.localize('mWindow', "Window"), submenu: windowMenu }));
+		return menubar;
+	}
+
 	private setMacApplicationMenu(macApplicationMenu: Menu): void {
 		const about = this.createMenuItem(nls.localize('mAbout', "About {0}", this.productService.nameLong), 'workbench.action.showAboutDialog');
 		const checkForUpdates = this.getUpdateMenuItems();
@@ -419,19 +461,7 @@ export class Menubar extends Disposable {
 		const hideOthers = new MenuItem({ label: nls.localize('mHideOthers', "Hide Others"), role: 'hideOthers', accelerator: 'Command+Alt+H' });
 		const showAll = new MenuItem({ label: nls.localize('mShowAll', "Show All"), role: 'unhide' });
 		const quit = new MenuItem(this.likeAction('workbench.action.quit', {
-			label: nls.localize('miQuit', "Quit {0}", this.productService.nameLong), click: async (item, window, event) => {
-				const lastActiveWindow = this.windowsMainService.getLastActiveWindow();
-				if (
-					this.windowsMainService.getWindowCount() === 0 || 	// allow to quit when no more windows are open
-					!!BaseWindow.getFocusedWindow() ||					// allow to quit when window has focus (fix for https://github.com/microsoft/vscode/issues/39191); QuantLab host (U5): any focused window, so also the host window while the terminal view has focus
-					lastActiveWindow?.win?.isMinimized()				// allow to quit when window has no focus but is minimized (https://github.com/microsoft/vscode/issues/63000)
-				) {
-					const confirmed = await this.confirmBeforeQuit(event);
-					if (confirmed) {
-						this.nativeHostMainService.quit(undefined);
-					}
-				}
-			}
+			label: nls.localize('miQuit', "Quit {0}", this.productService.nameLong), click: (item, window, event) => this.quitFromMenu(event)
 		}));
 
 		const actions = [about];
