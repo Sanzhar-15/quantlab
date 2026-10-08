@@ -87,6 +87,12 @@ function holdsNeverSyncedSettings(content: string): boolean {
 	return !!parsed && NEVER_SYNCED_SETTINGS.some(key => parsed[key] !== undefined);
 }
 
+function neverSyncedSettingsHeld(targetContent: string, sourceContent: string): string[] {
+	const target = parse(targetContent);
+	const source = parse(sourceContent);
+	return NEVER_SYNCED_SETTINGS.filter(key => (!!target && target[key] !== undefined) || (!!source && source[key] !== undefined));
+}
+
 function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions): string {
 	const parsed = parse(content);
 	if (!parsed) {
@@ -101,13 +107,15 @@ function removeNeverSyncedSettings(content: string, formattingOptions: Formattin
 }
 
 /**
- * Ignored settings, {@link NEVER_SYNCED_SETTINGS} always among them, take the value they have in `sourceContent` (or are
- * removed when the source lacks them). Built for the local file with the local content as source, the result keeps the
- * local values; built with `'{}'` as source, it holds none. Content that leaves this machine and is rebuilt against
- * the remote is built with {@link updateIgnoredSettingsForRemote}.
+ * Ignored settings take the value they have in `sourceContent` (or are removed when the source lacks them). Each
+ * {@link NEVER_SYNCED_SETTINGS} key is among them exactly when either side holds it, whatever list the caller passed, so
+ * content where neither side holds the pair is rebuilt as the ordinary ignored settings alone rebuild it. Built for the
+ * local file with the local content as source, the result keeps the local values; built with `'{}'` as source, it holds
+ * none. Content that leaves this machine and is rebuilt against the remote is built with
+ * {@link updateIgnoredSettingsForRemote}.
  */
 export function updateIgnoredSettings(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
-	ignoredSettings = distinct([...ignoredSettings, ...NEVER_SYNCED_SETTINGS]);
+	ignoredSettings = distinct([...ignoredSettings.filter(key => !NEVER_SYNCED_SETTINGS.includes(key)), ...neverSyncedSettingsHeld(targetContent, sourceContent)]);
 	if (ignoredSettings.length) {
 		const sourceTree = parseSettings(sourceContent);
 		const source = parse(sourceContent) || {};
