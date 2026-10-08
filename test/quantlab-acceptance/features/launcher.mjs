@@ -3,8 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// FEATURES closing checks (PLAN-FINAL 3.9): launches the packaged app twice on fresh profiles -- the
-// app itself, then a copy with one pinned extension removed (the negative control) -- with the driver
+// FEATURES closing checks (PLAN-FINAL 3.9): launches the packaged app on fresh profiles -- the app itself, the import in
+// its own launch, the import again in its own launch in a NAMED profile (`--profile`, QL-G-FEAT c1 M3: the row
+// import-named-profile, network-off run only), then a copy with one pinned extension removed (the negative control) -- with the driver
 // extension in ./driver running the checks inside the extension host. The steps the extension host
 // cannot take (the Action view's form, a modal's button) the driver hands to the window driver here
 // (cues.cjs, window.mjs over CDP). The extension-pack row adds a plain first start, observed from outside
@@ -16,7 +17,7 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { connect, waitForEndpoint } from './cdp.mjs';
 import * as net from 'node:net';
-import { assemble, assertNoAsarEnvAbsent, checkIdsFor, closeApp, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, readForkSha, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
+import { assemble, assertNoAsarEnvAbsent, checkIdsFor, closeApp, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgeImportNamedProfile, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, PACK_OWNERS, packMembers, PINNED_IDS, processesInside, profileArgs, readForkSha, readNamedProfileState, readPins, requestUrls, sha256File, treeDigest } from './lib.mjs';
 import { backtestForm, pressModal, readToasts, waitForWorkbench } from './window.mjs';
 
 // This process only: Electron's asar-patched fs refuses to read a FILE named *.asar as bytes (ENOENT ", not found in
@@ -83,6 +84,8 @@ async function launch(bundle, dir, mode, python, network) {
 		MOCK_KEYCHAIN,
 		`--user-data-dir=${userData}`,
 		`--extensions-dir=${path.join(dir, 'extensions')}`,
+		// `--profile <name>` for the import-profile mode only: a named profile created on this fresh user-data dir (lib.mjs NAMED_PROFILE).
+		...profileArgs(mode),
 		...driverArgs(mode, path.join(here, 'driver')),
 		'--disable-workspace-trust',
 		'--skip-welcome',
@@ -272,6 +275,20 @@ async function plainLaunch(bundle, dir) {
 	return { toasts: [...toasts], ...observeProfile(dir) };
 }
 
+/** The import-named-profile row from its launch: a launch failure is a FAIL by name, so is a profile state that cannot be read. */
+function judgeNamedProfileLaunch(named, dir) {
+	if (named.launchError) {
+		return { status: 'FAIL', detail: named.launchError };
+	}
+	let state;
+	try {
+		state = readNamedProfileState(path.join(dir, 'user-data'));
+	} catch (err) {
+		return { status: 'FAIL', detail: `[profile_state_unreadable] ${err instanceof Error ? err.message : String(err)}` };
+	}
+	return judgeImportNamedProfile({ ...named.profileImport, state });
+}
+
 /** The network-on run's precondition: the gallery host answers a TCP connection. */
 function networkOn() {
 	return new Promise(resolve => {
@@ -346,6 +363,9 @@ try {
 		const main = await launch(app, path.join(evidence, 'main'), 'all', python, network);
 		// The import needs its modal: its own launch, without the extension tests (DIALOG_MODES).
 		const imported = await launch(app, path.join(evidence, 'import'), 'import', python, network);
+		// The same import in a NAMED profile on its own fresh user-data dir (`--profile`): its own launch.
+		const namedDir = path.join(evidence, 'import-profile');
+		const namedProfile = await launch(app, namedDir, 'import-profile', python, network);
 		// 2. The negative control: a copy of the app without one pinned extension; only the pin report is read.
 		const copy = path.join(evidence, 'control', path.basename(app));
 		fs.mkdirSync(path.join(evidence, 'control'));
@@ -364,6 +384,7 @@ try {
 			}
 		}
 		checks.import = imported.launchError ? { status: 'FAIL', detail: imported.launchError } : imported.checks.import;
+		checks['import-named-profile'] = judgeNamedProfileLaunch(namedProfile, namedDir);
 		checks['pinned-dependency-removed'] = control.launchError
 			? { status: 'FAIL', detail: control.launchError }
 			: judgePinnedDependency(main.pins, control.pins, REMOVED_IN_CONTROL);

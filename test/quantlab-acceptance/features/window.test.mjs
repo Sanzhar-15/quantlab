@@ -33,9 +33,9 @@ test('pressModal: an unknown or missing dialogStyle throws before the CDP connec
 	await assert.rejects(pressModal(null, { message: MESSAGE, button: BUTTON }, 123), /\[dialog_style_unknown\] window\.dialogStyle is undefined/);
 });
 
-test('driver and launcher: both modal cues carry the dialogStyle reading, and the launcher hands the app pid to pressModal', () => {
+test('driver and launcher: every modal cue (the import, the import in a named profile, the trust prompt) carries the dialogStyle reading, and the launcher hands the app pid to pressModal', () => {
 	const driver = fs.readFileSync(new URL('./driver/checks.cjs', import.meta.url), 'utf8');
-	assert.strictEqual(driver.split('dialogStyle: dialogStyle() }').length - 1, 2);
+	assert.strictEqual(driver.split('dialogStyle: dialogStyle() }').length - 1, 3);
 	assert.ok(driver.includes(`getConfiguration('window').get('dialogStyle')`));
 	const launcher = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
 	assert.strictEqual(launcher.split('pressModal(await window(), args, child.pid)').length - 1, 2);

@@ -15,7 +15,7 @@ import { test } from 'node:test';
 import { createRequire } from 'node:module';
 import { connect, evaluateInFrames } from './cdp.mjs';
 import { isAppSurface } from './window.mjs';
-import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, closeApp, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, packMembers, processesInside, readForkSha, readPins, requestUrls, treeDigest } from './lib.mjs';
+import { assemble, assertNoAsarEnvAbsent, CHECK_IDS, checkIdsFor, closeApp, DIALOG_MODES, driverArgs, findBuiltInExtensionDir, galleryHosts, IMPORT_KEYBINDING, IMPORT_SETTINGS, judgeImportNamedProfile, judgePackQuiet, judgePackRow, judgePinnedDependency, judgeQuantbookMcpAbsent, MOCK_KEYCHAIN, NAMED_PROFILE, packMembers, processesInside, profileArgs, readForkSha, readNamedProfileState, readPins, requestUrls, treeDigest } from './lib.mjs';
 
 const { ask, serve } = createRequire(import.meta.url)('./cues.cjs');
 
@@ -263,7 +263,7 @@ test('evaluateInFrames attaches only to app-surface targets: the guest\'s silent
 });
 
 test('driverArgs: the dialog modes run the driver without --extensionTestsPath (dialogs are refused there); the others with it', () => {
-	assert.deepStrictEqual(DIALOG_MODES, ['import', 'pack-trigger']);
+	assert.deepStrictEqual(DIALOG_MODES, ['import', 'import-profile', 'pack-trigger']);
 	for (const mode of DIALOG_MODES) {
 		assert.deepStrictEqual(driverArgs(mode, '/d'), ['--extensionDevelopmentPath=/d'], mode);
 	}
@@ -287,9 +287,11 @@ test('the driver starts itself in the dialog modes: a loadable manifest, onStart
 	assert.ok(all.length > 0 && !all.includes('importFromVsCode'), 'the import (a modal) is still in the extension-tests mode');
 	const launcher = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
 	assert.ok(!launcher.includes('--extensionTestsPath'), 'launcher.mjs passes --extensionTestsPath itself instead of driverArgs');
-	assert.strictEqual(launcher.match(/await launch\(/g).length, 4);
-	assert.strictEqual(launcher.match(/await launch\([^\n]*, python, network\);/g).length, 4);
+	assert.strictEqual(launcher.match(/await launch\(/g).length, 5);
+	assert.strictEqual(launcher.match(/await launch\([^\n]*, python, network\);/g).length, 5);
 	assert.ok(launcher.includes(`'import', python, network)`), 'no import launch');
+	assert.ok(launcher.includes(`'import-profile', python, network)`), 'no named-profile import launch');
+	assert.ok(launcher.includes('...profileArgs(mode),'), 'launch() does not pass profileArgs(mode)');
 });
 
 test('isAppSurface: workbench and webview URLs only', () => {
@@ -471,4 +473,161 @@ test('every app launch in launcher.mjs carries the mock keychain flag (R-24)', (
 	assert.ok(launches.length >= 2, `found ${launches.length} app launches in launcher.mjs`);
 	assert.deepStrictEqual(launches.map(args => args.includes('MOCK_KEYCHAIN')), launches.map(() => true));
 	assert.strictEqual(MOCK_KEYCHAIN, '--use-mock-keychain');
+});
+
+// ---- the import-named-profile row (QL-G-FEAT c1 M3) ----
+
+const PLANT = { dir: 'abc123', settings: { 'editor.tabSize': 3, 'editor.fontSize': 11 }, keybindings: [{ key: 'ctrl+alt+w', command: 'workbench.action.files.save' }] };
+const SHA_S = 'a'.repeat(64);
+const SHA_K = 'b'.repeat(64);
+
+/** A passing observation: one profile directory with the merged files and both backups; the default profile's two files unchanged. */
+function namedProfileObs(change = {}) {
+	const dir = {
+		name: 'abc123',
+		path: '/e/import-profile/user-data/User/profiles/abc123',
+		files: ['keybindings.json', 'keybindings.json.pre-import-20261008T080000Z', 'settings.json', 'settings.json.pre-import-20261008T080000Z'],
+		settings: JSON.stringify({ ...PLANT.settings, ...IMPORT_SETTINGS }),
+		keybindings: JSON.stringify([...PLANT.keybindings, IMPORT_KEYBINDING]),
+		backups: [
+			{ name: 'keybindings.json.pre-import-20261008T080000Z', text: JSON.stringify(PLANT.keybindings) },
+			{ name: 'settings.json.pre-import-20261008T080000Z', text: JSON.stringify(PLANT.settings) },
+		],
+	};
+	return { planted: PLANT, plantedDirs: ['abc123'], defaultBefore: { settings: SHA_S, keybindings: null }, state: { dirs: [dir], defaultAfter: { settings: SHA_S, keybindings: null } }, ...change };
+}
+
+test('judgeImportNamedProfile: PASS names the profile directory and the files; the default profile unchanged (settings sha, keybindings absent)', () => {
+	const verdict = judgeImportNamedProfile(namedProfileObs());
+	assert.strictEqual(verdict.status, 'PASS', verdict.detail);
+	assert.ok(verdict.detail.includes('/e/import-profile/user-data/User/profiles/abc123'));
+	assert.ok(verdict.detail.includes('settings.json') && verdict.detail.includes('keybindings.json'));
+	assert.ok(verdict.detail.includes('settings.json.pre-import-20261008T080000Z') && verdict.detail.includes('keybindings.json.pre-import-20261008T080000Z'));
+	assert.ok(verdict.detail.includes(SHA_S) && verdict.detail.includes('keybindings.json (absent)'));
+});
+
+test('judgeImportNamedProfile: the default profile written -> [default_profile_written] naming the file and both digests', () => {
+	const settingsChanged = judgeImportNamedProfile(namedProfileObs({ state: { ...namedProfileObs().state, defaultAfter: { settings: 'c'.repeat(64), keybindings: null } } }));
+	assert.strictEqual(settingsChanged.status, 'FAIL');
+	assert.ok(settingsChanged.detail.includes(`[default_profile_written] the default profile's User/settings.json changed: sha256 ${SHA_S} before, ${'c'.repeat(64)} after`), settingsChanged.detail);
+	// A default keybindings.json that appeared where there was none is a write as well.
+	const created = judgeImportNamedProfile(namedProfileObs({ state: { ...namedProfileObs().state, defaultAfter: { settings: SHA_S, keybindings: SHA_K } } }));
+	assert.strictEqual(created.status, 'FAIL');
+	assert.ok(created.detail.includes(`[default_profile_written] the default profile's User/keybindings.json changed: sha256 absent before, ${SHA_K} after`), created.detail);
+	// The pre-fix behaviour: the default profile's files written and the named profile's left as planted.
+	const old = namedProfileObs();
+	old.state.dirs[0] = { ...old.state.dirs[0], settings: JSON.stringify(PLANT.settings), keybindings: JSON.stringify(PLANT.keybindings), backups: [] };
+	old.state.defaultAfter = { settings: 'd'.repeat(64), keybindings: SHA_K };
+	const tags = ['default_profile_written', 'profile_settings_missing', 'profile_backup_missing'].filter(tag => judgeImportNamedProfile(old).detail.includes(`[${tag}]`));
+	assert.deepStrictEqual(tags, ['default_profile_written', 'profile_settings_missing', 'profile_backup_missing']);
+});
+
+test('judgeImportNamedProfile: zero or two profile directories -> [profile_dir_count]; the files and backups are not judged then', () => {
+	const none = judgeImportNamedProfile(namedProfileObs({ planted: undefined, plantedDirs: [], state: { dirs: [], defaultAfter: { settings: SHA_S, keybindings: null } } }));
+	assert.strictEqual(none.status, 'FAIL');
+	assert.ok(none.detail.includes('[profile_dir_count] expected exactly one directory under User/profiles, the one planted into: found [] after the import (0)'), none.detail);
+	assert.ok(!none.detail.includes('[profile_settings_missing]') && !none.detail.includes('[profile_backup_missing]'));
+	const two = namedProfileObs();
+	two.state.dirs.push({ ...two.state.dirs[0], name: 'def456', path: '/e/import-profile/user-data/User/profiles/def456' });
+	const verdict = judgeImportNamedProfile(two);
+	assert.strictEqual(verdict.status, 'FAIL');
+	assert.ok(verdict.detail.includes('[profile_dir_count]') && verdict.detail.includes('found [abc123, def456] after the import (2)'), verdict.detail);
+	// One directory now, but the driver planted into a different one (or saw two before): not the profile it prepared.
+	const other = judgeImportNamedProfile(namedProfileObs({ plantedDirs: ['abc123', 'zzz'], planted: { ...PLANT, dir: 'zzz' } }));
+	assert.ok(other.detail.includes('[profile_dir_count]') && other.detail.includes('planted into zzz'), other.detail);
+});
+
+test('judgeImportNamedProfile: the imported values or the keybinding missing in the profile, or an absent or unparseable file -> [profile_settings_missing]', () => {
+	const mutate = change => {
+		const obs = namedProfileObs();
+		obs.state.dirs[0] = { ...obs.state.dirs[0], ...change };
+		return judgeImportNamedProfile(obs);
+	};
+	const old = mutate({ settings: JSON.stringify(PLANT.settings) });
+	assert.strictEqual(old.status, 'FAIL');
+	assert.ok(old.detail.includes('[profile_settings_missing] editor.fontSize is 11 in /e/import-profile/user-data/User/profiles/abc123/settings.json, expected 17'), old.detail);
+	assert.ok(old.detail.includes('files.trimTrailingWhitespace is undefined'), old.detail);
+	const lost = mutate({ settings: JSON.stringify(IMPORT_SETTINGS) });
+	assert.ok(lost.detail.includes('[profile_settings_missing] editor.tabSize is undefined'), lost.detail);
+	const noSettings = mutate({ settings: undefined });
+	assert.ok(noSettings.detail.includes('[profile_settings_missing]') && noSettings.detail.includes('settings.json is absent'), noSettings.detail);
+	const noKeybinding = mutate({ keybindings: JSON.stringify(PLANT.keybindings) });
+	assert.ok(noKeybinding.detail.includes(`[profile_settings_missing] ${IMPORT_KEYBINDING.key} -> ${IMPORT_KEYBINDING.command} is not in`), noKeybinding.detail);
+	const noKeybindings = mutate({ keybindings: undefined });
+	assert.ok(noKeybindings.detail.includes('keybindings.json is absent'), noKeybindings.detail);
+	const garbled = mutate({ settings: '{ not json' });
+	assert.ok(garbled.detail.includes('settings.json is not a JSON object'), garbled.detail);
+	assert.ok(![old, lost, noSettings, noKeybinding, noKeybindings, garbled].some(v => v.detail.includes('[default_profile_written]')));
+});
+
+test('judgeImportNamedProfile: a missing, doubled or wrong pre-import backup beside the profile\'s files -> [profile_backup_missing]', () => {
+	const mutate = backups => {
+		const obs = namedProfileObs();
+		obs.state.dirs[0] = { ...obs.state.dirs[0], backups };
+		return judgeImportNamedProfile(obs);
+	};
+	const [keybindingsBackup, settingsBackup] = namedProfileObs().state.dirs[0].backups;
+	const noSettings = mutate([keybindingsBackup]);
+	assert.strictEqual(noSettings.status, 'FAIL');
+	assert.ok(noSettings.detail.includes('[profile_backup_missing] expected exactly one settings.json.pre-import-* in /e/import-profile/user-data/User/profiles/abc123 holding the planted settings.json, found []'), noSettings.detail);
+	const noKeybindings = mutate([settingsBackup]);
+	assert.ok(noKeybindings.detail.includes('[profile_backup_missing] expected exactly one keybindings.json.pre-import-*'), noKeybindings.detail);
+	const none = mutate([]);
+	assert.strictEqual((none.detail.match(/\[profile_backup_missing\]/g) ?? []).length, 2);
+	const twice = mutate([keybindingsBackup, settingsBackup, { ...settingsBackup, name: 'settings.json.pre-import-20261008T080000Z-1' }]);
+	assert.ok(twice.detail.includes('found [settings.json.pre-import-20261008T080000Z, settings.json.pre-import-20261008T080000Z-1]'), twice.detail);
+	const wrong = mutate([keybindingsBackup, { ...settingsBackup, text: JSON.stringify({ 'editor.tabSize': 9 }) }]);
+	assert.ok(wrong.detail.includes('found [settings.json.pre-import-20261008T080000Z] with other content'), wrong.detail);
+});
+
+test('judgeImportNamedProfile: no observation, or no profile state, is a FAIL by name, never a pass', () => {
+	for (const obs of [undefined, {}, { planted: PLANT, defaultBefore: { settings: null, keybindings: null } }, { planted: PLANT, state: namedProfileObs().state }]) {
+		const verdict = judgeImportNamedProfile(obs);
+		assert.strictEqual(verdict.status, 'FAIL');
+		assert.ok(verdict.detail.startsWith('[profile_import_unreported]'), verdict.detail);
+	}
+});
+
+test('readNamedProfileState: reads the profile directories, their files and backups and the default profile\'s digests from a real tree', () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-features-profile-'));
+	try {
+		const user = path.join(root, 'User');
+		fs.mkdirSync(path.join(user, 'profiles', 'p1'), { recursive: true });
+		fs.mkdirSync(path.join(user, 'profiles', 'p2'));
+		fs.writeFileSync(path.join(user, 'profiles', 'stray-file'), 'x');
+		fs.writeFileSync(path.join(user, 'settings.json'), '{"a":1}');
+		fs.writeFileSync(path.join(user, 'profiles', 'p1', 'settings.json'), '{"b":2}');
+		fs.writeFileSync(path.join(user, 'profiles', 'p1', 'settings.json.pre-import-20261008T080000Z'), '{}');
+		fs.writeFileSync(path.join(user, 'profiles', 'p1', 'keybindings.json.pre-import-20261008T080000Z-1'), '[]');
+		const state = readNamedProfileState(root);
+		assert.deepStrictEqual(state.dirs.map(d => d.name), ['p1', 'p2']);
+		assert.strictEqual(state.dirs[0].settings, '{"b":2}');
+		assert.strictEqual(state.dirs[0].keybindings, undefined);
+		assert.deepStrictEqual(state.dirs[0].backups.map(b => b.name), ['keybindings.json.pre-import-20261008T080000Z-1', 'settings.json.pre-import-20261008T080000Z']);
+		assert.deepStrictEqual(state.dirs[1].files, []);
+		assert.deepStrictEqual(state.defaultAfter, { settings: crypto.createHash('sha256').update('{"a":1}').digest('hex'), keybindings: null });
+		assert.deepStrictEqual(readNamedProfileState(path.join(root, 'nowhere')), { dirs: [], defaultAfter: { settings: null, keybindings: null } });
+	} finally {
+		fs.rmSync(root, { recursive: true });
+	}
+});
+
+test('import-named-profile wiring: --profile only in the import-profile launch; the row sits after import in the network-off run only; the driver plants the literals lib.mjs judges', () => {
+	assert.deepStrictEqual(profileArgs('import-profile'), ['--profile', NAMED_PROFILE]);
+	for (const mode of ['all', 'pins', 'import', 'pack-trigger']) {
+		assert.deepStrictEqual(profileArgs(mode), [], mode);
+	}
+	assert.strictEqual(CHECK_IDS.indexOf('import-named-profile'), CHECK_IDS.indexOf('import') + 1);
+	assert.ok(checkIdsFor('off').includes('import-named-profile') && !checkIdsFor('on').includes('import-named-profile'));
+	const driver = fs.readFileSync(new URL('./driver/checks.cjs', import.meta.url), 'utf8');
+	assert.ok(driver.includes(`const IMPORT_SETTINGS = { 'editor.fontSize': 17, 'files.trimTrailingWhitespace': true };`));
+	assert.deepStrictEqual(IMPORT_SETTINGS, { 'editor.fontSize': 17, 'files.trimTrailingWhitespace': true });
+	assert.ok(driver.includes(`const IMPORT_KEYBINDING = { key: 'ctrl+alt+q', command: 'workbench.action.files.saveAll' };`));
+	assert.deepStrictEqual(IMPORT_KEYBINDING, { key: 'ctrl+alt+q', command: 'workbench.action.files.saveAll' });
+	assert.ok(driver.includes(`const PROFILE_PLANT_SETTINGS = { 'editor.tabSize': 3, 'editor.fontSize': 11 };`));
+	assert.ok(driver.includes(`const PROFILE_PLANT_KEYBINDINGS = [{ key: 'ctrl+alt+w', command: 'workbench.action.files.save' }];`));
+	assert.deepStrictEqual(PLANT.settings, { 'editor.tabSize': 3, 'editor.fontSize': 11 });
+	assert.deepStrictEqual(PLANT.keybindings, [{ key: 'ctrl+alt+w', command: 'workbench.action.files.save' }]);
+	const launcher = fs.readFileSync(new URL('./launcher.mjs', import.meta.url), 'utf8');
+	assert.ok(launcher.includes(`checks['import-named-profile'] = judgeNamedProfileLaunch(namedProfile, namedDir);`));
 });

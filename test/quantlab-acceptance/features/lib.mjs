@@ -9,8 +9,11 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-/** The five closing checks, in the plan's order, the extension-pack row, then the Quantbook MCP row (W-ORCH, 2026-10-05). */
-export const CHECK_IDS = ['backtest-bundled-engine', 'python-intelligence', 'notebook-cell', 'pinned-dependency-removed', 'import', 'extension-pack-quiet', 'quantbook-mcp-absent'];
+/**
+ * The five closing checks, in the plan's order, the import-in-a-named-profile row (QL-G-FEAT c1 M3), the extension-pack
+ * row, then the Quantbook MCP row (W-ORCH, 2026-10-05).
+ */
+export const CHECK_IDS = ['backtest-bundled-engine', 'python-intelligence', 'notebook-cell', 'pinned-dependency-removed', 'import', 'import-named-profile', 'extension-pack-quiet', 'quantbook-mcp-absent'];
 
 /** The rows a run judges: every one with the network off; with it on, only the extension-pack row. */
 export function checkIdsFor(network) {
@@ -42,12 +45,12 @@ export const PINNED_IDS = ['ms-python.python', 'detachhead.basedpyright', 'ms-to
 export const STATUSES = ['PASS', 'FAIL', 'NOT RUN'];
 
 /**
- * The driver's modes whose steps need a MODAL dialog (the import confirmation, the publisher-trust prompt of an
+ * The driver's modes whose steps need a MODAL dialog (the import confirmation, in the default and in a named profile, the publisher-trust prompt of an
  * install). The workbench refuses every dialog in a launch with --extensionTestsPath (dialogService.ts skipDialogs:
  * "refused to show dialog in tests"), so these modes run the driver as an extension under development, started by its
  * own activation; the other modes run it as the extension tests.
  */
-export const DIALOG_MODES = ['import', 'pack-trigger'];
+export const DIALOG_MODES = ['import', 'import-profile', 'pack-trigger'];
 
 /**
  * Asks the app to close (`send('Browser.close')`) and waits up to `limitMs` for `exit`. The app closes its debugging
@@ -213,6 +216,145 @@ export function judgePinnedDependency(main, control, removed) {
 		return { status: 'FAIL', detail: `the control copy without ${removed} named [${control.missing.join(', ')}] instead` };
 	}
 	return { status: 'PASS', detail: `app: all pins present; control without ${removed}: ${control.lines.join('; ')}` };
+}
+
+/**
+ * The import row's planted source (driver/checks.cjs declares the same literals; lib.test.mjs compares them): what the
+ * import must leave in the target settings.json and keybindings.json, in the default and in the named profile alike.
+ */
+export const IMPORT_SETTINGS = { 'editor.fontSize': 17, 'files.trimTrailingWhitespace': true };
+export const IMPORT_KEYBINDING = { key: 'ctrl+alt+q', command: 'workbench.action.files.saveAll' };
+
+/**
+ * The import-named-profile row (QL-G-FEAT c1 M3) launches in a profile of this name: `--profile <name>`. Read in this fork:
+ * src/vs/platform/environment/node/argv.ts:71,114 define `profile` (string; "If the profile does not exist, a new empty one is
+ * created"); src/vs/code/electron-main/app.ts:1315 reads it, :1322-1332 (no path argument) and :1359-1368 (path arguments, as here)
+ * pass it as `forceProfile`; an --extensionDevelopmentPath launch re-opens through open() with the same forceProfile
+ * (windowsMainService.ts:1425); resolveProfileForBrowserWindow (:1656-1658) finds the profile by name or calls
+ * createNamedProfile(name) with NO options, so no useDefaultFlags: toUserDataProfile (userDataProfile.ts:159-160) gives it its
+ * own `<userRoamingDataHome>/profiles/<id>/settings.json` and `keybindings.json` (profilesHome = User/profiles, :229), and
+ * createProfile makes the `<id>` folder (:332) -- empty until something writes. A fresh user-data dir therefore ends with
+ * exactly one directory under User/profiles. Not run against the packaged app from here.
+ */
+export const NAMED_PROFILE = 'ql-features-named-profile';
+
+/** The extra launch arguments of `mode`: `--profile <name>` for import-profile only. */
+export function profileArgs(mode) {
+	return mode === 'import-profile' ? ['--profile', NAMED_PROFILE] : [];
+}
+
+function sha256OrAbsent(file) {
+	return fs.existsSync(file) ? sha256File(file) : null;
+}
+
+/**
+ * What the named-profile import left on disk under `<userData>/User` (read after the app exited): every directory under
+ * profiles/ with its files, its settings.json and keybindings.json text and its pre-import backups; and the sha256 (null: absent)
+ * of the DEFAULT profile's User/settings.json and User/keybindings.json. Throws on an unreadable path; nothing is defaulted.
+ */
+export function readNamedProfileState(userData) {
+	const user = path.join(userData, 'User');
+	const root = path.join(user, 'profiles');
+	const names = fs.existsSync(root)
+		? fs.readdirSync(root, { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort()
+		: [];
+	const dirs = names.map(name => {
+		const dir = path.join(root, name);
+		const files = fs.readdirSync(dir).sort();
+		const text = file => files.includes(file) ? fs.readFileSync(path.join(dir, file), 'utf8') : undefined;
+		return {
+			name,
+			path: dir,
+			files,
+			settings: text('settings.json'),
+			keybindings: text('keybindings.json'),
+			backups: files.filter(file => /^(settings|keybindings)\.json\.pre-import-/.test(file)).map(file => ({ name: file, text: fs.readFileSync(path.join(dir, file), 'utf8') })),
+		};
+	});
+	return { dirs, defaultAfter: { settings: sha256OrAbsent(path.join(user, 'settings.json')), keybindings: sha256OrAbsent(path.join(user, 'keybindings.json')) } };
+}
+
+function parsedOrUndefined(text) {
+	if (text === undefined) {
+		return undefined;
+	}
+	try {
+		return JSON.parse(text);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The import-named-profile row's verdict. `obs` = { planted, plantedDirs, defaultBefore, state }: `planted` is what the driver wrote into
+ * the named profile before the import ({ dir, settings, keybindings }; undefined if it saw other than one profile directory, then
+ * `plantedDirs` names what it saw), `defaultBefore` the sha256 (null: absent) of the default profile's User/settings.json and
+ * keybindings.json taken before the import, `state` readNamedProfileState after the app exited. PASS only if
+ * (1) exactly one directory under User/profiles (the one planted into), (2) its settings.json holds the planted settings with the
+ * imported values over them and its keybindings.json the planted and the imported keybinding, (3) the default profile's two files
+ * are byte-identical to before (or still absent), (4) one settings.json.pre-import-* and one keybindings.json.pre-import-* sit beside
+ * them, each equal to what was planted. Every failure is a named tag; all are reported.
+ */
+export function judgeImportNamedProfile(obs) {
+	if (obs === undefined || obs.state === undefined || obs.defaultBefore === undefined) {
+		return { status: 'FAIL', detail: '[profile_import_unreported] the driver reported no planted/before observation or the profile state was not read' };
+	}
+	const { planted, plantedDirs, defaultBefore, state } = obs;
+	const failures = [];
+	const fail = (tag, message) => failures.push(`[${tag}] ${message}`);
+	const names = state.dirs.map(d => d.name);
+
+	const oneDir = state.dirs.length === 1 && planted !== undefined && planted.dir === state.dirs[0].name;
+	if (!oneDir) {
+		fail('profile_dir_count', `expected exactly one directory under User/profiles, the one planted into: found [${names.join(', ')}] after the import (${state.dirs.length}); the driver saw [${(plantedDirs ?? []).join(', ')}] before it${planted === undefined ? ' and planted nothing' : ` and planted into ${planted.dir}`}`);
+	}
+
+	for (const file of ['settings', 'keybindings']) {
+		if (defaultBefore[file] !== state.defaultAfter[file]) {
+			fail('default_profile_written', `the default profile's User/${file}.json changed: sha256 ${defaultBefore[file] ?? 'absent'} before, ${state.defaultAfter[file] ?? 'absent'} after`);
+		}
+	}
+
+	let where = `profile directories [${names.join(', ')}]`;
+	if (oneDir) {
+		const dir = state.dirs[0];
+		where = `profile directory ${dir.path}`;
+		const settings = parsedOrUndefined(dir.settings);
+		if (settings === undefined || settings === null || typeof settings !== 'object' || Array.isArray(settings)) {
+			fail('profile_settings_missing', `${path.join(dir.path, 'settings.json')} is ${settings === undefined ? 'absent' : 'not a JSON object'} (files: [${dir.files.join(', ')}])`);
+		} else {
+			for (const [key, value] of Object.entries({ ...planted.settings, ...IMPORT_SETTINGS })) {
+				if (JSON.stringify(settings[key]) !== JSON.stringify(value)) {
+					fail('profile_settings_missing', `${key} is ${JSON.stringify(settings[key])} in ${path.join(dir.path, 'settings.json')}, expected ${JSON.stringify(value)}`);
+				}
+			}
+		}
+		const keybindings = parsedOrUndefined(dir.keybindings);
+		if (!Array.isArray(keybindings)) {
+			fail('profile_settings_missing', `${path.join(dir.path, 'keybindings.json')} is ${keybindings === undefined ? 'absent' : 'not a JSON array'} (files: [${dir.files.join(', ')}])`);
+		} else {
+			for (const wanted of [...planted.keybindings, IMPORT_KEYBINDING]) {
+				if (!keybindings.some(k => k !== null && typeof k === 'object' && k.key === wanted.key && k.command === wanted.command)) {
+					fail('profile_settings_missing', `${wanted.key} -> ${wanted.command} is not in ${path.join(dir.path, 'keybindings.json')}`);
+				}
+			}
+		}
+		for (const [file, before] of [['settings.json', planted.settings], ['keybindings.json', planted.keybindings]]) {
+			const found = dir.backups.filter(b => b.name.startsWith(`${file}.pre-import-`));
+			if (found.length !== 1 || JSON.stringify(parsedOrUndefined(found[0].text)) !== JSON.stringify(before)) {
+				fail('profile_backup_missing', `expected exactly one ${file}.pre-import-* in ${dir.path} holding the planted ${file}, found [${found.map(b => b.name).join(', ')}]${found.length === 1 ? ' with other content' : ''}`);
+			}
+		}
+	}
+
+	if (failures.length > 0) {
+		return { status: 'FAIL', detail: `${failures.join('; ')} (${where}; default profile settings.json ${state.defaultAfter.settings ?? 'absent'}, keybindings.json ${state.defaultAfter.keybindings ?? 'absent'})` };
+	}
+	const dir = state.dirs[0];
+	return {
+		status: 'PASS',
+		detail: `${where}: settings.json (${Object.keys({ ...planted.settings, ...IMPORT_SETTINGS }).join(', ')}) and keybindings.json (${IMPORT_KEYBINDING.key}) hold the import; backups ${dir.backups.map(b => b.name).join(', ')}; the default profile's settings.json (${defaultBefore.settings ?? 'absent'}) and keybindings.json (${defaultBefore.keybindings ?? 'absent'}) are byte-identical`,
+	};
 }
 
 /**

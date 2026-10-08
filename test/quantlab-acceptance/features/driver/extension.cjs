@@ -7,7 +7,7 @@
 // launched without --extensionTestsPath, where the workbench refuses dialogs, so checks.cjs runs from this
 // activation instead; the launcher closes the app once the result is written. In the other modes the extension
 // tests run checks.cjs and this activation does nothing.
-const DIALOG_MODES = ['import', 'pack-trigger'];
+const DIALOG_MODES = ['import', 'import-profile', 'pack-trigger'];
 
 exports.activate = function () {
 	const mode = process.env.QL_FEATURES_MODE;
