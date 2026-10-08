@@ -6,7 +6,7 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
-import { getIgnoredSettings, merge, NeverSyncedSettingsError, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
+import { getIgnoredSettings, INeverSyncedPasses, merge, NeverSyncedSettingsError, removeNeverSyncedSettings, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
 import { assertNoNeverSynced, assertRawOccurrences, assertNoNeverSyncedProperty, assertOrdinaryKept, DEMO_EMAIL, DEMO_PASSWORD, IRawSettings, RawStyle, rawSettings, topLevelPropertyNames } from './rawNeverSyncedSettings.js';
 
 // QuantLab F-SYNC-STRIP-1 (M1): content built to leave the machine holds NO occurrence of a never-synced key and none of its
@@ -196,6 +196,61 @@ suite('SettingsMerge - never-synced settings written more than once (STRIP-1)', 
 				updateIgnoredSettingsForRemote(content, '{}', [...ignored, 'machine.a', 'machine.b'], formattingOptions),
 				updateIgnoredSettings(content, '{}', [...ignored, 'machine.a', 'machine.b'], formattingOptions)
 			);
+		}
+	});
+
+	// QuantLab F-SYNC-STRIP-2 (S1, B1): the removal makes a bounded number of full-document passes whatever the duplicate count.
+	// The bound is frozen here, before any run: one traversal collects the ranges, one traversal checks the result, one parse
+	// reads the object (STRIP-1 repeated all of these once per duplicate, so its cost grew with the square of the count).
+	const MAX_FULL_DOCUMENT_PASSES = 3;
+
+	test('the removal makes at most 3 full-document passes, however many duplicates the content holds', () => {
+		const counts: number[] = [];
+		for (const occurrences of [1, 4, 100, 2000]) {
+			const fixture = rawSettings([DEMO_EMAIL, DEMO_PASSWORD], occurrences, 'plain', 'SENTINEL', 'local');
+			const passes: INeverSyncedPasses = { fullDocumentPasses: 0 };
+			const actual = removeNeverSyncedSettings(fixture.text, formattingOptions, passes);
+			// every sentinel value starts with the fixture tag: one scan for all of them
+			assertOutbound(actual, ['SENTINEL-'], fixture.ordinary, `${occurrences} duplicates of each key`);
+			assert.ok(passes.fullDocumentPasses <= MAX_FULL_DOCUMENT_PASSES, `${occurrences} duplicates of each key took ${passes.fullDocumentPasses} full-document passes`);
+			counts.push(passes.fullDocumentPasses);
+		}
+		assert.deepStrictEqual(counts, [counts[0], counts[0], counts[0], counts[0]], 'the pass count must not depend on the duplicate count');
+	});
+
+	test('content that holds no key is read in at most 3 passes and comes back unchanged', () => {
+		const passes: INeverSyncedPasses = { fullDocumentPasses: 0 };
+		const content = '{\n\t// a comment\n\t"local.y": 2,\n}';
+		assert.strictEqual(removeNeverSyncedSettings(content, formattingOptions, passes), content);
+		assert.ok(passes.fullDocumentPasses >= 1 && passes.fullDocumentPasses <= MAX_FULL_DOCUMENT_PASSES, String(passes.fullDocumentPasses));
+	});
+
+	test('2,000 duplicates of each key: the outbound content is clean through every outbound entry point', () => {
+		const fixture = rawSettings([DEMO_EMAIL, DEMO_PASSWORD], 2000, 'plain', 'SENTINEL', 'local');
+		assertOutbound(updateIgnoredSettingsForRemote(fixture.text, '{}', ignored, formattingOptions), ['SENTINEL-'], fixture.ordinary, 'updateIgnoredSettingsForRemote');
+		assertOutbound(merge(fixture.text, cleanRemote, cleanRemote, ignored, [], formattingOptions).remoteContent, ['SENTINEL-'], fixture.ordinary, 'merge');
+	});
+
+	// The shape of the batch: exact strings, one per kind of run. A run takes the comma that joined it to the kept property
+	// before it; a run that opens the object takes what leads up to the next kept property (and is formatted as setProperty
+	// formats it); when nothing is kept, a trailing comma goes with the last property.
+	test('the batch of removals leaves the kept properties and their commas as setProperty does', () => {
+		const email = '"qic.demo.email": "x"';
+		const password = '"qic.demo.password": "y"';
+		const cases: { name: string; input: string; expected: string }[] = [
+			{ name: 'a key between kept properties', input: `{\n\t"a": 1,\n\t${email},\n\t"b": 2\n}`, expected: '{\n\t"a": 1,\n\t"b": 2\n}' },
+			{ name: 'the last key after a kept property', input: `{\n\t"a": 1,\n\t${email}\n}`, expected: '{\n\t"a": 1\n}' },
+			{ name: 'the last key, a trailing comma follows', input: `{\n\t"a": 1,\n\t${email},\n}`, expected: '{\n\t"a": 1,\n}' },
+			{ name: 'the first key', input: `{\n\t${email},\n\t"a": 1\n}`, expected: '{\n\t"a": 1\n}' },
+			{ name: 'two adjacent keys in the middle', input: `{\n\t"a": 1,\n\t${email},\n\t${password},\n\t"b": 2\n}`, expected: '{\n\t"a": 1,\n\t"b": 2\n}' },
+			{ name: 'keys at the start, in the middle and at the end', input: `{\n\t${email},\n\t"a": 1,\n\t${password},\n\t${email},\n\t"b": 2,\n\t${password}\n}`, expected: '{\n\t"a": 1,\n\t"b": 2\n}' },
+			{ name: 'the only property, no comma', input: `{\n\t${email}\n}`, expected: '{\n}' },
+			{ name: 'the only property, a trailing comma follows', input: `{\n\t${email},\n}`, expected: '{\n}' },
+			{ name: 'only keys, a trailing comma follows', input: `{\n\t${email},\n\t${password},\n\t${email},\n}`, expected: '{\n}' },
+			{ name: 'compact, the only property', input: `{${email}}`, expected: '{}' },
+		];
+		for (const { name, input, expected } of cases) {
+			assert.strictEqual(removeNeverSyncedSettings(input, formattingOptions), expected, name);
 		}
 	});
 

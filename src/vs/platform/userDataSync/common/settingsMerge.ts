@@ -5,7 +5,7 @@
 
 import { distinct } from '../../../base/common/arrays.js';
 import { IStringDictionary } from '../../../base/common/collections.js';
-import { JSONVisitor, ParseError, SyntaxKind, createScanner, findNodeAtLocation, parse, parseTree, visit } from '../../../base/common/json.js';
+import { JSONVisitor, ParseError, parse, visit } from '../../../base/common/json.js';
 import { applyEdits, setProperty, withFormatting } from '../../../base/common/jsonEdit.js';
 import { Edit, FormattingOptions, getEOL } from '../../../base/common/jsonFormatter.js';
 import * as objects from '../../../base/common/objects.js';
@@ -128,73 +128,167 @@ function assertParses(content: string): void {
 }
 
 /**
- * The never-synced keys among the properties of the root object, one entry per occurrence, found by the real tokenizer.
- * The tokenizer recovers from syntax errors, so this also reads content the ordinary ignored-settings removal left with
- * errors (all settings removed from `{ "a": 1, }` leaves `{ , }`, which upstream uploads as it is).
+ * Counts the full-document passes (a tokenizer or parser traversal of the whole content) that {@link removeNeverSyncedSettings}
+ * makes. The function takes it as an argument, so that a test reads the count off the real function, whatever the content.
  */
-function neverSyncedPropertyNames(content: string): string[] {
-	const found: string[] = [];
+export interface INeverSyncedPasses {
+	fullDocumentPasses: number;
+}
+
+/** A property of the root object: where its key starts, where its value ends, and the offset of the comma that follows it (if any). */
+interface IRootProperty {
+	readonly name: string;
+	readonly start: number;
+	end: number;
+	comma: number | undefined;
+}
+
+interface IRootScan {
+	/** Every property of the root object, in text order, duplicates included. */
+	readonly properties: IRootProperty[];
+	/** The offset of the root object's opening brace, when the root value is an object. */
+	readonly rootOffset: number | undefined;
+	readonly errorCount: number;
+}
+
+/**
+ * ONE tokenizer traversal of the whole content: the properties of the root object with their ranges, and the number of syntax
+ * errors. The tokenizer recovers from syntax errors, so this also reads content the ordinary ignored-settings removal left
+ * with errors (all settings removed from `{ "a": 1, }` leaves `{ , }`, which upstream uploads as it is).
+ */
+function scanRoot(content: string, passes: INeverSyncedPasses): IRootScan {
+	passes.fullDocumentPasses++;
+	const properties: IRootProperty[] = [];
+	let rootOffset: number | undefined;
 	let depth = 0;
+	let errorCount = 0;
+	let current: IRootProperty | undefined;
+	const inRoot = () => rootOffset !== undefined && depth === 1;
 	visit(content, {
-		onObjectBegin: () => { depth++; },
-		onObjectEnd: () => { depth--; },
-		onArrayBegin: () => { depth++; },
-		onArrayEnd: () => { depth--; },
-		onObjectProperty: (name: string) => {
-			if (depth === 1 && NEVER_SYNCED_SETTINGS.includes(name)) {
-				found.push(name);
+		onObjectBegin: (offset: number) => {
+			if (depth === 0) {
+				rootOffset = offset;
 			}
-		}
+			depth++;
+		},
+		onObjectEnd: (offset: number, length: number) => {
+			depth--;
+			if (inRoot() && current) {
+				current.end = offset + length;
+			}
+		},
+		onArrayBegin: () => { depth++; },
+		onArrayEnd: (offset: number, length: number) => {
+			depth--;
+			if (inRoot() && current) {
+				current.end = offset + length;
+			}
+		},
+		onObjectProperty: (name: string, offset: number, length: number) => {
+			if (inRoot()) {
+				current = { name, start: offset, end: offset + length, comma: undefined };
+				properties.push(current);
+			}
+		},
+		onLiteralValue: (_value: unknown, offset: number, length: number) => {
+			if (inRoot() && current) {
+				current.end = offset + length;
+			}
+		},
+		onSeparator: (character: string, offset: number) => {
+			if (character === ',' && inRoot() && current && current.comma === undefined) {
+				current.comma = offset;
+			}
+		},
+		onError: () => { errorCount++; }
 	}, NEVER_SYNCED_PARSE_OPTIONS);
-	return found;
+	return { properties, rootOffset, errorCount };
 }
 
 /**
- * Removes the first top-level property `key`, as `setProperty(…, undefined)` does, except that when it is the only
- * property of the root object and a comma follows it (`{ "k": 1, }`) the comma goes with it: `setProperty` would leave
- * `{ , }`, which does not parse. Content that does not hold `key` is returned as it is.
+ * The removal of every never-synced property of a scan, as ONE batch of edits that do not overlap. A run of adjacent
+ * never-synced properties is one edit, comma-aware the way `setProperty(…, undefined)` is: after a kept property it takes
+ * the text from that property's end to the run's last end, so the comma that followed the run stays as the separator (or as
+ * the trailing comma the content already had); a run that opens the object takes the text from the opening brace to the next
+ * kept property, or, when no property is kept, to the last property's comma (`{ "k": 1, }` becomes `{}`, where
+ * `setProperty` would leave `{ , }`, which does not parse). The edit that opens the object is returned apart, for it
+ * is formatted after the batch is applied (as `setProperty` formats it); it lies before every edit of the batch.
  */
-function removeNeverSyncedProperty(content: string, key: string, formattingOptions: FormattingOptions): string {
-	const root = parseTree(content);
-	const parent = root ? findNodeAtLocation(root, []) : undefined;
-	if (parent?.type === 'object' && parent.children?.length === 1 && parent.children[0].children?.[0].value === key) {
-		const property = parent.children[0];
-		const scanner = createScanner(content, true);
-		scanner.setPosition(property.offset + property.length);
-		if (scanner.scan() === SyntaxKind.CommaToken) {
-			const begin = parent.offset + 1;
-			const edit = withFormatting(content, { offset: begin, length: scanner.getTokenOffset() + 1 - begin, content: '' }, formattingOptions)[0];
-			return content.substring(0, edit.offset) + edit.content + content.substring(edit.offset + edit.length);
+function planRemovals(scan: IRootScan): { batch: Edit[]; leading: Edit | undefined } {
+	const { properties, rootOffset } = scan;
+	const batch: Edit[] = [];
+	let leading: Edit | undefined;
+	const held = (index: number) => NEVER_SYNCED_SETTINGS.includes(properties[index].name);
+	for (let first = 0; first < properties.length; first++) {
+		if (!held(first)) {
+			continue;
 		}
+		let last = first;
+		while (last + 1 < properties.length && held(last + 1)) {
+			last++;
+		}
+		if (first > 0) {
+			const begin = properties[first - 1].end;
+			batch.push({ offset: begin, length: properties[last].end - begin, content: '' });
+		} else {
+			if (rootOffset === undefined) {
+				throw new NeverSyncedSettingsError('A never-synced setting was found in settings content that has no root object');
+			}
+			const begin = rootOffset + 1;
+			const next = properties[last + 1];
+			const lastComma = properties[last].comma;
+			const end = next ? next.start : (lastComma !== undefined ? lastComma + 1 : properties[last].end);
+			leading = { offset: begin, length: end - begin, content: '' };
+		}
+		first = last;
 	}
-	return contentUtil.edit(content, [key], undefined, formattingOptions);
+	return { batch, leading };
+}
+
+/** Applies edits that are sorted by offset and do not overlap, in one linear pass; an overlap is an error, never an adjustment. */
+function applySortedEdits(content: string, edits: Edit[]): string {
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const edit of edits) {
+		if (edit.offset < cursor) {
+			throw new NeverSyncedSettingsError('The removals of the never-synced settings overlap');
+		}
+		parts.push(content.substring(cursor, edit.offset), edit.content);
+		cursor = edit.offset + edit.length;
+	}
+	parts.push(content.substring(cursor));
+	return parts.join('');
 }
 
 /**
- * Removes EVERY top-level occurrence of each {@link NEVER_SYNCED_SETTINGS} key, however often the raw text writes it: one
- * removal takes the first occurrence of a key, so it repeats until the tokenizer finds none. The result is then checked a
- * second way, on the parsed object. Content without the keys comes back byte for byte as it came in, so what upstream
- * uploads for such content is unchanged, syntax errors its own ignored-settings removal left included. A throw
- * ({@link NeverSyncedSettingsError}) means a key is still there, or this removal left more syntax errors than the content
- * had: content that leaves this machine is never passed on unchecked.
+ * Removes EVERY top-level occurrence of each {@link NEVER_SYNCED_SETTINGS} key, however often the raw text writes it, in a
+ * bounded number of full-document passes whatever the duplicate count: one traversal collects the ranges of all of them, one
+ * batch of edits removes them, one traversal checks the result, and the parsed object is read once more (at most three
+ * passes, counted in `passes`). Content that holds no key comes back as it came in. A throw ({@link NeverSyncedSettingsError})
+ * means a key is still there, or the removal left the content with more syntax errors than it had: content that leaves
+ * this machine is never passed on unchecked. The last check, on the parsed object, is a second property-presence check, not an
+ * independent parser (`parse` runs on the same tokenizer).
  */
-function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions): string {
-	const errorsBefore = parseErrorsOf(content).length;
-	let held = neverSyncedPropertyNames(content).length;
-	while (held > 0) {
-		for (const key of NEVER_SYNCED_SETTINGS) {
-			content = removeNeverSyncedProperty(content, key, formattingOptions);
+export function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions, passes: INeverSyncedPasses = { fullDocumentPasses: 0 }): string {
+	const before = scanRoot(content, passes);
+	if (before.properties.some(property => NEVER_SYNCED_SETTINGS.includes(property.name))) {
+		const { batch, leading } = planRemovals(before);
+		content = applySortedEdits(content, batch);
+		if (leading) {
+			const formatted = withFormatting(content, leading, formattingOptions)[0];
+			content = content.substring(0, formatted.offset) + formatted.content + content.substring(formatted.offset + formatted.length);
 		}
-		const remaining = neverSyncedPropertyNames(content);
-		if (remaining.length >= held) {
+		const after = scanRoot(content, passes);
+		const remaining = after.properties.filter(property => NEVER_SYNCED_SETTINGS.includes(property.name)).map(property => property.name);
+		if (remaining.length) {
 			throw new NeverSyncedSettingsError(`A never-synced setting could not be removed from the settings content: ${distinct(remaining).join(', ')}`);
 		}
-		held = remaining.length;
+		if (after.errorCount > before.errorCount) {
+			throw new NeverSyncedSettingsError('Removing the never-synced settings left the settings content with syntax errors it did not have');
+		}
 	}
 
-	if (parseErrorsOf(content).length > errorsBefore) {
-		throw new NeverSyncedSettingsError('Removing the never-synced settings left the settings content with syntax errors it did not have');
-	}
+	passes.fullDocumentPasses++;
 	const parsed = parse(content, [], NEVER_SYNCED_PARSE_OPTIONS);
 	if (parsed !== null && typeof parsed === 'object') {
 		const left = NEVER_SYNCED_SETTINGS.filter(key => Object.prototype.hasOwnProperty.call(parsed, key));
@@ -260,10 +354,8 @@ export function updateIgnoredSettingsForRemote(targetContent: string, sourceCont
 	// ignored-settings removal then leaves behind is not judged here, only that no never-synced key is left.
 	assertParses(targetContent);
 	// The keys go first, whole: updateIgnoredSettings would remove one occurrence of each and, from an object whose only
-	// setting is a key followed by a comma, leave `{ , }`. Content that holds no key is not touched by this.
-	if (neverSyncedPropertyNames(targetContent).length) {
-		targetContent = removeNeverSyncedSettings(targetContent, formattingOptions);
-	}
+	// setting is a key followed by a comma, leave `{ , }`. Content that holds no key comes back from this as it is.
+	targetContent = removeNeverSyncedSettings(targetContent, formattingOptions);
 	return removeNeverSyncedSettings(updateIgnoredSettings(targetContent, sourceContent, ignoredSettings, formattingOptions), formattingOptions);
 }
 
