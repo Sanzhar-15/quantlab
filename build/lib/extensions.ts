@@ -25,6 +25,7 @@ import { getProductionDependencies } from './dependencies.ts';
 import { type IExtensionDefinition, getExtensionStream } from './builtInExtensions.ts';
 import { getVersion } from './getVersion.ts';
 import { fetchUrls, fetchGithub } from './fetch.ts';
+import { gateQuantlabPackageJsonStream, quantbookAuthorised } from './quantbookManifest.ts';
 import vzip from 'gulp-vinyl-zip';
 
 import { createRequire } from 'module';
@@ -448,8 +449,13 @@ function doPackageLocalExtensionsStream(forWeb: boolean, disableMangle: boolean,
 	const localExtensionsStream = minifyExtensionResources(
 		es.merge(
 			...localExtensionsDescriptions.map(extension => {
-				return fromLocal(extension.path, forWeb, disableMangle)
-					.pipe(rename(p => p.dirname = `extensions/${extension.name}/${p.dirname}`));
+				const local = fromLocal(extension.path, forWeb, disableMangle);
+				// The Quantbook notebook type ships only where product.json authorises Quantbook (quantbookManifest.ts);
+				// gated before the rename, while the manifest still sits at its source path.
+				const gated = extension.name === 'quantlab'
+					? gateQuantlabPackageJsonStream(local, quantbookAuthorised(productJson))
+					: local;
+				return gated.pipe(rename(p => p.dirname = `extensions/${extension.name}/${p.dirname}`));
 			})
 		)
 	);
