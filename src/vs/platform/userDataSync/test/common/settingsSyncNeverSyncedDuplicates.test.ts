@@ -6,6 +6,7 @@
 import assert from 'assert';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { Event } from '../../../../base/common/event.js';
 import { IRequestContext, IRequestOptions } from '../../../../base/parts/request/common/request.js';
 import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -13,7 +14,7 @@ import { IConfigurationService } from '../../../configuration/common/configurati
 import { IFileService } from '../../../files/common/files.js';
 import { IUserDataProfilesService } from '../../../userDataProfile/common/userDataProfile.js';
 import { parseSettingsSyncContent, SettingsSynchroniser } from '../../common/settingsSync.js';
-import { ISyncData, IUserDataSyncStoreService, SyncResource } from '../../common/userDataSync.js';
+import { ISyncData, IUserDataSyncStoreService, SyncResource, UserDataSyncError, UserDataSyncErrorCode } from '../../common/userDataSync.js';
 import { assertNoNeverSynced, assertNoNeverSyncedProperty, assertOrdinaryKept, DEMO_EMAIL, DEMO_PASSWORD, IRawSettings, RawStyle, rawSettings } from './rawNeverSyncedSettings.js';
 import { UserDataSyncClient, UserDataSyncTestServer } from './userDataSyncClient.js';
 
@@ -158,20 +159,22 @@ suite('SettingsSync - never-synced settings written more than once (STRIP-1)', (
 				assert.strictEqual(await readLocal(), fixture.text, 'the local file keeps its text');
 			}));
 
+			// The merge compares the ordinary settings of both sides in order, and treats any difference as a conflict a user has to
+			// resolve, so a sync() that merges uploads nothing (it waits in HasConflicts). To merge without conflict the remote
+			// holds the same ordinary settings as the local file, in the same order, and differs by the keys it holds.
 			test(`merge with a remote that holds the keys too: ${name}`, () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 				const fixture = local();
-				const other = remote();
+				const other = rawSettings(keys, occurrences, style, 'REMOTE-SENTINEL', 'local');
+				assert.deepStrictEqual(other.ordinary, fixture.ordinary);
 				await seedRemote(other.text);
 				await writeLocal(fixture.text);
 
 				await testObject.sync(await client.getLatestRef(SyncResource.Settings));
 
-				await assertEverythingSentIsClean([...fixture.sentinels, ...other.sentinels], { ...fixture.ordinary, ...other.ordinary });
+				await assertEverythingSentIsClean([...fixture.sentinels, ...other.sentinels], fixture.ordinary);
 				// the local file keeps every value it had and never takes one of the remote's
 				const written = await readLocal();
-				for (const sentinel of fixture.sentinels) {
-					assert.ok(written.includes(sentinel), `the local file lost ${sentinel}`);
-				}
+				assert.strictEqual(written, fixture.text, 'the local file keeps its text');
 				for (const sentinel of other.sentinels) {
 					assert.ok(!written.includes(sentinel), `the local file took the remote's ${sentinel}`);
 				}
@@ -192,4 +195,20 @@ suite('SettingsSync - never-synced settings written more than once (STRIP-1)', (
 			assert.ok(written.includes(fixture.sentinels[fixture.sentinels.length - 1]), 'the local file lost its last value');
 		}));
 	}
+
+	// merge() now throws on content that does not parse; a local file being typed must still announce a local change (and the
+	// sync then reports LocalInvalidContent), never end in a rejected local-change check.
+	test('a local file that does not parse is a local change, and the sync reports it as invalid content', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		const fixture = rawSettings([DEMO_EMAIL, DEMO_PASSWORD], 4, 'plain', 'SENTINEL', 'local');
+		await writeLocal(fixture.text);
+		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
+		server.forgetPosts();
+
+		const changed = Event.toPromise(testObject.onDidChangeLocal);
+		await writeLocal(`{\n\t"files.autoSave": "off",\n\t"${DEMO_PASSWORD}": "SENTINEL-TYPING`);
+		await changed;
+
+		await assert.rejects(testObject.sync(await client.getLatestRef(SyncResource.Settings)), (error: unknown) => error instanceof UserDataSyncError && error.code === UserDataSyncErrorCode.LocalInvalidContent);
+		assert.deepStrictEqual(server.posts.filter(post => post.url.endsWith('/resource/settings')), [], 'nothing is uploaded from a file that does not parse');
+	}));
 });

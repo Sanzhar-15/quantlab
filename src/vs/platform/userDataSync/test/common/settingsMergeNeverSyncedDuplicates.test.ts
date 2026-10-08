@@ -6,8 +6,8 @@
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
-import { getIgnoredSettings, merge, NeverSyncedSettingsError, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
-import { assertNoNeverSynced, assertRawOccurrences, assertNoNeverSyncedProperty, assertOrdinaryKept, DEMO_EMAIL, DEMO_PASSWORD, IRawSettings, RawStyle, rawSettings } from './rawNeverSyncedSettings.js';
+import { getIgnoredSettings, merge, NeverSyncedSettingsError, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
+import { assertNoNeverSynced, assertRawOccurrences, assertNoNeverSyncedProperty, assertOrdinaryKept, DEMO_EMAIL, DEMO_PASSWORD, IRawSettings, RawStyle, rawSettings, topLevelPropertyNames } from './rawNeverSyncedSettings.js';
 
 // QuantLab F-SYNC-STRIP-1 (M1): content built to leave the machine holds NO occurrence of a never-synced key and none of its
 // values, however many times the raw JSONC writes the key. The old strip removed one occurrence per key (setProperty removes
@@ -167,11 +167,41 @@ suite('SettingsMerge - never-synced settings written more than once (STRIP-1)', 
 		);
 	});
 
-	test('a merge whose remote content does not parse is refused where it would build outbound content', () => {
-		const brokenRemote = '{ "remote.x": 1 "qic.demo.email": "SENTINEL-broken" }';
+	test('a merge whose local content does not parse is refused (the sync validates it first)', () => {
 		assert.throws(
-			() => merge(cleanLocal, brokenRemote, cleanRemote, ignored, [], formattingOptions),
-			(error: unknown) => error instanceof NeverSyncedSettingsError
+			() => merge('{ "local.y": 1 "qic.demo.email": "SENTINEL-broken" }', cleanRemote, cleanRemote, ignored, [], formattingOptions),
+			(error: unknown) => error instanceof NeverSyncedSettingsError && !error.message.includes('SENTINEL-broken')
 		);
+	});
+
+	// A remote that does not parse is not refused: the merge reads it as the tolerant parser does, every occurrence of the keys
+	// is removed from what is uploaded, and the result is checked. (Here the removal also repairs the missing comma.)
+	test('a remote that does not parse and holds a key is uploaded without it', () => {
+		const brokenRemote = '{ "remote.x": 1 "qic.demo.email": "SENTINEL-broken" }';
+		const result = merge('{}', brokenRemote, null, ignored, [], formattingOptions);
+		assertOutbound(result.remoteContent, ['SENTINEL-broken'], { 'remote.x': 1 }, 'broken remote');
+	});
+
+	// What upstream uploads for content without a never-synced key is not changed, syntax errors included: removing every
+	// ordinary setting from `{ "a": 1, }` leaves `{ , }` and upstream uploads it.
+	test('content without the keys comes back byte for byte as the ordinary ignored settings alone build it', () => {
+		const contents = [
+			'{\n\t// Machine\n\t"machine.a": 1,\n\t"machine.b": 2,\n}',
+			'{\n\t"machine.a": 1,\n}',
+			'{\n\t"local.y": 2,\n\t"machine.a": 1\n}',
+			'{}',
+		];
+		for (const content of contents) {
+			assert.strictEqual(
+				updateIgnoredSettingsForRemote(content, '{}', [...ignored, 'machine.a', 'machine.b'], formattingOptions),
+				updateIgnoredSettings(content, '{}', [...ignored, 'machine.a', 'machine.b'], formattingOptions)
+			);
+		}
+	});
+
+	test('the only setting is a never-synced key and a comma follows it: the result parses', () => {
+		const actual = updateIgnoredSettingsForRemote('{\n\t"qic.demo.password": "SENTINEL-0",\n}', '{}', ignored, formattingOptions);
+		assert.deepStrictEqual(topLevelPropertyNames(actual), []);
+		assert.ok(!actual.includes('SENTINEL-0'));
 	});
 });
