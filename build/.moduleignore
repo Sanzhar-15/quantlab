@@ -20,13 +20,9 @@ fsevents/test/**
 @vscode/spdlog/*.yml
 !@vscode/spdlog/build/Release/*.node
 
-@vscode/deviceid/binding.gyp
-@vscode/deviceid/build/**
-@vscode/deviceid/deps/**
-@vscode/deviceid/src/**
-@vscode/deviceid/test/**
-@vscode/deviceid/*.yml
-!@vscode/deviceid/build/Release/*.node
+# Quantlab (F-STRIP-DEVID-1): the app never loads this package (its developer device id is its own), and its
+# shared Microsoft id file must stay unreachable, so the packaged app ships none of its files.
+@vscode/deviceid/**
 
 
 @vscode/sqlite3/binding.gyp
