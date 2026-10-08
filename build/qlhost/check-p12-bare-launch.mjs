@@ -10,7 +10,9 @@
 // gate.ts and workbenchHost.ts are the real sources (p12-host-fixture.mjs transpiles them) driven with fakes.
 // Run from the fork root: `node build/qlhost/check-p12-bare-launch.mjs src/vs/code/electron-main/qlHost`; rc 0 = GREEN.
 // Negative: 3974929ed9e's gate.ts, or only `return whenIdle ? whenIdle() : this.firstUse(cause, run);` put back to
-// `return this.firstUse(cause, run);` -> rows 1, 2, 3 RED (rows 4-6, the controls, stay GREEN).
+// `return this.firstUse(cause, run);` -> rows 1, 2, 3 RED (rows 4-6, the controls, stay GREEN). Review c1 M1 (rows 7, 8): 239f1cdc7f9's
+// gate.ts (a bare launch awaits the first use in flight before it is looked at), or only the `whenIdle && this.state !== 'open'`
+// early return of `use` removed -> rows 7, 8 RED, every other row GREEN.
 import { loadHostModules, flush } from './p12-host-fixture.mjs';
 
 const dir = process.argv[2];
@@ -108,10 +110,71 @@ const bare = { context: OpenContext.DESKTOP, cli: { _: [] }, forceEmpty: true };
 
 {
 	// With a workbench open the gate keeps today's behaviour: a bare request is the stock open (nothing is short-circuited).
+	// This is a DIRECT gate call, not a second-instance launch: the fixture's stock open makes a window per call, so the gate refuses
+	// the extra one. The real path (stock launchMainService finds the existing CodeWindow and calls openExistingWindow instead of
+	// open, on the macOS default) is proven by the package row (A7 with a workbench already open), not here.
 	const { rig, result, innerOpens } = await send(bare, { before: async setup => { await setup.gate.open({ context: OpenContext.DESKTOP, cli: { _: ['/work/folder'] } }); } });
-	row('6 control: with a workbench already open a bare request reaches the stock open as before (it asked for a second window: refused, not brought forward)',
+	row('6 control (a direct gate call, the fixture\'s window-per-open model): with a workbench already open a bare request is not short-circuited: it reaches the stock open as before (the fixture\'s open made a window, the gate refused it; not brought forward)',
 		innerOpens === 1 && broughtLines(rig).length === 0 && result.error !== undefined && /cannot be shown \(the host holds ONE workbench window\)/.test(result.error.message),
 		`stock opens ${innerOpens}, brought-forward lines ${broughtLines(rig).length}, error ${result.error?.message ?? 'none'}`);
+}
+
+// Review c1 M1: a bare launch while a first use is in flight (state `opening`). The race is forced, not approximated: the first use's
+// stock open is a promise this check holds; the bare launch is issued while it is still pending and must have RESOLVED, with the host
+// window surfaced, BEFORE the check releases it. Then the first use is released (`outcome` succeeds or throws): no second stock open
+// happens in either case, and the bare launch neither inherits the failure nor reaches the stock open.
+async function bareDuringFirstUse(outcome) {
+	const rig = makeRig();
+	const stock = rig.gate.inner.open.bind(rig.gate.inner);
+	let release;
+	const held = new Promise(resolve => { release = resolve; });
+	let stockCalls = 0;
+	rig.gate.inner.open = async config => {
+		stockCalls += 1;
+		if (stockCalls === 1) {
+			await held;
+			if (outcome === 'failure') {
+				throw new Error('first use failed');
+			}
+		}
+
+		return stock(config);
+	};
+
+	let firstDone = false;
+	const first = rig.gate.open({ context: OpenContext.DESKTOP, cli: { _: ['/work/folder'] } }).then(value => ({ value }), error => ({ error })).finally(() => { firstDone = true; });
+	await flush();
+	const pending = { state: rig.gate.workbenchState, stockCalls, firstDone };
+
+	let bareDone = false;
+	const second = rig.gate.open(bare).then(value => ({ value }), error => ({ error })).finally(() => { bareDone = true; });
+	await flush();
+	const before = { bareDone, bareState: rig.gate.workbenchState, stockCalls, firstDone, shows: rig.hostWindow.shows };
+	release();
+	const firstResult = await first;
+	const bareResult = await second;
+	await flush();
+
+	const raced = pending.state === 'opening' && pending.stockCalls === 1 && !pending.firstDone;
+	const beforeOk = before.bareDone && before.bareState === 'opening' && before.stockCalls === 1 && !before.firstDone && before.shows === 1;
+	const bareOk = !bareResult.error && Array.isArray(bareResult.value) && bareResult.value.length === 0;
+	const afterOk = stockCalls === 1 && rig.hostWindow.shows === 1 && broughtLines(rig).length === 1
+		&& (outcome === 'failure'
+			? firstResult.error?.message === 'first use failed' && rig.gate.workbenchState === 'idle'
+			: !firstResult.error && rig.gate.workbenchState === 'open');
+	const observed = `first use pending ${JSON.stringify(pending)}; BEFORE release: ${JSON.stringify(before)}; bare ${bareOk ? 'resolved []' : `error ${bareResult.error?.message ?? 'none'}`}; AFTER release: first ${firstResult.error?.message ?? 'resolved'}, stock opens ${stockCalls}, state ${rig.gate.workbenchState}, host window shows ${rig.hostWindow.shows}, brought-forward lines ${broughtLines(rig).length}`;
+
+	return { ok: raced && beforeOk && bareOk && afterOk, observed };
+}
+
+{
+	const { ok, observed } = await bareDuringFirstUse('success');
+	row('7 a bare launch issued while a first use is still pending resolves and surfaces the host window BEFORE that first use is released; the first use then succeeds and there is no second stock open', ok, observed);
+}
+
+{
+	const { ok, observed } = await bareDuringFirstUse('failure');
+	row('8 same race, the first use then FAILS: the bare launch had already resolved (it does not inherit the failure), no second stock open, the gate is idle again', ok, observed);
 }
 
 console.log(rows.join('\n'));

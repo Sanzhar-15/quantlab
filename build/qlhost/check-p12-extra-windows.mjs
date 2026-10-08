@@ -6,11 +6,16 @@
 // HOST check (QuantLab, P12 cure P2). A first use that succeeds but whose request also opened windows the host cannot show (a
 // restored session of several windows) is told apart by TYPE (`QlExtraWindowsRefusedError`, gate.ts): the host logs the refusal at
 // error level and shows NO dialog. Every other first-use failure still reaches the dialog, and a failure while the app is quitting
-// still shows none (review c1 M7). gate.ts and workbenchHost.ts are the real sources (p12-host-fixture.mjs transpiles them),
+// still shows none (review c1 M7). Review c1 repairs: the type is raised only when EVERY refused window was refused because a
+// workbench already existed (M2: an adoption failure or a defect in the captured options, mixed results included, is an ordinary
+// failure), and the refusal does not end the originating request: the kept workbench's readiness and display checks still run (M3).
+// gate.ts and workbenchHost.ts are the real sources (p12-host-fixture.mjs transpiles them),
 // driven through `requestWorkbench` (the launch request) with fakes.
 // Run from the fork root: `node build/qlhost/check-p12-extra-windows.mjs src/vs/code/electron-main/qlHost`; rc 0 = GREEN.
 // Negative: 3974929ed9e's gate.ts + workbenchHost.ts -> rows 1, 2, 3 RED; only the `error instanceof QlExtraWindowsRefusedError`
-// branch of `reportFailure` removed -> rows 1, 2 RED (rows 4-7, the controls, stay GREEN).
+// handling of `ensureWorkbench` removed -> rows 1, 2, 11-13 RED (rows 4-7, the controls, stay GREEN). Review c1 repairs: 239f1cdc7f9's
+// gate.ts + workbenchHost.ts -> rows 8, 9, 10, 12, 13 RED (row 11 is the control that stays GREEN there); only the gate's
+// `capacityOnly` test put back to "always the type" -> rows 8, 9, 10 RED.
 import { loadHostModules, flush } from './p12-host-fixture.mjs';
 
 const dir = process.argv[2];
@@ -86,7 +91,8 @@ const refusalLines = rig => rig.logs.filter(entry => entry.message.includes(REFU
 }
 
 {
-	// control (review c1 M7): the app is quitting: no dialog for either kind of failure, each logged at error
+	// control (review c1 M7): the app is quitting: no dialog for either kind of failure, each logged at error. An extras-only refusal
+	// is now logged by `ensureWorkbench` (the request goes on after it), so its error line is the refusal's own, not the quit guard's.
 	const failing = makeRig({ windowsPerOpen: () => 0 });
 	failing.lifecycle.quitRequested = true;
 	failing.host.requestWorkbench('launch arguments');
@@ -97,8 +103,106 @@ const refusalLines = rig => rig.logs.filter(entry => entry.message.includes(REFU
 	row('7 control: while the app is quitting a failure shows no dialog and is logged at error (c1 M7 kept), refusal or not',
 		failing.dialogs.length === 0 && extras.dialogs.length === 0
 		&& failing.logs.some(entry => entry.level === 'error' && entry.message.includes('failed while the app is quitting; no dialog is shown'))
-		&& extras.logs.some(entry => entry.level === 'error' && entry.message.includes('while the app is quitting')),
-		`dialogs ${failing.dialogs.length}/${extras.dialogs.length}, quitting lines ${failing.logs.filter(entry => entry.message.includes('while the app is quitting')).length}/${extras.logs.filter(entry => entry.message.includes('while the app is quitting')).length}`);
+		&& extras.logs.some(entry => entry.level === 'error' && (entry.message.includes('while the app is quitting') || entry.message.includes(REFUSAL))),
+		`dialogs ${failing.dialogs.length}/${extras.dialogs.length}, quitting lines ${failing.logs.filter(entry => entry.message.includes('while the app is quitting')).length}, refusal lines ${refusalLines(extras).length}`);
+}
+
+// review c1 M2: only a capacity refusal is the expected one. The first window's adoption (or its option capture) fails, the second is
+// adopted: the workbench is kept, and the failure is told in a dialog
+async function twoWindows(prepare) {
+	const rig = makeRig({ windowsPerOpen: () => 2 });
+	prepare(rig);
+	rig.host.requestWorkbench('launch arguments');
+	await flush();
+
+	return rig;
+}
+
+{
+	let attempts = 0;
+	const rig = await twoWindows(setup => {
+		const adopt = setup.adopt;
+		setup.adopt = (...args) => {
+			attempts += 1;
+			if (attempts === 1) {
+				throw new Error('injected adoption failure');
+			}
+
+			return adopt(...args);
+		};
+	});
+	row('8 M2: two windows, the first adoption throws and the second succeeds: the workbench is kept and the failure reaches the dialog (naming the adoption failure)',
+		rig.gate.workbenchState === 'open' && rig.dialogs.length === 1 && rig.dialogs[0].message === HEADLINE && rig.dialogs[0].detail.includes('injected adoption failure'),
+		`state ${rig.gate.workbenchState}, dialogs ${JSON.stringify(rig.dialogs.map(options => `${options.message} | ${options.detail}`))}`);
+}
+
+{
+	// the first window sees two recorded option sets (one extra recorded before the stock open) and is refused for that; the second is adopted
+	const rig = makeRig({ windowsPerOpen: () => 2 });
+	const stock = rig.gate.inner.open.bind(rig.gate.inner);
+	rig.gate.inner.open = config => {
+		rig.seam.onCodeWindowOptions({ webPreferences: { sandbox: true } }, { mode: 1 });
+
+		return stock(config);
+	};
+	rig.host.requestWorkbench('launch arguments');
+	await flush();
+	row('9 M2: two windows, the first has invalid captured options (2 sets) and the second is adopted: the failure reaches the dialog (naming the option sets)',
+		rig.gate.workbenchState === 'open' && rig.dialogs.length === 1 && rig.dialogs[0].message === HEADLINE && /option sets were recorded for it/.test(rig.dialogs[0].detail),
+		`state ${rig.gate.workbenchState}, dialogs ${JSON.stringify(rig.dialogs.map(options => `${options.message} | ${options.detail}`))}`);
+}
+
+{
+	// mixed: one adoption failure AND one capacity refusal in the same result is still an ordinary failure
+	let attempts = 0;
+	const rig = makeRig({ windowsPerOpen: () => 3 });
+	const adopt = rig.adopt;
+	rig.adopt = (...args) => {
+		attempts += 1;
+		if (attempts === 1) {
+			throw new Error('injected adoption failure');
+		}
+
+		return adopt(...args);
+	};
+	rig.host.requestWorkbench('launch arguments');
+	await flush();
+	row('10 M2: three windows, a failed adoption AND a capacity refusal in one result (mixed): an ordinary failure, a dialog',
+		rig.gate.workbenchState === 'open' && rig.closedWindows.length === 2 && rig.dialogs.length === 1 && rig.dialogs[0].detail.includes('injected adoption failure'),
+		`state ${rig.gate.workbenchState}, closed windows ${rig.closedWindows.length}, dialogs ${JSON.stringify(rig.dialogs.map(options => options.detail))}`);
+}
+
+// review c1 M3: the refusal does not end the originating request: the kept workbench's readiness and display checks still run
+const READINESS = 'workbench document failed to load';
+const readinessRejects = rig => {
+	const adopt = rig.adopt;
+	rig.adopt = (...args) => ({ ...adopt(...args), whenReady: async () => { throw new Error(READINESS); } });
+};
+
+{
+	const rig = await twoWindows(() => { });
+	row('11 M3 control: extras and a ready workbench: one workbench open and on screen, the extra closed, no dialog, the refusal logged once at error',
+		rig.gate.workbenchState === 'open' && rig.closedWindows.length === 1 && rig.shown.length > 0 && rig.shown.every(name => name === 'workbench') && rig.dialogs.length === 0 && refusalLines(rig).length === 1,
+		`state ${rig.gate.workbenchState}, closed ${rig.closedWindows.length}, shown ${JSON.stringify(rig.shown)}, dialogs ${rig.dialogs.length}, refusal lines ${refusalLines(rig).length}`);
+}
+
+{
+	const rig = await twoWindows(readinessRejects);
+	row('12 M3: extras and the kept workbench\'s readiness REJECTS: a failure dialog naming the readiness failure, the workbench is not shown, the refusal is still logged at error',
+		rig.dialogs.length === 1 && rig.dialogs[0].message === HEADLINE && rig.dialogs[0].detail.includes(READINESS) && !rig.shown.includes('workbench') && refusalLines(rig).length === 1 && refusalLines(rig)[0].level === 'error',
+		`dialogs ${JSON.stringify(rig.dialogs.map(options => `${options.message} | ${options.detail}`))}, shown ${JSON.stringify(rig.shown)}, refusal lines ${refusalLines(rig).length}`);
+}
+
+{
+	const rig = makeRig({ windowsPerOpen: () => 2 });
+	readinessRejects(rig);
+	rig.lifecycle.quitRequested = true;
+	rig.host.requestWorkbench('launch arguments');
+	await flush();
+	const quitLines = rig.logs.filter(entry => entry.level === 'error' && entry.message.includes('failed while the app is quitting; no dialog is shown'));
+	row('13 M3: extras and the readiness failure while the app is quitting: no dialog; the readiness failure itself (not the refusal) is the error logged under the quit guard',
+		rig.dialogs.length === 0 && quitLines.length === 1 && quitLines[0].args[0] instanceof Error && quitLines[0].args[0].message === READINESS,
+		`dialogs ${rig.dialogs.length}, quit lines ${quitLines.length}, logged error ${quitLines[0]?.args[0]?.message ?? 'none'}`);
 }
 
 console.log(rows.join('\n'));

@@ -47,7 +47,8 @@ export interface IQlWorkbenchListener {
 /**
  * QuantLab host (P12): the first use succeeded and the workbench is open, but the request also opened windows the host cannot
  * show, so the gate closed them. The refusal is expected (a restored session of several windows) and handled, so it is its own
- * type: the host logs it and shows no dialog, while every other first-use failure still gets one.
+ * type: the host logs it and shows no dialog, while every other first-use failure still gets one. It is raised only when EVERY
+ * refused window was refused because a workbench window already existed; an adoption failure is an ordinary error (review c1 M2).
  */
 export class QlExtraWindowsRefusedError extends Error {
 	constructor(message: string) {
@@ -115,8 +116,11 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 	/** The webPreferences of the CodeWindows created and not yet seen by `onDidOpenWindow` (always 0 or 1: both happen synchronously). */
 	private readonly pendingWebPreferences: WebPreferences[] = [];
 
-	/** CodeWindows that were opened but could not be adopted, with the reason; the request that opened them fails and closes them. */
-	private readonly unadopted: { readonly window: ICodeWindow; readonly reason: string }[] = [];
+	/**
+	 * CodeWindows that were opened but could not be adopted, with the reason; the request that opened them fails and closes them.
+	 * `capacity` (P12): refused only because a workbench window already existed; an adoption failure or a defect in the captured options is not.
+	 */
+	private readonly unadopted: { readonly window: ICodeWindow; readonly reason: string; readonly capacity: boolean }[] = [];
 
 	constructor(
 		machineId: string,
@@ -192,18 +196,24 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 	private async use<T>(cause: string, run: () => Promise<T>, whenIdle?: () => T): Promise<T> {
 		await this.listenerAttached.p;
 
+		// QuantLab host (P12, review c1 M1): such a request is answered at once while no workbench is open, a first use in flight
+		// included: it neither joins that first use (its failure, its extras refusal) nor reaches the stock open after it
+		if (whenIdle && this.state !== 'open') {
+			return whenIdle();
+		}
+
 		if (this.state === 'opening') {
 			await this.opening; // rejects with the first use's error: concurrent first uses share one outcome
 		}
 
 		if (this.state === 'idle') {
-			return whenIdle ? whenIdle() : this.firstUse(cause, run);
+			return this.firstUse(cause, run);
 		}
 
 		const { value, extras } = await this.runOpen(run);
 		this.listener?.surface(cause);
 		if (extras) {
-			throw extras;
+			throw extras.error;
 		}
 
 		return value;
@@ -216,7 +226,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 
 		const opened = this.runOpen(run).then(result => {
 			if (!this.current) {
-				throw result.extras ?? new Error(`QuantLab host (U5): the ${cause} request returned without opening a workbench window`);
+				throw result.extras?.error ?? new Error(`QuantLab host (U5): the ${cause} request returned without opening a workbench window`);
 			}
 
 			this.state = 'open';
@@ -239,8 +249,9 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		return opened.then(({ value, extras }) => {
 			this.listener?.surface(cause);
 			if (extras) {
-				// the workbench is open and kept; the request still reports that it asked for more windows than the host holds (P12: by type)
-				throw new QlExtraWindowsRefusedError(extras.message);
+				// the workbench is open and kept; the request still reports that it asked for more windows than the host holds. P12: by type,
+				// and only when every refused window was refused for that (review c1 M2); an adoption failure stays an ordinary error.
+				throw extras.capacityOnly ? new QlExtraWindowsRefusedError(extras.error.message) : extras.error;
 			}
 
 			return value;
@@ -248,7 +259,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 	}
 
 	/** Runs the stock open. Windows it opened that could not be adopted are closed here and reported as `extras` (the caller throws it). */
-	private async runOpen<T>(run: () => Promise<T>): Promise<{ readonly value: T; readonly extras: Error | undefined }> {
+	private async runOpen<T>(run: () => Promise<T>): Promise<{ readonly value: T; readonly extras: { readonly error: Error; readonly capacityOnly: boolean } | undefined }> {
 		const value = await run();
 
 		if (this.unadopted.length === 0) {
@@ -260,7 +271,9 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 			window.close();
 		}
 
-		return { value, extras: new Error(`QuantLab host (U5): the request opened ${failures.length} window(s) that cannot be shown (the host holds ONE workbench window), so they were closed: ${failures.map(failure => failure.reason).join('; ')}`) };
+		const error = new Error(`QuantLab host (U5): the request opened ${failures.length} window(s) that cannot be shown (the host holds ONE workbench window), so they were closed: ${failures.map(failure => failure.reason).join('; ')}`);
+
+		return { value, extras: { error, capacityOnly: failures.every(failure => failure.capacity) } };
 	}
 
 	private discardCurrent(): void {
@@ -284,10 +297,12 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		const listener = this.listener;
 
 		let refusal: string | undefined;
+		let capacity = false; // P12: only "a workbench window already exists" is the expected one-window limit
 		if (!listener) {
 			refusal = 'the host is not attached';
 		} else if (this.current) {
 			refusal = 'a workbench window already exists';
+			capacity = true;
 		} else if (captured.length !== 1) {
 			refusal = `${captured.length} option sets were recorded for it (expected 1)`;
 		}
@@ -319,7 +334,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		}
 
 		this.logService.error(`QuantLab host: a window was opened that the host cannot adopt (${refusal})`);
-		this.unadopted.push({ window: codeWindow, reason: refusal });
+		this.unadopted.push({ window: codeWindow, reason: refusal, capacity });
 	}
 
 	private onWorkbenchGone(workbench: IAdoptedWorkbench): void {

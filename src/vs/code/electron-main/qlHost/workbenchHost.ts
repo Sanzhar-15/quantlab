@@ -199,7 +199,17 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 			// the host log's line (`shell: first-use workbench cause=…`): its absence proves the workbench was never started
 			this.requireTerminalHost().host.log(`first-use workbench cause=${cause}`);
 
-			this.ensuring = this.deps.openWorkbench().then(() => {
+			this.ensuring = this.deps.openWorkbench().then(() => undefined, (error: unknown) => {
+				// QuantLab host (P12): the first use succeeded and the workbench is open; the request only asked for more windows than the
+				// host holds, and the gate closed them (a restored session of several windows does that on every first use). The refusal is
+				// logged here, at error, once (the gate refused something), and the request goes on to the kept workbench's readiness and
+				// display checks: a load, readiness or display failure after it is an ordinary failure. Told by type, never by message.
+				if (!(error instanceof QlExtraWindowsRefusedError)) {
+					throw error;
+				}
+
+				this.deps.logService.error(`QuantLab host: ${cause}: ${error.message}; the workbench is kept`);
+			}).then(() => {
 				const workbench = this.deps.gate.workbench;
 				if (!workbench) {
 					throw new Error(`QuantLab host (U5): the ${cause} request ended without a workbench window`);
@@ -377,15 +387,6 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		// dialog was app-modal with nobody to answer it (SIGTERM 1.5 s after the attach: alive 60 s, no will-quit).
 		if (this.closing || this.deps.lifecycleMainService.quitRequested) {
 			this.deps.logService.error(`QuantLab host: ${what} failed while the app is quitting; no dialog is shown`, error);
-
-			return;
-		}
-
-		// QuantLab host (P12): the first use succeeded and the workbench is open; the request only asked for more windows than the
-		// host holds, and the gate closed them. A restored session of several windows does that on every first use, so it is
-		// logged (at error: the gate refused something) and no alert is shown for a handled, expected refusal. Told by type, never by message.
-		if (error instanceof QlExtraWindowsRefusedError) {
-			this.deps.logService.error(`QuantLab host: ${what}: ${error.message}; no dialog is shown`);
 
 			return;
 		}
