@@ -26,15 +26,21 @@ export interface IMergeResult {
  * value left in a user's settings.json must not be synced. They are appended AFTER the user's `-key` opt-back-in
  * entries in {@link getIgnoredSettings}, so no `settingsSync.ignoredSettings` entry can bring them back.
  *
- * They never cross the boundary in either direction. Outbound: content built to leave this machine
- * ({@link updateIgnoredSettingsForRemote} and every `remoteContent` of {@link merge}) holds neither key, whatever the
- * remote, the base or the ignored-settings list say, and a remote that still holds them receives a change that
- * removes them. Local-bound: content built for the local file ({@link updateIgnoredSettings} with the local content
- * as source, every `localContent` of {@link merge}) keeps the local values and never takes the other side's.
+ * Outbound (what this guarantee covers): content built to leave this machine holds neither key, whatever the remote, the base
+ * or the ignored-settings list say, and a remote that still holds them receives a change that removes them. That content is
+ * {@link updateIgnoredSettingsForRemote}, and every `remoteContent` of {@link merge}, which is either null (nothing is sent) or
+ * went through {@link removeNeverSyncedSettings} (called directly in the branches that start from the remote's own content, and
+ * inside updateIgnoredSettingsForRemote in the others). Local-bound: content built for the local file ({@link updateIgnoredSettings}
+ * with the local content as source, every `localContent` of {@link merge}) keeps the local values and never takes the other
+ * side's. Not covered: the inbound initialisers (the first-run `SettingsInitializer` writes remote settings into a profile
+ * without this module); they are reserved to a later fold.
  * Outbound content is checked, not trusted: every occurrence of a key is removed however often the raw text writes it
  * (the parser keeps the last duplicate, so one removal per key is not enough), the result is scanned again, and a result
  * that still holds a key, or built from a local content that does not parse, is refused with a {@link NeverSyncedSettingsError}.
- * Content without the keys is returned exactly as upstream builds it.
+ * Byte identity with upstream holds only where it is stated: {@link removeNeverSyncedSettings} returns content that holds no
+ * key exactly as it came in, and {@link updateIgnoredSettingsForRemote} returns what the ordinary ignored-settings step
+ * ({@link updateIgnoredSettings}) builds whenever the source holds no key. Where the source holds a key it is copied in and
+ * removed again, and the result can differ from the base's, as stated at {@link updateIgnoredSettingsForRemote}.
  * Remove this list after the first user-facing release that includes QuantLab.
  */
 export const NEVER_SYNCED_SETTINGS: readonly string[] = Object.freeze(['qic.demo.email', 'qic.demo.password']);
@@ -348,6 +354,14 @@ export function updateIgnoredSettings(targetContent: string, sourceContent: stri
  * {@link NEVER_SYNCED_SETTINGS} keys is removed whatever `sourceContent` holds, so a remote that holds them never has them
  * copied back into an upload. That guarantee does not rest on {@link updateIgnoredSettings}, which removes one occurrence
  * per ignored key. Throws a {@link NeverSyncedSettingsError} when `targetContent` does not parse or the result still holds a key.
+ *
+ * Against the base (7931203e520, whose strip removed one occurrence of each key), for a target that holds no key: the output is
+ * byte for byte the base's when the source holds no key either (updateIgnoredSettings alone builds it). When the source holds
+ * a key, updateIgnoredSettings copies it into the target and the removal takes it out again; the tests compare the base's exact
+ * output for the layouts they pin. The one difference known and asserted: upstream's removal of an ignored setting can leave a
+ * bare comma (`{ , }`), and when every property left is a never-synced one, the removal of the last of them takes that comma
+ * too. Target `{"machine.a":1,}` with `machine.a` ignored and a source that holds both keys gives `{\n\t,\n}` on the base
+ * (which does not parse) and `{\n}` here.
  */
 export function updateIgnoredSettingsForRemote(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
 	// The content this builds from is the caller's own: it must parse (the sync validates it first). What the ordinary

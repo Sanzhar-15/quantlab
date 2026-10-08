@@ -4,9 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { parse } from '../../../../base/common/json.js';
+import { FormattingOptions } from '../../../../base/common/jsonFormatter.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { TestConfigurationService } from '../../../configuration/test/common/testConfigurationService.js';
-import { getIgnoredSettings, INeverSyncedPasses, merge, NeverSyncedSettingsError, removeNeverSyncedSettings, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
+import * as contentUtil from '../../common/content.js';
+import { getIgnoredSettings, INeverSyncedPasses, merge, NEVER_SYNCED_SETTINGS, NeverSyncedSettingsError, removeNeverSyncedSettings, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../common/settingsMerge.js';
 import { assertNoNeverSynced, assertRawOccurrences, assertNoNeverSyncedProperty, assertOrdinaryKept, DEMO_EMAIL, DEMO_PASSWORD, IRawSettings, RawStyle, rawSettings, topLevelPropertyNames } from './rawNeverSyncedSettings.js';
 
 // QuantLab F-SYNC-STRIP-1 (M1): content built to leave the machine holds NO occurrence of a never-synced key and none of its
@@ -184,7 +187,7 @@ suite('SettingsMerge - never-synced settings written more than once (STRIP-1)', 
 
 	// What upstream uploads for content without a never-synced key is not changed, syntax errors included: removing every
 	// ordinary setting from `{ "a": 1, }` leaves `{ , }` and upstream uploads it.
-	test('content without the keys comes back byte for byte as the ordinary ignored settings alone build it', () => {
+	test('content without the keys, against a source without them, comes back byte for byte as the ordinary ignored settings alone build it', () => {
 		const contents = [
 			'{\n\t// Machine\n\t"machine.a": 1,\n\t"machine.b": 2,\n}',
 			'{\n\t"machine.a": 1,\n}',
@@ -197,6 +200,70 @@ suite('SettingsMerge - never-synced settings written more than once (STRIP-1)', 
 				updateIgnoredSettings(content, '{}', [...ignored, 'machine.a', 'machine.b'], formattingOptions)
 			);
 		}
+	});
+
+	// QuantLab F-SYNC-STRIP-2 (S3, B4): the byte-identity promise, stated where it holds. The BASE function (7931203e520) is
+	// reproduced here from its source: updateIgnoredSettings (unchanged by this fold) and then a strip that parses once and
+	// removes the first occurrence of each key the parse shows. For a target that holds no key, the new
+	// updateIgnoredSettingsForRemote is compared with it by exact string, with a source that holds none and with a source that
+	// holds both (the keys are copied in and removed again).
+	function baseRemoveNeverSyncedSettings(content: string, options: FormattingOptions): string {
+		const parsed = parse(content);
+		if (!parsed) {
+			return content;
+		}
+		for (const key of NEVER_SYNCED_SETTINGS) {
+			if (parsed[key] !== undefined) {
+				content = contentUtil.edit(content, [key], undefined, options);
+			}
+		}
+		return content;
+	}
+
+	function baseUpdateIgnoredSettingsForRemote(target: string, source: string, ignoredSettings: string[], options: FormattingOptions): string {
+		return baseRemoveNeverSyncedSettings(updateIgnoredSettings(target, source, ignoredSettings, options), options);
+	}
+
+	const credentialSource = '{\n\t"qic.demo.email": "SOURCE-EMAIL",\n\t"qic.demo.password": "SOURCE-PASSWORD"\n}';
+
+	test('a target without the keys is built exactly as the base builds it, against a source without them and against one that holds both', () => {
+		const targets: { name: string; target: string; extraIgnored: string[] }[] = [
+			{ name: 'one setting', target: '{\n\t"local.y": 2\n}', extraIgnored: [] },
+			{ name: 'one setting, a trailing comma', target: '{\n\t"local.y": 2,\n}', extraIgnored: [] },
+			{ name: 'empty object', target: '{}', extraIgnored: [] },
+			{ name: 'an ignored setting before a kept one', target: '{\n\t"machine.a": 1,\n\t"local.y": 2\n}', extraIgnored: ['machine.a'] },
+		];
+		for (const { name, target, extraIgnored } of targets) {
+			for (const [sourceName, source] of [['no keys', '{}'], ['both keys', credentialSource]]) {
+				const list = [...ignored, ...extraIgnored];
+				assert.strictEqual(
+					updateIgnoredSettingsForRemote(target, source, list, formattingOptions),
+					baseUpdateIgnoredSettingsForRemote(target, source, list, formattingOptions),
+					`${name}, source with ${sourceName}`
+				);
+			}
+		}
+		// the same without the source keys, for the layouts of the test above that hold ignored settings and comments
+		for (const target of ['{\n\t// Machine\n\t"machine.a": 1,\n\t"machine.b": 2,\n}', '{\n\t"machine.a": 1,\n}', '{\n\t"local.y": 2,\n\t"machine.a": 1\n}']) {
+			const list = [...ignored, 'machine.a', 'machine.b'];
+			assert.strictEqual(updateIgnoredSettingsForRemote(target, '{}', list, formattingOptions), baseUpdateIgnoredSettingsForRemote(target, '{}', list, formattingOptions), target);
+		}
+	});
+
+	// The one difference known (the reviewer's case). Upstream's removal of the ignored `machine.a` leaves `{ , }`; the two
+	// keys copied in from the source are then the only properties left, and the removal of the last of them takes the bare
+	// comma too. The base leaves it, and what it uploads does not parse.
+	test('target {"machine.a":1,} with machine.a ignored and a source that holds both keys: the stated difference from the base', () => {
+		const target = '{"machine.a":1,}';
+		const list = [...ignored, 'machine.a'];
+		const base = baseUpdateIgnoredSettingsForRemote(target, credentialSource, list, formattingOptions);
+		const head = updateIgnoredSettingsForRemote(target, credentialSource, list, formattingOptions);
+		assert.strictEqual(base, '{\n\t,\n}');
+		assert.strictEqual(head, '{\n}');
+		assertNoNeverSyncedProperty(head, 'head');
+		// with a source that holds neither key the two agree (the ordinary ignored-settings removal alone builds `{ , }`)
+		assert.strictEqual(updateIgnoredSettingsForRemote(target, '{}', list, formattingOptions), baseUpdateIgnoredSettingsForRemote(target, '{}', list, formattingOptions));
+		assert.strictEqual(updateIgnoredSettingsForRemote(target, '{}', list, formattingOptions), '{\n\t,\n}');
 	});
 
 	// QuantLab F-SYNC-STRIP-2 (S1, B1): the removal makes a bounded number of full-document passes whatever the duplicate count.
