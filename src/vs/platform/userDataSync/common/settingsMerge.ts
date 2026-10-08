@@ -25,6 +25,11 @@ export interface IMergeResult {
  * content. `qic.demo.email` and `qic.demo.password` were registered by a contribution that no longer exists, so a
  * value left in a user's settings.json must not be synced. They are appended AFTER the user's `-key` opt-back-in
  * entries in {@link getIgnoredSettings}, so no `settingsSync.ignoredSettings` entry can bring them back.
+ *
+ * Unlike ordinary ignored settings (whose value on the other side is PRESERVED), these are never copied from the
+ * other side: {@link updateIgnoredSettings} removes them from the content it returns, and {@link merge} turns a
+ * remote that still holds them into a remote change that removes them. Any content built by either function
+ * therefore holds neither key, whatever the remote, the base or the ignored-settings list say.
  * Remove this list after the first user-facing release that includes QuantLab.
  */
 export const NEVER_SYNCED_SETTINGS: readonly string[] = Object.freeze(['qic.demo.email', 'qic.demo.password']);
@@ -76,8 +81,32 @@ export function removeComments(content: string, formattingOptions: FormattingOpt
 	return result;
 }
 
+function holdsNeverSyncedSettings(content: string): boolean {
+	const parsed = parse(content);
+	return !!parsed && NEVER_SYNCED_SETTINGS.some(key => parsed[key] !== undefined);
+}
+
+function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions): string {
+	const parsed = parse(content);
+	if (!parsed) {
+		return content;
+	}
+	for (const key of NEVER_SYNCED_SETTINGS) {
+		if (parsed[key] !== undefined) {
+			content = contentUtil.edit(content, [key], undefined, formattingOptions);
+		}
+	}
+	return content;
+}
+
+/**
+ * Ordinary ignored settings take the value they have in `sourceContent` (or are removed when the source lacks them).
+ * {@link NEVER_SYNCED_SETTINGS} are removed from the result whatever the source holds, so they cannot be copied back
+ * from the other side.
+ */
 export function updateIgnoredSettings(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
-	if (ignoredSettings.length) {
+	const ordinaryIgnoredSettings = ignoredSettings.filter(key => !NEVER_SYNCED_SETTINGS.includes(key));
+	if (ordinaryIgnoredSettings.length) {
 		const sourceTree = parseSettings(sourceContent);
 		const source = parse(sourceContent) || {};
 		const target = parse(targetContent);
@@ -85,7 +114,7 @@ export function updateIgnoredSettings(targetContent: string, sourceContent: stri
 			return targetContent;
 		}
 		const settingsToAdd: INode[] = [];
-		for (const key of ignoredSettings) {
+		for (const key of ordinaryIgnoredSettings) {
 			const sourceValue = source[key];
 			const targetValue = target[key];
 
@@ -107,10 +136,15 @@ export function updateIgnoredSettings(targetContent: string, sourceContent: stri
 		settingsToAdd.sort((a, b) => a.startOffset - b.startOffset);
 		settingsToAdd.forEach(s => targetContent = addSetting(s.setting!.key, sourceContent, targetContent, formattingOptions));
 	}
-	return targetContent;
+	return removeNeverSyncedSettings(targetContent, formattingOptions);
 }
 
 export function merge(originalLocalContent: string, originalRemoteContent: string, baseContent: string | null, ignoredSettings: string[], resolvedConflicts: { key: string; value: any | undefined }[], formattingOptions: FormattingOptions): IMergeResult {
+
+	// NEVER_SYNCED_SETTINGS are ignored by every merge, whatever list the caller passed.
+	ignoredSettings = distinct([...ignoredSettings, ...NEVER_SYNCED_SETTINGS]);
+	// A remote that holds them must receive a change that removes them, even when nothing else differs.
+	const remoteHoldsNeverSynced = holdsNeverSyncedSettings(originalRemoteContent);
 
 	const localContentWithoutIgnoredSettings = updateIgnoredSettings(originalLocalContent, originalRemoteContent, ignoredSettings, formattingOptions);
 	const localForwarded = baseContent !== localContentWithoutIgnoredSettings;
@@ -128,13 +162,18 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 
 	/* remote has changed and local has not */
 	if (remoteForwarded && !localForwarded) {
-		return { conflictsSettings: [], localContent: updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions), remoteContent: null, hasConflicts: false };
+		return {
+			conflictsSettings: [],
+			localContent: updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions),
+			remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions) : null,
+			hasConflicts: false
+		};
 	}
 
 	/* local is empty and not synced before */
 	if (baseContent === null && isEmpty(originalLocalContent)) {
 		const localContent = areSame(originalLocalContent, originalRemoteContent, ignoredSettings) ? null : updateIgnoredSettings(originalRemoteContent, originalLocalContent, ignoredSettings, formattingOptions);
-		return { conflictsSettings: [], localContent, remoteContent: null, hasConflicts: false };
+		return { conflictsSettings: [], localContent, remoteContent: remoteHoldsNeverSynced ? removeNeverSyncedSettings(originalRemoteContent, formattingOptions) : null, hasConflicts: false };
 	}
 
 	/* remote and local has changed */
@@ -252,6 +291,8 @@ export function merge(originalLocalContent: string, originalRemoteContent: strin
 			localContent = addSetting(key, remoteContent, localContent, formattingOptions);
 		}
 	}
+
+	remoteContent = removeNeverSyncedSettings(remoteContent, formattingOptions);
 
 	const hasConflicts = conflicts.size > 0 || !areSame(localContent, remoteContent, ignoredSettings);
 	const hasLocalChanged = hasConflicts || !areSame(localContent, originalLocalContent, []);
