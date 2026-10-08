@@ -5,7 +5,7 @@
 
 import { distinct } from '../../../base/common/arrays.js';
 import { IStringDictionary } from '../../../base/common/collections.js';
-import { JSONVisitor, parse, visit } from '../../../base/common/json.js';
+import { JSONVisitor, ParseError, parse, visit } from '../../../base/common/json.js';
 import { applyEdits, setProperty, withFormatting } from '../../../base/common/jsonEdit.js';
 import { Edit, FormattingOptions, getEOL } from '../../../base/common/jsonFormatter.js';
 import * as objects from '../../../base/common/objects.js';
@@ -31,6 +31,9 @@ export interface IMergeResult {
  * remote, the base or the ignored-settings list say, and a remote that still holds them receives a change that
  * removes them. Local-bound: content built for the local file ({@link updateIgnoredSettings} with the local content
  * as source, every `localContent` of {@link merge}) keeps the local values and never takes the other side's.
+ * Outbound content is checked, not trusted: every occurrence of a key is removed however often the raw text writes it
+ * (the parser keeps the last duplicate, so one removal per key is not enough), the result is scanned again, and content
+ * that cannot be parsed, or that still holds a key, is refused with a {@link NeverSyncedSettingsError}.
  * Remove this list after the first user-facing release that includes QuantLab.
  */
 export const NEVER_SYNCED_SETTINGS: readonly string[] = Object.freeze(['qic.demo.email', 'qic.demo.password']);
@@ -93,14 +96,81 @@ function neverSyncedSettingsHeld(targetContent: string, sourceContent: string): 
 	return NEVER_SYNCED_SETTINGS.filter(key => (!!target && target[key] !== undefined) || (!!source && source[key] !== undefined));
 }
 
-function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions): string {
-	const parsed = parse(content);
-	if (!parsed) {
-		return content;
+/**
+ * Thrown when content that would leave this machine cannot be shown to be free of {@link NEVER_SYNCED_SETTINGS}: it does
+ * not parse, or a key is still there after every occurrence was removed. The message names keys and offsets only, never
+ * a value or any part of the content.
+ */
+export class NeverSyncedSettingsError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'NeverSyncedSettingsError';
 	}
-	for (const key of NEVER_SYNCED_SETTINGS) {
-		if (parsed[key] !== undefined) {
+}
+
+/** The same parse options as the sync validator (`AbstractJsonSynchronizer.hasErrors`): comments, trailing commas and empty content are valid. */
+const NEVER_SYNCED_PARSE_OPTIONS = { allowTrailingComma: true, allowEmptyContent: true };
+
+function throwIfParseErrors(errors: ParseError[]): void {
+	if (errors.length) {
+		throw new NeverSyncedSettingsError(`Settings content cannot be checked for never-synced settings: it has ${errors.length} syntax error(s), the first (code ${errors[0].error}) at offset ${errors[0].offset}`);
+	}
+}
+
+/** Throws a {@link NeverSyncedSettingsError} when the content has a syntax error (comments, trailing commas and empty content are valid). */
+function assertParses(content: string): void {
+	const errors: ParseError[] = [];
+	visit(content, { onError: (error, offset, length) => { errors.push({ error, offset, length }); } }, NEVER_SYNCED_PARSE_OPTIONS);
+	throwIfParseErrors(errors);
+}
+
+/** The never-synced keys among the properties of the root object, one entry per occurrence, found by the real tokenizer. */
+function neverSyncedPropertyNames(content: string): string[] {
+	const found: string[] = [];
+	const errors: ParseError[] = [];
+	let depth = 0;
+	visit(content, {
+		onObjectBegin: () => { depth++; },
+		onObjectEnd: () => { depth--; },
+		onArrayBegin: () => { depth++; },
+		onArrayEnd: () => { depth--; },
+		onObjectProperty: (name: string) => {
+			if (depth === 1 && NEVER_SYNCED_SETTINGS.includes(name)) {
+				found.push(name);
+			}
+		},
+		onError: (error, offset, length) => { errors.push({ error, offset, length }); }
+	}, NEVER_SYNCED_PARSE_OPTIONS);
+	throwIfParseErrors(errors);
+	return found;
+}
+
+/**
+ * Removes EVERY top-level occurrence of each {@link NEVER_SYNCED_SETTINGS} key, however often the raw text writes it: one
+ * removal takes the first occurrence of a key, so it repeats until the tokenizer finds none. The result is then checked a
+ * second way, on the parsed object. Content that does not parse, or that still holds a key, throws a
+ * {@link NeverSyncedSettingsError}: content that leaves this machine is never passed on unchecked.
+ */
+function removeNeverSyncedSettings(content: string, formattingOptions: FormattingOptions): string {
+	let held = neverSyncedPropertyNames(content).length;
+	while (held > 0) {
+		for (const key of NEVER_SYNCED_SETTINGS) {
 			content = contentUtil.edit(content, [key], undefined, formattingOptions);
+		}
+		const remaining = neverSyncedPropertyNames(content);
+		if (remaining.length >= held) {
+			throw new NeverSyncedSettingsError(`A never-synced setting could not be removed from the settings content: ${distinct(remaining).join(', ')}`);
+		}
+		held = remaining.length;
+	}
+
+	const errors: ParseError[] = [];
+	const parsed = parse(content, errors, NEVER_SYNCED_PARSE_OPTIONS);
+	throwIfParseErrors(errors);
+	if (parsed !== null && typeof parsed === 'object') {
+		const left = NEVER_SYNCED_SETTINGS.filter(key => Object.prototype.hasOwnProperty.call(parsed, key));
+		if (left.length) {
+			throw new NeverSyncedSettingsError(`Settings content still holds never-synced settings after their removal: ${left.join(', ')}`);
 		}
 	}
 	return content;
@@ -111,8 +181,9 @@ function removeNeverSyncedSettings(content: string, formattingOptions: Formattin
  * {@link NEVER_SYNCED_SETTINGS} key is among them exactly when either side holds it, whatever list the caller passed, so
  * content where neither side holds the pair is rebuilt as the ordinary ignored settings alone rebuild it. Built for the
  * local file with the local content as source, the result keeps the local values; built with `'{}'` as source, it holds
- * none. Content that leaves this machine and is rebuilt against the remote is built with
- * {@link updateIgnoredSettingsForRemote}.
+ * none of a key written once. Like every ignored setting here, a key the raw text writes several times loses one occurrence
+ * per call: content that leaves this machine is therefore never built with this function alone but with
+ * {@link updateIgnoredSettingsForRemote}, which removes every occurrence.
  */
 export function updateIgnoredSettings(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
 	ignoredSettings = distinct([...ignoredSettings.filter(key => !NEVER_SYNCED_SETTINGS.includes(key)), ...neverSyncedSettingsHeld(targetContent, sourceContent)]);
@@ -150,10 +221,14 @@ export function updateIgnoredSettings(targetContent: string, sourceContent: stri
 }
 
 /**
- * Outbound content (it leaves this machine): {@link updateIgnoredSettings}, then {@link NEVER_SYNCED_SETTINGS} are removed
- * whatever `sourceContent` holds, so a remote that holds them never has them copied back into an upload.
+ * Outbound content (it leaves this machine): {@link updateIgnoredSettings}, then every occurrence of the
+ * {@link NEVER_SYNCED_SETTINGS} keys is removed whatever `sourceContent` holds, so a remote that holds them never has them
+ * copied back into an upload. That guarantee does not rest on {@link updateIgnoredSettings}, which removes one occurrence
+ * per ignored key. Throws a {@link NeverSyncedSettingsError} when `targetContent` does not parse or the result still holds a key.
  */
 export function updateIgnoredSettingsForRemote(targetContent: string, sourceContent: string, ignoredSettings: string[], formattingOptions: FormattingOptions): string {
+	// The tolerant parser behind updateIgnoredSettings would otherwise rebuild (or pass on) content that does not parse.
+	assertParses(targetContent);
 	return removeNeverSyncedSettings(updateIgnoredSettings(targetContent, sourceContent, ignoredSettings, formattingOptions), formattingOptions);
 }
 

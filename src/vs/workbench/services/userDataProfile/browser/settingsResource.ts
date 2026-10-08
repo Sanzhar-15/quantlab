@@ -9,7 +9,7 @@ import { FileOperationError, FileOperationResult, IFileService } from '../../../
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { IProfileResource, IProfileResourceChildTreeItem, IProfileResourceInitializer, IProfileResourceTreeItem, IUserDataProfileService } from '../common/userDataProfile.js';
-import { NEVER_SYNCED_SETTINGS, updateIgnoredSettings } from '../../../../platform/userDataSync/common/settingsMerge.js';
+import { NEVER_SYNCED_SETTINGS, updateIgnoredSettings, updateIgnoredSettingsForRemote } from '../../../../platform/userDataSync/common/settingsMerge.js';
 import { IUserDataSyncUtilService } from '../../../../platform/userDataSync/common/userDataSync.js';
 import { ITreeItemCheckboxState, TreeItemCollapsibleState } from '../../../common/views.js';
 import { IUserDataProfile, ProfileResourceType } from '../../../../platform/userDataProfile/common/userDataProfile.js';
@@ -62,7 +62,9 @@ export class SettingsResource implements IProfileResource {
 		} else {
 			const ignoredSettings = this.getIgnoredSettings();
 			const formattingOptions = await this.userDataSyncUtilService.resolveFormattingOptions(profile.settingsResource);
-			const settings = updateIgnoredSettings(localContent || '{}', '{}', ignoredSettings, formattingOptions);
+			// An export leaves this machine: every occurrence of the never-synced keys is removed and the result is
+			// checked (a local file that does not parse fails the export with a NeverSyncedSettingsError).
+			const settings = updateIgnoredSettingsForRemote(localContent || '{}', '{}', ignoredSettings, formattingOptions);
 			return { settings };
 		}
 	}
