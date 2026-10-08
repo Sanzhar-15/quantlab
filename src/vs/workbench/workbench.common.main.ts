@@ -214,6 +214,9 @@ import './contrib/chat/browser/contextContrib/chatContext.contribution.js';
 // QIC - Quantlab Intelligence Console
 import './contrib/qic/browser/qicGate.contribution.js';
 
+// Quantlab: the active profile's own settings/keybindings resources, named for the settings import
+import './contrib/quantlab/browser/importTargets.contribution.js';
+
 // QuantLab Auth Gate -- full-screen login overlay shown before the workbench when unauthenticated
 
 // Interactive

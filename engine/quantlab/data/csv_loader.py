@@ -25,6 +25,28 @@ class CSVLoaderError(Exception):
     pass
 
 
+def _rows(reader, path: Path) -> Iterator[list[str]]:
+    """The reader's rows; an error of the csv module itself (a field over csv.field_size_limit(), a bad quote)
+    is a CSVLoaderError naming the file and the line, never a bare csv.Error (review c1 S2)."""
+    while True:
+        try:
+            row = next(reader)
+        except StopIteration:
+            return
+        except csv.Error as e:
+            raise CSVLoaderError(f"{path}: line {reader.line_num} cannot be read by the csv module ({e})") from e
+        yield row
+
+
+def _utc(value: datetime) -> datetime:
+    """The one timezone rule of this loader: a naive datetime is UTC (as backtest() reads its start/end);
+    an aware one is converted to UTC. Every timestamp it yields and both filters go through here, so the
+    filter comparisons never mix naive and aware values."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class CSVLoader:
     """
     Load market data from CSV files.
@@ -34,6 +56,11 @@ class CSVLoader:
     - Column mapping for different schemas
     - Date filtering
     - Lazy loading via iterator
+
+    Timestamps: a naive timestamp (no offset in the file or the format) is UTC, as backtest() reads its
+    start/end; a file written in a local exchange time must be converted, or given a format with %z,
+    before loading. Every cell of every row is validated, inside the date range or not: a file with one
+    unreadable row is rejected as a whole, naming the row.
 
     Usage:
         loader = CSVLoader("data/SPY.csv")
@@ -108,58 +135,63 @@ class CSVLoader:
         return None
 
     def _parse_date(self, date_str: str) -> datetime:
-        """Parse date string, auto-detecting format if needed."""
+        """Parse a date string. The format is detected on the first row and then holds for the whole file:
+        a later row in another format is a named error, never re-detected (a file mixing %m/%d and %d/%m
+        would otherwise be read with two meanings)."""
         date_str = date_str.strip()
 
-        # Check for Unix epoch timestamp (integer or float)
+        # A format detected on an earlier row (Unix epoch seconds or a strptime format) holds for every row.
         if self._detected_date_format == "__epoch__":
             return datetime.fromtimestamp(float(date_str), tz=timezone.utc)
-
-        try:
-            epoch = float(date_str)
-            # Heuristic: if it looks like a Unix timestamp (> year 2000 in seconds)
-            if epoch > 946684800 and date_str.replace(".", "").replace("-", "").isdigit():
-                self._detected_date_format = "__epoch__"
-                return datetime.fromtimestamp(epoch, tz=timezone.utc)
-        except (ValueError, OverflowError):
-            pass
-
-        # Use detected format if available
         if self._detected_date_format:
             try:
-                return datetime.strptime(date_str, self._detected_date_format)
-            except ValueError:
-                pass  # Fall through to auto-detect
+                return _utc(datetime.strptime(date_str, self._detected_date_format))
+            except ValueError as e:
+                raise CSVLoaderError(f"date {date_str!r} does not match the format {self._detected_date_format} of the earlier rows") from e
+
+        if not self.date_format:
+            try:
+                epoch = float(date_str)
+                # Heuristic: if it looks like a Unix timestamp (> year 2000 in seconds)
+                if epoch > 946684800 and date_str.replace(".", "").replace("-", "").isdigit():
+                    self._detected_date_format = "__epoch__"
+                    return datetime.fromtimestamp(epoch, tz=timezone.utc)
+            except (ValueError, OverflowError):
+                pass  # not a number: a text date, detected below
 
         # Use specified format
         if self.date_format:
-            return datetime.strptime(date_str, self.date_format)
+            return _utc(datetime.strptime(date_str, self.date_format))
 
         # Auto-detect format
         for fmt in self.DATE_FORMATS:
             try:
                 result = datetime.strptime(date_str, fmt)
                 self._detected_date_format = fmt  # Cache for future rows
-                return result
+                return _utc(result)
             except ValueError:
                 continue
 
         raise CSVLoaderError(f"Could not parse date: {date_str}")
 
     def _parse_decimal(self, value: str) -> Decimal:
-        """Parse string to Decimal, handling common formats."""
-        value = value.strip().replace(",", "")
-        if not value or value.lower() in ("nan", "null", ""):
-            return Decimal("0")
-        return Decimal(value)
+        """Parse a price cell (thousands commas allowed). An empty, null or non-finite cell is a ValueError:
+        it never becomes a number (iter_bars names the row)."""
+        cell = value.strip().replace(",", "")
+        if not cell or cell.lower() in ("nan", "null"):
+            raise ValueError(f"empty or not-a-number cell {value!r}")
+        result = Decimal(cell)
+        if not result.is_finite():
+            raise ValueError(f"non-finite cell {value!r}")
+        return result
 
     def _parse_int(self, value: str) -> int:
-        """Parse string to int, handling common formats."""
-        value = value.strip().replace(",", "")
-        if not value or value.lower() in ("nan", "null", ""):
-            return 0
-        # Handle float strings like "1000000.0"
-        return int(float(value))
+        """Parse a volume cell; "1000000.0" is accepted, a fractional volume is not. An empty, null or
+        non-finite cell is a ValueError, never 0."""
+        number = self._parse_decimal(value)
+        if number != number.to_integral_value():
+            raise ValueError(f"fractional volume {value!r}")
+        return int(number)
 
     def load_bars(
         self,
@@ -195,13 +227,22 @@ class CSVLoader:
             end: Optional end date filter
 
         Yields:
-            Bar objects
+            Bar objects (timestamps UTC-aware)
+
+        Raises:
+            CSVLoaderError: a row that cannot be read, naming its row number and cells; no row is skipped
+            silently (a blank line holds no data and is not a row)
         """
+        start = _utc(start) if start is not None else None
+        end = _utc(end) if end is not None else None
         with open(self.path, "r", newline="", encoding="utf-8-sig") as f:
             reader = csv.reader(f, delimiter=self.delimiter)
+            rows = _rows(reader, self.path)
 
             # Read and process headers
-            headers = next(reader)
+            headers = next(rows, None)
+            if headers is None:
+                raise CSVLoaderError(f"{self.path}: empty file, no header row")
             headers = [h.strip() for h in headers]
 
             # Find required columns
@@ -218,39 +259,35 @@ class CSVLoader:
                 raise CSVLoaderError(f"Could not find close column. Headers: {headers}")
 
             # Read data rows
-            for row_num, row in enumerate(reader, start=2):
+            needed = max(i for i in (ts_idx, open_idx, high_idx, low_idx, close_idx, volume_idx) if i is not None) + 1
+            for row_num, row in enumerate(rows, start=2):
+                if not row:
+                    continue  # a blank line: no cells, no data
+                if len(row) < needed:
+                    raise CSVLoaderError(f"{self.path}: row {row_num} has {len(row)} cells, {needed} needed: {row!r}")
                 try:
-                    if len(row) < max(ts_idx, close_idx) + 1:
-                        continue  # Skip incomplete rows
-
                     timestamp = self._parse_date(row[ts_idx])
 
-                    # Apply date filters
-                    if start and timestamp < start:
-                        continue
-                    if end and timestamp > end:
-                        continue
-
-                    # Parse OHLCV (use close for missing O/H/L)
+                    # Parse OHLCV before the date filter: a row outside the range is validated too (review c1 S4) (use close for missing O/H/L)
                     close = self._parse_decimal(row[close_idx])
                     open_price = self._parse_decimal(row[open_idx]) if open_idx is not None else close
                     high = self._parse_decimal(row[high_idx]) if high_idx is not None else close
                     low = self._parse_decimal(row[low_idx]) if low_idx is not None else close
                     volume = self._parse_int(row[volume_idx]) if volume_idx is not None else 0
+                except (ValueError, ArithmeticError, CSVLoaderError) as e:
+                    raise CSVLoaderError(f"{self.path}: row {row_num} cannot be read ({e}): {row!r}") from e
 
-                    yield Bar(
-                        symbol=symbol,
-                        timestamp=timestamp,
-                        open=open_price,
-                        high=high,
-                        low=low,
-                        close=close,
-                        volume=volume,
-                    )
-
-                except Exception as e:
-                    logger.warning(f"Error parsing row {row_num}: {e}")
+                if (start and timestamp < start) or (end and timestamp > end):
                     continue
+                yield Bar(
+                    symbol=symbol,
+                    timestamp=timestamp,
+                    open=open_price,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=volume,
+                )
 
     def get_date_range(self) -> tuple[datetime, datetime] | None:
         """

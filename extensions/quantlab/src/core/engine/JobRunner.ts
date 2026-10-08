@@ -210,7 +210,7 @@ export class JobRunner {
 			});
 		});
 
-		this.proc.on('close', (code) => {
+		this.proc.on('close', (code, signal) => {
 			void stdinSettled.then(stdinError => {
 				if (this.finished) {
 					return;
@@ -226,7 +226,7 @@ export class JobRunner {
 					});
 					return;
 				}
-				this.onProcessExit(code);
+				this.onProcessExit(code, signal);
 			});
 		});
 	}
@@ -346,7 +346,7 @@ export class JobRunner {
 		}
 	}
 
-	private onProcessExit(code: number | null): void {
+	private onProcessExit(code: number | null, signal: NodeJS.Signals | null): void {
 		if (this.killTimer) {
 			clearTimeout(this.killTimer);
 			this.killTimer = undefined;
@@ -412,6 +412,19 @@ export class JobRunner {
 				jobId,
 				error: reading.error,
 				stack: reading.stack,
+			});
+			return;
+		}
+
+		// A success on stdout is not a completed job unless the engine also ended normally with code 0: a process
+		// that flushed a result and then exited non-zero, or was killed by a signal, did not finish its run.
+		if (code !== 0 || signal !== null) {
+			const ended = signal !== null ? `was terminated by signal ${signal}` : `exited with code ${code}`;
+			this.emitLog('error', `The engine ${ended} after printing a success result; the result is discarded.`);
+			this.options.onEvent({
+				type: 'failed',
+				jobId,
+				error: `The engine ${ended} after printing a success result, so the job did not complete.`,
 			});
 			return;
 		}

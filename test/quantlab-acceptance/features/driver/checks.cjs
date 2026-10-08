@@ -7,6 +7,7 @@
 // (--extensionTestsPath). Writes one JSON result to QL_FEATURES_RESULT; the launcher judges it.
 // A check that throws is a FAIL with the error's message; nothing here turns an error into a pass.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
@@ -77,6 +78,16 @@ function pinReport() {
 		}
 	}
 	return { ok: missing.length === 0, missing, lines };
+}
+
+/**
+ * window.dialogStyle as the workbench resolved it, policy included: the extension host's configuration is the one the workbench's
+ * own configuration service hands it (user setting overridden by the packaged app's policy), and dialog.contribution.ts picks the
+ * custom or native dialog from the same key. The window driver routes its modal step on this reading, taken when the step is asked.
+ * Undefined if the key does not exist; the window driver then throws [dialog_style_unknown], it is never defaulted here.
+ */
+function dialogStyle() {
+	return vscode.workspace.getConfiguration('window').get('dialogStyle');
 }
 
 function workspaceFile(name) {
@@ -225,11 +236,8 @@ const IMPORT_SETTINGS = { 'editor.fontSize': 17, 'files.trimTrailingWhitespace':
 const IMPORT_KEYBINDING = { key: 'ctrl+alt+q', command: 'workbench.action.files.saveAll' };
 const IMPORT_EXTENSION = 'ms-python.python';
 
-/**
- * Import from a VS Code profile planted in this run's HOME: the settings, the keybinding and the
- * extension set arrive in the app's user directory; the user's previous settings are backed up.
- */
-async function importFromVsCode() {
+/** A VS Code profile planted in this run's HOME: the settings, the keybinding and the extension set the import reads. */
+function plantVsCodeSource() {
 	const home = os.homedir();
 	if (home !== requireEnv('HOME')) {
 		throw new Error(`[home_mismatch] the extension host's home is ${home}, the run set HOME=${process.env.HOME}`);
@@ -240,11 +248,19 @@ async function importFromVsCode() {
 	fs.writeFileSync(path.join(source, 'keybindings.json'), JSON.stringify([IMPORT_KEYBINDING]));
 	fs.mkdirSync(path.join(home, '.vscode', 'extensions'), { recursive: true });
 	fs.writeFileSync(path.join(home, '.vscode', 'extensions', 'extensions.json'), JSON.stringify([{ identifier: { id: IMPORT_EXTENSION } }]));
+}
+
+/**
+ * Import from a VS Code profile planted in this run's HOME: the settings, the keybinding and the
+ * extension set arrive in the app's user directory; the user's previous settings are backed up.
+ */
+async function importFromVsCode() {
+	plantVsCodeSource();
 
 	const user = path.join(requireEnv('QL_FEATURES_USER_DATA'), 'User');
 	const before = JSON.parse(fs.readFileSync(path.join(user, 'settings.json'), 'utf8'));
 	const command = vscode.commands.executeCommand('quantlab.importFromEditor');
-	const modal = await ask(requireEnv('QL_FEATURES_CUES'), 'import-modal', { message: 'Import settings, keybindings and extensions from VS Code?', button: 'Import' }, 120 * 1000);
+	const modal = await ask(requireEnv('QL_FEATURES_CUES'), 'import-modal', { message: 'Import settings, keybindings and extensions from VS Code?', button: 'Import', dialogStyle: dialogStyle() }, 120 * 1000);
 	await command;
 
 	const settings = JSON.parse(fs.readFileSync(path.join(user, 'settings.json'), 'utf8'));
@@ -269,7 +285,47 @@ async function importFromVsCode() {
 	if (extensionsLine !== 'Extensions: 0 installed, 1 already installed, 0 not imported') {
 		throw new Error(`[import_extensions] the report says ${JSON.stringify(extensionsLine)}, expected ${IMPORT_EXTENSION} already installed`);
 	}
-	return { status: 'PASS', detail: `modal "${modal.text}" -> Import; settings ${Object.keys(IMPORT_SETTINGS).join(', ')}; keybinding ${IMPORT_KEYBINDING.key}; ${extensionsLine}; backup ${backups[0]}` };
+	// `modal` (route, texts, buttons, the button pressed) is kept whole: driver-result.json shows WHICH route and button answered.
+	return { status: 'PASS', modal, detail: `modal "${modal.text}" -> ${modal.clicked} (route ${modal.route}); settings ${Object.keys(IMPORT_SETTINGS).join(', ')}; keybinding ${IMPORT_KEYBINDING.key}; ${extensionsLine}; backup ${backups[0]}` };
+}
+
+// Planted into the NAMED profile's own files before the import (a fresh profile has none, and the importer backs a file up only if it
+// existed): editor.fontSize is overwritten by the import, editor.tabSize and the keybinding must survive it.
+const PROFILE_PLANT_SETTINGS = { 'editor.tabSize': 3, 'editor.fontSize': 11 };
+const PROFILE_PLANT_KEYBINDINGS = [{ key: 'ctrl+alt+w', command: 'workbench.action.files.save' }];
+
+function sha256OrAbsent(file) {
+	return fs.existsSync(file) ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
+}
+
+/**
+ * The import in a NAMED profile (the launcher passes `--profile <name>` on a fresh user-data dir, lib.mjs NAMED_PROFILE). Records
+ * the sha256 (null: absent) of the DEFAULT profile's User/settings.json and keybindings.json, plants settings and a keybinding into
+ * the one profile directory's own files, runs the same import with the same modal press, and reports what it did; the launcher reads
+ * the result from disk after the app has exited and lib.mjs judgeImportNamedProfile judges it. Nothing is judged here.
+ */
+async function importIntoNamedProfile() {
+	plantVsCodeSource();
+	const user = path.join(requireEnv('QL_FEATURES_USER_DATA'), 'User');
+	const defaultBefore = { settings: sha256OrAbsent(path.join(user, 'settings.json')), keybindings: sha256OrAbsent(path.join(user, 'keybindings.json')) };
+	const root = path.join(user, 'profiles');
+	const plantedDirs = fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort() : [];
+	let planted;
+	if (plantedDirs.length === 1) {
+		const dir = path.join(root, plantedDirs[0]);
+		for (const file of ['settings.json', 'keybindings.json']) {
+			if (fs.existsSync(path.join(dir, file))) {
+				throw new Error(`[profile_not_fresh] ${path.join(dir, file)} exists before the import; the named profile is not fresh`);
+			}
+		}
+		fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(PROFILE_PLANT_SETTINGS));
+		fs.writeFileSync(path.join(dir, 'keybindings.json'), JSON.stringify(PROFILE_PLANT_KEYBINDINGS));
+		planted = { dir: plantedDirs[0], settings: PROFILE_PLANT_SETTINGS, keybindings: PROFILE_PLANT_KEYBINDINGS };
+	}
+	const command = vscode.commands.executeCommand('quantlab.importFromEditor');
+	const modal = await ask(requireEnv('QL_FEATURES_CUES'), 'import-modal', { message: 'Import settings, keybindings and extensions from VS Code?', button: 'Import', dialogStyle: dialogStyle() }, 120 * 1000);
+	await command;
+	return { planted, plantedDirs, defaultBefore, modal };
 }
 
 /**
@@ -281,10 +337,17 @@ async function packTrigger() {
 	void vscode.window.showInformationMessage('[ql-features control] Install Pylance from the Python extension pack?', 'Install');
 	await new Promise(resolve => setTimeout(resolve, 2000));
 	const toasts = await ask(requireEnv('QL_FEATURES_CUES'), 'toasts', {}, 60 * 1000);
+	const network = requireEnv('QL_FEATURES_NETWORK');
 	let install;
 	try {
-		await vscode.commands.executeCommand('workbench.extensions.installExtension', 'ms-python.debugpy');
-		install = 'ms-python.debugpy installed';
+		const installing = vscode.commands.executeCommand('workbench.extensions.installExtension', 'ms-python.debugpy');
+		// With the gallery reachable the first install from a publisher asks for trust (a modal); a user presses it.
+		// With the network off the gallery query fails first and no prompt is shown.
+		const trust = network === 'on'
+			? await ask(requireEnv('QL_FEATURES_CUES'), 'trust-modal', { message: 'Do you trust the publisher', button: 'Trust Publisher & Install', dialogStyle: dialogStyle() }, 120 * 1000)
+			: undefined;
+		await installing;
+		install = `ms-python.debugpy installed${trust === undefined ? '' : ` (trust prompt "${trust.text}" answered: ${trust.clicked}, route ${trust.route})`}`;
 	} catch (err) {
 		install = `ms-python.debugpy not installed: ${err instanceof Error ? err.message : String(err)}`;
 	}
@@ -308,14 +371,19 @@ exports.run = async function () {
 		result.checks = {
 			'python-intelligence': await guarded(pythonIntelligence),
 			'notebook-cell': await guarded(notebookCell),
-			// These two drive the window through the launcher (cues.cjs); import runs last because it changes the settings.
+			// Driven through the launcher's window driver (cues.cjs).
 			'backtest-bundled-engine': await guarded(backtestBundledEngine),
-			'import': await guarded(importFromVsCode),
 		};
+	} else if (mode === 'import') {
+		// Its own launch: the confirmation is a modal (lib.mjs DIALOG_MODES).
+		result.checks = { 'import': await guarded(importFromVsCode) };
+	} else if (mode === 'import-profile') {
+		// Its own launch in a named profile (lib.mjs DIALOG_MODES, NAMED_PROFILE); judged by the launcher from disk afterwards.
+		result.profileImport = await importIntoNamedProfile();
 	} else if (mode === 'pack-trigger') {
 		result.packTrigger = await packTrigger();
 	} else if (mode !== 'pins') {
-		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all, pins or pack-trigger)`);
+		throw new Error(`[driver_mode_invalid] QL_FEATURES_MODE is ${JSON.stringify(mode)} (expected all, pins, import, import-profile or pack-trigger)`);
 	}
 	fs.writeFileSync(resultPath, JSON.stringify(result, undefined, '\t') + '\n');
 };

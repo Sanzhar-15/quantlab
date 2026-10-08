@@ -13,6 +13,7 @@ export interface ImportPorts {
 		/** Rejects with a Node-style error carrying `.code` (ENOENT when the file does not exist). */
 		readFile(path: string): Promise<string>;
 		writeFile(path: string, text: string): Promise<void>;
+		/** Creates `to` exclusively: rejects with a Node-style error carrying `.code` EEXIST when `to` already exists, and never overwrites it. */
 		copyFile(from: string, to: string): Promise<void>;
 	};
 	gallery: GalleryPort;
@@ -38,21 +39,56 @@ function backupStamp(now: Date): string {
 	return now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 }
 
+/** How many backups of one file taken in the same second are told apart before the import gives up. */
+const MAX_BACKUPS_PER_STAMP = 1000;
+
 /**
- * Writes `text` to `target`; a target that already exists is first copied beside itself.
+ * Writes `text` to `target`; a target that already exists is first copied beside itself, to a name that
+ * did not exist (`<target>.pre-import-<second>`, then `-1`, `-2`, ... when another backup took the name:
+ * the copy is exclusive, so a backup is never overwritten).
  * Returns the backup path, or `undefined` when there was nothing to back up.
  */
 async function writeWithBackup(ports: ImportPorts, target: string, existed: boolean, text: string): Promise<string | undefined> {
 	let backup: string | undefined;
 	if (existed) {
-		backup = `${target}.pre-import-${backupStamp(ports.now())}`;
-		await ports.fs.copyFile(target, backup);
+		const base = `${target}.pre-import-${backupStamp(ports.now())}`;
+		for (let n = 0; backup === undefined; n++) {
+			if (n >= MAX_BACKUPS_PER_STAMP) {
+				throw new Error(`[backup_names_exhausted] Quantlab: ${MAX_BACKUPS_PER_STAMP} backups named ${base}[-n] already exist; nothing was written to ${target}.`);
+			}
+			const candidate = n === 0 ? base : `${base}-${n}`;
+			try {
+				await ports.fs.copyFile(target, candidate);
+				backup = candidate;
+			} catch (err: unknown) {
+				if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+					throw err;
+				}
+			}
+		}
 	}
 	await ports.fs.writeFile(target, text);
 	return backup;
 }
 
+// One import at a time: an import reads the target files, merges and writes them back, so two interleaved
+// imports would lose one another's changes. A second import while one is running is REFUSED by name (not
+// queued): the user sees why, and nothing waits on state it cannot see.
+let importInFlight = false;
+
 export async function runImport(snapshot: EditorSnapshot, target: ImportTarget, ports: ImportPorts): Promise<ImportReport> {
+	if (importInFlight) {
+		throw new Error('[import_in_progress] Quantlab: another import is still running; wait for it to finish, then import again.');
+	}
+	importInFlight = true;
+	try {
+		return await importOnce(snapshot, target, ports);
+	} finally {
+		importInFlight = false;
+	}
+}
+
+async function importOnce(snapshot: EditorSnapshot, target: ImportTarget, ports: ImportPorts): Promise<ImportReport> {
 	let settings: ImportReport['settings'];
 	if (snapshot.settings !== undefined) {
 		const text = await readOptional(ports.fs, target.settingsPath);
