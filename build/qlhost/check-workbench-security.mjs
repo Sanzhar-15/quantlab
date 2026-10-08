@@ -17,8 +17,8 @@
 // `return isWorkbenchFrame(parent, policy);`) -> rows 2, 7, 10, 10a, 12, 13, 14, 15, 16 RED;
 // (f) the `await this.qlRegisterFrame(encodedWebviewOrigin, targetWindow);` line removed from browser/webviewElement.ts ->
 // row 18 RED; (g) webviewRegistry.ts `bind` without its live-frame test (the `const bound` line and its `if` block) ->
-// rows 13, 16 RED; (h) c3: securityPolicy.ts isOwnedFrame's post-write branch (`return ownedIndexAuthority(parent, policy, webviews) ===
-// document.authority;` under the index.html rule) as `return false;` -> row 19 RED; (i) that branch as `return true;` -> row 19 RED.
+// rows 13, 16 RED; (h) c3: securityPolicy.ts isOwnedFrame's index.html rule widened as adb6f9a0044 had it (an index.html
+// under ownedIndexAuthority(parent) of the same authority is owned) -> row 19 RED.
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -428,31 +428,29 @@ const securityOf = contents => {
 }
 
 {
-	// 19 (review c3 M2/M3): the content frame after stock index.html writes its document (contentDocument.open/write/close)
-	// reports its writer's URL, index.html, under the registered webview's own frame. Owned there, one level only, same authority.
+	// 19 (review c3 M2/M3), the shape MEASURED on a package (folds/HOST/PKG-C3-JUDGE.md): after stock index.html writes its
+	// content document, the main process reports the content frame at fake.html under the registered webview's own frame
+	// (a write commits no navigation). That frame is owned and granted. An index.html under an index.html is never reported
+	// and is NOT owned (no rule widened for it).
 	const s = scene();
 	registry.register(s.contents, 'a', 'aaaa');
 	const bound = s.add('', s.top, 'a');
 	s.go(bound, INDEX_A);
 	const content = s.add('', bound, '');
 	const loads = s.go(content, FAKE_A);
-	content.url = INDEX_A; // the write: no navigation event, the frame now reports index.html
-	const blank = s.add('about:blank', content, '');
-	const deeper = s.add(INDEX_A, content, '');
-	const otherAuthority = s.add(INDEX_B, bound, '');
-	const navToIndex = s.go(s.add('', bound, ''), INDEX_A);
+	const indexChild = s.add(INDEX_A, bound, '');
 	const twin = s.add(INDEX_A, s.top, 'twin');
-	const twinContent = s.add(INDEX_A, twin, '');
+	const twinContent = s.add(FAKE_A, twin, '');
 	const webviews = registry.of(s.contents);
 	const owned = f => policyMod.isOwnedFrame(f, policy, webviews);
-	const grants = frames => GRANTED.map(p => policyMod.isGrantedPermission(contentsOf(s.top, frames), p, INDEX_A, false, { ...policy, webviews: () => webviews }));
-	const legit = grants([bound, content]);
-	const withTwin = grants([bound, content, twin, twinContent]);
-	const twinAlone = grants([twin, twinContent]);
-	const ok = loads && owned(content) && owned(blank) && !owned(deeper) && !owned(otherAuthority) && !navToIndex && !owned(twinContent)
-		&& legit.every(v => v === true) && withTwin.every(v => v === false) && twinAlone.every(v => v === false);
-	row('19 post-write content frame (index.html under the bound index.html) is owned, both permissions granted; deeper, other-authority, navigated-to and twin-held ones are not', ok,
-		`fake.html load ${loads}; content owned ${owned(content)}; blank under it ${owned(blank)}; deeper index.html ${owned(deeper)}; other authority ${owned(otherAuthority)}; navigation to index.html ${navToIndex}; twin content ${owned(twinContent)}; granted legit [${legit}], with twin [${withTwin}], twin alone [${twinAlone}]`);
+	const grants = (frames, url) => GRANTED.map(p => policyMod.isGrantedPermission(contentsOf(s.top, frames), p, url, false, { ...policy, webviews: () => webviews }));
+	const reported = grants([bound, content], FAKE_A);
+	const indexUnder = grants([bound, indexChild], INDEX_A);
+	const twinHeld = grants([bound, content, twin, twinContent], FAKE_A);
+	const ok = loads && owned(content) && !owned(indexChild) && !owned(twinContent)
+		&& reported.every(v => v === true) && indexUnder.every(v => v === false) && twinHeld.every(v => v === false);
+	row('19 measured content shape: fake.html under the bound index.html is owned and granted; index.html under index.html is not; a twin-held URL is denied', ok,
+		`fake.html load ${loads}; content (fake.html) owned ${owned(content)}; index.html under index.html owned ${owned(indexChild)}; twin content owned ${owned(twinContent)}; granted reported [${reported}], index.html-under-index [${indexUnder}], twin-held [${twinHeld}]`);
 }
 
 console.log(rows.join('\n'));

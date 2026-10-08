@@ -98,17 +98,14 @@ function isWorkbenchFrame(frame: IQlFrame, policy: IQlFramePolicy): boolean {
 	return frame.parent === null && isWorkbenchDocument(frame.url, policy);
 }
 
-/**
- * The webview authority of a registered webview's own frame (an `index.html` directly under the workbench document, bound to
- * that authority), or undefined when `frame` is not one. Only this frame's children are its content.
- */
+/** The webview authority of an owned `index.html` frame, or undefined when `frame` is not one. */
 function ownedIndexAuthority(frame: IQlFrame, policy: IQlFramePolicy, webviews: IQlWebviewRegistrations): string | undefined {
 	const document = parseDocument(frame.url);
-	if (!document || document.scheme !== policy.webviewScheme || document.path !== '/index.html' || frame.parent === null || !isWorkbenchFrame(frame.parent, policy)) {
+	if (!document || document.scheme !== policy.webviewScheme || document.path !== '/index.html') {
 		return undefined;
 	}
 
-	return webviews.boundAuthority(frame.frameTreeNodeId) === document.authority ? document.authority : undefined;
+	return isOwnedFrame(frame, policy, webviews) ? document.authority : undefined;
 }
 
 /** Whether `frame`, as it is now, is an owned document. A top frame is owned only as the workbench document. */
@@ -132,14 +129,11 @@ export function isOwnedFrame(frame: IQlFrame, policy: IQlFramePolicy, webviews: 
 	}
 
 	if (document.path === '/index.html') {
-		if (isWorkbenchFrame(parent, policy)) {
-			return webviews.boundAuthority(frame.frameTreeNodeId) === document.authority;
-		}
-
-		// review c3 M2/M3: the webview's content frame. Stock index.html loads it at fake.html and then writes its document
-		// (`contentDocument.open/write/close`), after which the frame reports its writer's URL: this index.html. It is owned
-		// under the registered webview's own frame of the same authority, one level only (a deeper index.html is not).
-		return ownedIndexAuthority(parent, policy, webviews) === document.authority;
+		// review c3 M2/M3, measured on a package (folds/HOST/PKG-C3-JUDGE.md): after stock index.html writes its content
+		// document (`contentDocument.open/write/close`), the main process still reports that frame at fake.html (a write
+		// commits no navigation), so the content frame is the fake.html rule below. An index.html is owned only as the
+		// registered webview's own frame, directly under the workbench.
+		return isWorkbenchFrame(parent, policy) && webviews.boundAuthority(frame.frameTreeNodeId) === document.authority;
 	}
 
 	if (document.path === '/fake.html') {
