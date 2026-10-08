@@ -9,6 +9,10 @@
 // driven with fakes (rows 1-4); its source and app.ts are read for the wiring (rows 5-6).
 // Run from the fork root: `node build/qlhost/check-keychain-gate.mjs src/vs`; rc 0 = GREEN.
 // Negatives: 49e35049609's encryptionMainService.ts -> rows 1-5 RED; 49e35049609's app.ts -> row 6 RED.
+// F-PERF-LZ1-1 (row 6's new form): the service is taken in the SYNCHRONOUS createQlStartServices (from the accessor); the hook
+// awaits the services, attaches, reports, and holds nothing else (no catch: a rejection fails the start at before-show); the
+// services promise is the deferred itself, nothing chained on it. Negatives: (c) a try/catch around the hook's await -> row 6 RED;
+// (d) a second terminalHostKeychainPhaseSettled() call -> row 6 RED; (e) adb6f9a0044's app.ts (the synchronous hook) -> row 6 RED.
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -122,15 +126,19 @@ row('5 every Keychain safeStorage call sits in keychainCall, after its own wait 
 	direct.length === 3 && gated.every(entry => entry.endsWith(' true')), `${direct.length} direct call site(s); gated: ${gated.join(', ')}`);
 
 const app = readFileSync(join(vs, 'code/electron-main/app.ts'), 'utf8');
-const startAt = app.indexOf('private async startQlTerminalHost(');
+const startAt = app.indexOf('\tprivate createQlStartServices(accessor: ServicesAccessor, initialProtocolUrls: IInitialProtocolUrls | undefined): QlStartServices {');
+const startEnd = startAt < 0 ? -1 : app.indexOf('\n\t}\n', startAt);
 const takenAt = app.indexOf('const encryptionMainService = this.requireQlEncryptionMainService(accessor.get(IEncryptionMainService));', startAt);
-const firstAwait = startAt < 0 ? -1 : app.indexOf('await ', startAt);
+const synchronous = startAt >= 0 && !app.slice(startAt, startEnd).includes('await ') && app.slice(startAt, startEnd).includes('return { qlWorkbenchHost, encryptionMainService };');
+const firstAwait = startEnd;
+const passed = (app.match(/this\.startQlTerminalHost\(qlServices\.p\)/g)?.length ?? 0) === 1 && !/qlServices\.p\.(then|catch|finally)\(|\bservices\.(then|catch|finally)\(/.test(app)
+	&& /\} catch \(error\) \{\n\t\t\tqlServices\.error\(error\);\n\t\t\tthrow error;\n\t\t\}\n\t\tqlServices\.complete\(qlStartServices\);/.test(app);
 const reports = app.match(/\.terminalHostKeychainPhaseSettled\(\)/g)?.length ?? 0;
-const inHook = /onBeforeShow: started => \{\n\t\t\t\tqlWorkbenchHost\.attach\(started\);\n\t\t\t\tencryptionMainService\.terminalHostKeychainPhaseSettled\(\);\n\t\t\t\}/.test(app);
+const inHook = /onBeforeShow: async started => \{\n\t\t\t\tconst \{ qlWorkbenchHost, encryptionMainService \} = await services;\n\t\t\t\tqlWorkbenchHost\.attach\(started\);\n\t\t\t\tencryptionMainService\.terminalHostKeychainPhaseSettled\(\);\n\t\t\t\}/.test(app);
 const required = /private requireQlEncryptionMainService\(service: IEncryptionMainService\): EncryptionMainService \{\n\t\tif \(!\(service instanceof EncryptionMainService\)\) \{\n\t\t\tthrow new Error\(/.test(app);
-row('6 app.ts reports the phase once, from onBeforeShow after the attach, to the registered service taken before the first await',
-	startAt >= 0 && takenAt > startAt && takenAt < firstAwait && reports === 1 && inHook && required,
-	`service taken before the first await ${takenAt > startAt && takenAt < firstAwait}, ${reports} report call(s), in onBeforeShow after attach ${inHook}, instanceof guard ${required}`);
+row('6 app.ts reports the phase once, from onBeforeShow after awaiting the services and the attach, to the registered service taken synchronously',
+	startAt >= 0 && takenAt > startAt && takenAt < firstAwait && synchronous && passed && reports === 1 && inHook && required,
+	`service taken in the synchronous createQlStartServices ${takenAt > startAt && takenAt < firstAwait && synchronous}, services passed uncaught ${passed}, ${reports} report call(s), in onBeforeShow (await, attach, report; nothing else) ${inHook}, instanceof guard ${required}`);
 
 console.log(rows.join('\n'));
 if (problems.length) {
