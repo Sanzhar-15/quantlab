@@ -61,9 +61,17 @@ suite('DataService: host refusals reach the caller unchanged (QL-DATA ERR)', () 
 		clearHost();
 	});
 
+	// The complete IPC-DATA Code population (IPC-DATA.md line 21); 'server' also with a status.
 	const cases: [string, Error & { code: string; status?: number }][] = [
 		['identity-changed', refusal('identity-changed', 'review identity changed')],
+		['not-signed-in', refusal('not-signed-in', 'not signed in')],
+		['no-route', refusal('no-route', 'no route')],
+		['not-available', refusal('not-available', 'not available')],
+		['bad-request', refusal('bad-request', 'bad request')],
+		['too-large', refusal('too-large', 'too large')],
+		['forbidden', refusal('forbidden', 'forbidden')],
 		['cancelled', refusal('cancelled', 'cancelled')],
+		['server', refusal('server', 'server failure')],
 		['server with a status', refusal('server', 'bad gateway', 502)],
 	];
 
@@ -96,6 +104,33 @@ suite('DataService: host refusals reach the caller unchanged (QL-DATA ERR)', () 
 		await assert.rejects(
 			() => DataService.getInstance().getOHLCVFromServer('TEST', '1D'),
 			(error: Error) => error !== rejection && /^Failed to fetch data from server: Unexpected \/v1\/bars response shape: null$/.test(error.message)
+		);
+	});
+
+	// Planted negative control: restore `typeof error === 'object' && error !== null && typeof error.code === 'string'` as
+	// the whole of isHostRefusal -> both tests below fail (the injected object comes back unwrapped).
+	test('a Node errno error (ECONNRESET) is not a host refusal: it gets the server-fetch wrapper', async () => {
+		rejection = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET', errno: -104, syscall: 'read' });
+		await assert.rejects(
+			() => DataService.getInstance().getOHLCVFromServer('TEST', '1D'),
+			(error: Error & { code?: unknown }) => error !== rejection && error.code === undefined && /^Failed to fetch data from server: read ECONNRESET$/.test(error.message)
+		);
+		assert.strictEqual(hostCalls, 1);
+	});
+
+	test('a plain object with an unrelated string code is not a host refusal: it gets the server-fetch wrapper', async () => {
+		rejection = { code: 'SOMETHING_ELSE', message: 'not an Error' };
+		await assert.rejects(
+			() => DataService.getInstance().getOHLCVFromServer('TEST', '1D'),
+			(error: Error & { code?: unknown }) => error !== rejection && error instanceof Error && error.code === undefined && /^Failed to fetch data from server: \[object Object\]$/.test(error.message)
+		);
+	});
+
+	test('a plain object carrying a host code is still not an Error, so it is wrapped', async () => {
+		rejection = { code: 'identity-changed', message: 'not an Error' };
+		await assert.rejects(
+			() => DataService.getInstance().getOHLCVFromServer('TEST', '1D'),
+			(error: Error & { code?: unknown }) => error !== rejection && error instanceof Error && /^Failed to fetch data from server: /.test(error.message)
 		);
 	});
 

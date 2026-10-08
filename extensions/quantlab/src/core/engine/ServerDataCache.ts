@@ -136,16 +136,26 @@ export class ServerDataCache {
 	}
 
 	/**
-	 * Deletes every run file this instance wrote and has not disposed (a run
-	 * still in flight at deactivation). Each failure is logged, then all are
-	 * thrown together. A file whose unlink failed stays owned by the retired
-	 * instance, so its RunDataFile.dispose() can still delete it.
+	 * Retired instances that still own run files whose unlink failed in a reset. The singleton is cleared by every
+	 * reset (getInstance() throws until initialize() again), but ownership of an undeleted file is not dropped: the
+	 * next explicit resetInstance() reaches these instances too, however many initialize() calls came between.
+	 */
+	private static readonly retired: ServerDataCache[] = [];
+
+	/**
+	 * Deletes every run file the current instance and every earlier failed-reset instance wrote and has not disposed
+	 * (a run still in flight at deactivation). Each failure is logged, then all are thrown together. A file whose
+	 * unlink failed stays owned: its RunDataFile.dispose() can still delete it, and so can the next explicit
+	 * resetInstance(). Nothing is retried by itself.
 	 */
 	static resetInstance(): void {
+		const targets = ServerDataCache.retired.splice(0);
 		if (ServerDataCache.instance) {
-			const instance = ServerDataCache.instance;
+			targets.push(ServerDataCache.instance);
 			ServerDataCache.instance = undefined;
-			const failures: string[] = [];
+		}
+		const failures: string[] = [];
+		for (const instance of targets) {
 			for (const runPath of Array.from(instance.liveRunFiles)) {
 				try {
 					fs.unlinkSync(runPath);
@@ -160,9 +170,12 @@ export class ServerDataCache {
 					failures.push(message);
 				}
 			}
-			if (failures.length) {
-				throw new Error(`ServerDataCache: ${failures.length} run data file(s) could not be deleted: ${failures.join('; ')}`);
+			if (instance.liveRunFiles.size > 0) {
+				ServerDataCache.retired.push(instance);
 			}
+		}
+		if (failures.length) {
+			throw new Error(`ServerDataCache: ${failures.length} run data file(s) could not be deleted: ${failures.join('; ')}`);
 		}
 	}
 

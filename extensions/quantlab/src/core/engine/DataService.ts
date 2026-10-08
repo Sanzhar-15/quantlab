@@ -27,11 +27,32 @@ export interface MarketDataResult {
 }
 
 /**
- * True for a host rejection: an Error carrying the string `code` the host gave it (and `status` for a server error).
- * Classified by the code, never by the message text, as `isHostDataError` does for one named code.
+ * Every code a host refusal can carry: IPC-DATA `Code` (folds/QL-G-LOGIN+DATA/IPC-DATA.md line 21), the same population
+ * as QUANTLAB_HOST_ERROR_CODES in src/vs/workbench/services/quantlabHostIdentity/common/quantlabHostIdentity.ts (lines
+ * 67-77). KNOWN DUPLICATION: the extension's own declaration (QuantlabHostErrorCode in core/host/quantlabHost.d.ts:30) lists
+ * only four of the nine, and the extension cannot import the workbench file, so the list is written here until that
+ * declaration is completed. A code added on the host side must be added here too.
+ */
+const HOST_REFUSAL_CODES: ReadonlySet<string> = new Set([
+	'identity-changed',
+	'not-signed-in',
+	'no-route',
+	'not-available',
+	'bad-request',
+	'too-large',
+	'forbidden',
+	'cancelled',
+	'server',
+]);
+
+/**
+ * True for a host rejection: an Error (the ext-host bridge always rejects with one, `toRequestError` in
+ * extHostQuantlabHost.ts) whose `code` is one of the host's codes (and `status` for a server error). The bridge's Error
+ * has no class or name of its own, so the code population is the only marker; an Error with any other code (a Node errno
+ * such as ECONNRESET) or a non-Error object is not a host refusal and is wrapped by the caller.
  */
 function isHostRefusal(error: unknown): error is Error & { readonly code: string; readonly status?: number } {
-	return typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string';
+	return error instanceof Error && 'code' in error && typeof error.code === 'string' && HOST_REFUSAL_CODES.has(error.code);
 }
 
 /**

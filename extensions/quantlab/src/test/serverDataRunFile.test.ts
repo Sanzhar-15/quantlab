@@ -219,6 +219,69 @@ suite('Q-2 (a): per-run server-data files', () => {
 			assert.ok(!fs.existsSync(partialPath));
 		});
 
+		test('partial write whose cleanup AND first reset both fail EBUSY: the second explicit reset still reaches the file (3 attempts, none left)', async () => {
+			// NEGATIVE CONTROL: drop `ServerDataCache.retired` -- i.e. make resetInstance forget the instance after a failed
+			// pass (clear the singleton, never keep a failed instance reachable) -> the second reset finds nothing: 2
+			// attempts, the partial file remains -> RED.
+			const instance = ServerDataCache.getInstance();
+			(fsModule.promises as unknown as { writeFile: unknown }).writeFile = async (target: string, data: string, options: object): Promise<void> => {
+				await realWriteFile(target, data.slice(0, 10), options as fs.WriteFileOptions);
+				throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' });
+			};
+			ebusyBudget = 2;
+
+			await assert.rejects(
+				() => instance.writeRunFile(SOURCE, '1D'),
+				/Failed to write run data file .*EIO.*removing the partial file also failed: EBUSY/
+			);
+			const [partial] = fs.readdirSync(runDir);
+			assert.ok(partial, 'the partial file is left behind');
+			const partialPath = path.join(runDir, partial);
+			assert.strictEqual(attempts.length, 1);
+
+			assert.throws(() => ServerDataCache.resetInstance(), /1 run data file\(s\) could not be deleted.*EBUSY/);
+			assert.strictEqual(attempts.length, 2);
+			assert.ok(owned(partialPath, instance), 'the failed reset keeps the path owned');
+			assert.ok(fs.existsSync(partialPath));
+
+			ServerDataCache.resetInstance();
+			assert.deepStrictEqual(attempts, [
+				`unlink ${partial}`,
+				`unlinkSync ${partial}`,
+				`unlinkSync ${partial}`,
+			]);
+			assert.ok(!owned(partialPath, instance));
+			assert.ok(!fs.existsSync(partialPath), 'no file remains');
+			assert.deepStrictEqual(fs.readdirSync(runDir), []);
+
+			ServerDataCache.resetInstance();
+			assert.strictEqual(attempts.length, 3, 'a reset after success does nothing');
+		});
+
+		test('a run file whose dispose fails: the first explicit reset fails too, the second succeeds and only then releases the path', async () => {
+			// NEGATIVE CONTROL: as above -- a reset that forgets its instance after a failed pass leaves the file, owned
+			// only by an instance no later reset reaches -> the third attempt never happens -> RED.
+			const instance = ServerDataCache.getInstance();
+			const runFile = await instance.writeRunFile(SOURCE, '1D');
+			ebusyBudget = 2;
+
+			await assert.rejects(() => runFile.dispose(), /EBUSY/);
+			assert.ok(owned(runFile.path, instance));
+
+			assert.throws(() => ServerDataCache.resetInstance(), /1 run data file\(s\) could not be deleted.*EBUSY/);
+			assert.ok(owned(runFile.path, instance), 'the path is not released by a failed reset');
+			assert.ok(fs.existsSync(runFile.path));
+			assert.strictEqual(attempts.length, 2);
+
+			ServerDataCache.resetInstance();
+			assert.strictEqual(attempts.length, 3);
+			assert.ok(!owned(runFile.path, instance), 'released only after the successful reset');
+			assert.ok(!fs.existsSync(runFile.path));
+
+			await runFile.dispose();
+			assert.strictEqual(attempts.length, 3, 'a dispose after success does nothing');
+		});
+
 		test('partial-write cleanup that succeeds releases the path at once', async () => {
 			const instance = ServerDataCache.getInstance();
 			(fsModule.promises as unknown as { writeFile: unknown }).writeFile = async (target: string, data: string, options: object): Promise<void> => {
