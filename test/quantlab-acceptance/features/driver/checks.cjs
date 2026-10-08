@@ -79,6 +79,16 @@ function pinReport() {
 	return { ok: missing.length === 0, missing, lines };
 }
 
+/**
+ * window.dialogStyle as the workbench resolved it, policy included: the extension host's configuration is the one the workbench's
+ * own configuration service hands it (user setting overridden by the packaged app's policy), and dialog.contribution.ts picks the
+ * custom or native dialog from the same key. The window driver routes its modal step on this reading, taken when the step is asked.
+ * Undefined if the key does not exist; the window driver then throws [dialog_style_unknown], it is never defaulted here.
+ */
+function dialogStyle() {
+	return vscode.workspace.getConfiguration('window').get('dialogStyle');
+}
+
 function workspaceFile(name) {
 	const folders = vscode.workspace.workspaceFolders;
 	if (folders === undefined || folders.length !== 1) {
@@ -244,7 +254,7 @@ async function importFromVsCode() {
 	const user = path.join(requireEnv('QL_FEATURES_USER_DATA'), 'User');
 	const before = JSON.parse(fs.readFileSync(path.join(user, 'settings.json'), 'utf8'));
 	const command = vscode.commands.executeCommand('quantlab.importFromEditor');
-	const modal = await ask(requireEnv('QL_FEATURES_CUES'), 'import-modal', { message: 'Import settings, keybindings and extensions from VS Code?', button: 'Import' }, 120 * 1000);
+	const modal = await ask(requireEnv('QL_FEATURES_CUES'), 'import-modal', { message: 'Import settings, keybindings and extensions from VS Code?', button: 'Import', dialogStyle: dialogStyle() }, 120 * 1000);
 	await command;
 
 	const settings = JSON.parse(fs.readFileSync(path.join(user, 'settings.json'), 'utf8'));
@@ -269,7 +279,8 @@ async function importFromVsCode() {
 	if (extensionsLine !== 'Extensions: 0 installed, 1 already installed, 0 not imported') {
 		throw new Error(`[import_extensions] the report says ${JSON.stringify(extensionsLine)}, expected ${IMPORT_EXTENSION} already installed`);
 	}
-	return { status: 'PASS', detail: `modal "${modal.text}" -> Import; settings ${Object.keys(IMPORT_SETTINGS).join(', ')}; keybinding ${IMPORT_KEYBINDING.key}; ${extensionsLine}; backup ${backups[0]}` };
+	// `modal` (route, texts, buttons, the button pressed) is kept whole: driver-result.json shows WHICH route and button answered.
+	return { status: 'PASS', modal, detail: `modal "${modal.text}" -> ${modal.clicked} (route ${modal.route}); settings ${Object.keys(IMPORT_SETTINGS).join(', ')}; keybinding ${IMPORT_KEYBINDING.key}; ${extensionsLine}; backup ${backups[0]}` };
 }
 
 /**
@@ -288,10 +299,10 @@ async function packTrigger() {
 		// With the gallery reachable the first install from a publisher asks for trust (a modal); a user presses it.
 		// With the network off the gallery query fails first and no prompt is shown.
 		const trust = network === 'on'
-			? await ask(requireEnv('QL_FEATURES_CUES'), 'trust-modal', { message: 'Do you trust the publisher', button: 'Trust Publisher & Install' }, 120 * 1000)
+			? await ask(requireEnv('QL_FEATURES_CUES'), 'trust-modal', { message: 'Do you trust the publisher', button: 'Trust Publisher & Install', dialogStyle: dialogStyle() }, 120 * 1000)
 			: undefined;
 		await installing;
-		install = `ms-python.debugpy installed${trust === undefined ? '' : ` (trust prompt "${trust.text}" answered)`}`;
+		install = `ms-python.debugpy installed${trust === undefined ? '' : ` (trust prompt "${trust.text}" answered: ${trust.clicked}, route ${trust.route})`}`;
 	} catch (err) {
 		install = `ms-python.debugpy not installed: ${err instanceof Error ? err.message : String(err)}`;
 	}

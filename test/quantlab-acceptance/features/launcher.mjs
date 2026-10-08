@@ -103,8 +103,9 @@ async function launch(bundle, dir, mode, python, network) {
 	const window = async () => cdp ??= await connect(await waitForEndpoint(logPath, 60_000), CDP_ANSWER_MS);
 	const served = serve(cues, {
 		'backtest-form': async args => backtestForm(await window(), args),
-		'import-modal': async args => pressModal(await window(), args),
-		'trust-modal': async args => pressModal(await window(), args),
+		// child.pid: the app's main process, whose native dialogs the native route reads (window.mjs pressModal).
+		'import-modal': async args => pressModal(await window(), args, child.pid),
+		'trust-modal': async args => pressModal(await window(), args, child.pid),
 		'toasts': async () => ({ texts: await readToasts(await window()) }),
 	}, () => exited).then(names => ({ names }), err => ({ error: err instanceof Error ? err.message : String(err) }));
 	let closeError;
