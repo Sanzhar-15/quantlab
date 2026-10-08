@@ -116,6 +116,13 @@ export class ServerDataCache {
 	private readonly liveRunFiles = new Set<string>();
 	/** Disposals in flight, so two concurrent disposes of one file share ONE unlink attempt. */
 	private readonly disposalsInFlight = new Map<string, Promise<void>>();
+	/**
+	 * Owned paths whose write has started and not settled: the file may not exist yet and can still appear. Nothing
+	 * releases such a path, not even ENOENT; the writer itself settles its ownership (see writeRunFile).
+	 */
+	private readonly pendingWrites = new Set<string>();
+	/** Set by resetInstance: a reset instance creates no new run file, and a write that was pending deletes its own file. */
+	private closed = false;
 
 	private constructor(context: vscode.ExtensionContext) {
 		this.runDir = path.join(context.globalStorageUri.fsPath, 'server-data-cache');
@@ -147,6 +154,10 @@ export class ServerDataCache {
 	 * (a run still in flight at deactivation). Each failure is logged, then all are thrown together. A file whose
 	 * unlink failed stays owned: its RunDataFile.dispose() can still delete it, and so can the next explicit
 	 * resetInstance(). Nothing is retried by itself.
+	 *
+	 * A run that has not created its file yet is closed, not forgotten: a writeRunFile still waiting for its data
+	 * writes nothing and rejects; a write in flight is reported here as a failure, stays owned (its instance stays
+	 * reachable by the next reset), and its writer deletes the file when the write settles.
 	 */
 	static resetInstance(): void {
 		const targets = ServerDataCache.retired.splice(0);
@@ -156,7 +167,15 @@ export class ServerDataCache {
 		}
 		const failures: string[] = [];
 		for (const instance of targets) {
+			instance.closed = true;
 			for (const runPath of Array.from(instance.liveRunFiles)) {
+				if (instance.pendingWrites.has(runPath)) {
+					// The write can still create the file after any unlink made now: the path stays owned.
+					const message = `${runPath}: its write is still in flight (the writer deletes the file when the write settles)`;
+					console.error(`ServerDataCache: failed to delete run data file ${message}`);
+					failures.push(message);
+					continue;
+				}
 				try {
 					fs.unlinkSync(runPath);
 					instance.liveRunFiles.delete(runPath);
@@ -195,10 +214,13 @@ export class ServerDataCache {
 	): Promise<RunDataFile> {
 		// Validate symbol to prevent header injection attacks
 		this.validateSymbol(source.symbol);
+		this.assertNotReset(source.symbol);
 
 		const result = await DataService.getInstance().getOHLCVFromServer(
 			source.symbol, timeframe, range, undefined, source.assetClass
 		);
+		// A reset while the data was awaited: no file is created after it (nothing is awaited from here to the write).
+		this.assertNotReset(source.symbol);
 
 		if (result.data.length === 0) {
 			throw new Error(`No data available for ${source.symbol}`);
@@ -225,9 +247,11 @@ export class ServerDataCache {
 		const sanitized = source.symbol.replace(/[^a-zA-Z0-9]/g, '_');
 		const runPath = path.join(this.runDir, `run-${process.pid}-${sanitized}_${timeframe}_${randomUUID()}.csv`);
 		this.liveRunFiles.add(runPath);
+		this.pendingWrites.add(runPath);
 		try {
 			await fsPromises.writeFile(runPath, header + rows, { encoding: 'utf8', flag: 'wx' });
 		} catch (error) {
+			this.pendingWrites.delete(runPath);
 			const writeMessage = error instanceof Error ? error.message : String(error);
 			if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
 				// 'wx' refused: the file at this path is not ours, so it is never unlinked and never owned.
@@ -245,6 +269,19 @@ export class ServerDataCache {
 				}
 			}
 			throw new Error(`Failed to write run data file ${runPath}: ${writeMessage}`);
+		}
+		this.pendingWrites.delete(runPath);
+
+		if (this.closed) {
+			// Reset during the write: the run gets no file. A failed unlink keeps the path owned by this instance,
+			// which that reset kept reachable, so the next resetInstance tries again.
+			try {
+				await this.unlinkOwned(runPath);
+			} catch (cleanupError) {
+				const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+				throw new Error(`ServerDataCache was reset while run data file ${runPath} was being written; deleting it failed: ${cleanupMessage}`);
+			}
+			throw new Error(`ServerDataCache was reset while run data file ${runPath} was being written: the file was deleted`);
 		}
 
 		return {
@@ -286,6 +323,12 @@ export class ServerDataCache {
 			throw error;
 		}
 		this.liveRunFiles.delete(runPath);
+	}
+
+	private assertNotReset(symbol: string): void {
+		if (this.closed) {
+			throw new Error(`ServerDataCache was reset: no run data file is written for ${symbol}`);
+		}
 	}
 
 	/**

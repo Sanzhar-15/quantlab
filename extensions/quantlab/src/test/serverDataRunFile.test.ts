@@ -31,10 +31,12 @@ suite('Q-2 (a): per-run server-data files', () => {
 	let runDir = '';
 	let calls = 0;
 	let omitVolume = false;
+	let barsGate: Promise<void> | undefined;
 	const originalGetInstance = ServerApiClient.getInstance;
 	const fakeClient = {
 		getBars: async (): Promise<ServerBar[]> => {
 			calls++;
+			await barsGate;
 			const end = Date.now();
 			return [0, 1, 2].map(i => ({
 				symbol: 'TEST',
@@ -61,6 +63,7 @@ suite('Q-2 (a): per-run server-data files', () => {
 	setup(() => {
 		calls = 0;
 		omitVolume = false;
+		barsGate = undefined;
 		_resetShimState();
 		DataService.resetInstance();
 		storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ql-rundata-'));
@@ -280,6 +283,125 @@ suite('Q-2 (a): per-run server-data files', () => {
 
 			await runFile.dispose();
 			assert.strictEqual(attempts.length, 3, 'a dispose after success does nothing');
+		});
+
+		// F-QLLD-2 c2-1: a reset must not release a path while an operation can still create its file. A write in flight
+		// keeps its path owned through the reset and its writer deletes the file when the write settles; a run still
+		// waiting for its data creates nothing after the reset.
+		const deferWrites = (settle: (target: string, data: string, options: fs.WriteFileOptions) => Promise<void>) => {
+			let release: () => void = () => undefined;
+			let entered: () => void = () => undefined;
+			const gate = new Promise<void>(resolve => { release = resolve; });
+			const started = new Promise<void>(resolve => { entered = resolve; });
+			(fsModule.promises as unknown as { writeFile: unknown }).writeFile = async (target: string, data: string, options: object): Promise<void> => {
+				entered();
+				await gate;
+				await settle(target, data, options as fs.WriteFileOptions);
+			};
+			return { release, started };
+		};
+		const pendingPath = (instance: ServerDataCache): string => {
+			const pending = Array.from((instance as unknown as { pendingWrites: Set<string> }).pendingWrites);
+			assert.strictEqual(pending.length, 1, 'exactly one write is in flight');
+			return pending[0];
+		};
+
+		test('reset before a pending write creates its file: the path stays owned, the writer deletes the file when the write lands, none left', async () => {
+			// NEGATIVE CONTROL: drop the `pendingWrites` branch of resetInstance and the `if (this.closed)` block after
+			// the write -> the reset meets ENOENT and releases the path, the write then lands and resolves with a file
+			// nobody owns: the call resolves instead of rejecting and the file remains -> RED.
+			const instance = ServerDataCache.getInstance();
+			const deferred = deferWrites((target, data, options) => realWriteFile(target, data, options));
+			const writing = instance.writeRunFile(SOURCE, '1D');
+			const outcome = writing.then(() => 'resolved', (error: Error) => error.message);
+			await deferred.started;
+			const runPath = pendingPath(instance);
+
+			assert.throws(() => ServerDataCache.resetInstance(), /1 run data file\(s\) could not be deleted.*its write is still in flight/);
+			assert.deepStrictEqual(attempts, [], 'no unlink can settle a file that does not exist yet');
+			assert.ok(owned(runPath, instance), 'the reset keeps the pending path owned');
+			assert.deepStrictEqual(fs.readdirSync(runDir), []);
+
+			deferred.release();
+			assert.match(await outcome, /was reset while run data file .* was being written: the file was deleted/);
+			assert.deepStrictEqual(attempts, [`unlink ${path.basename(runPath)}`]);
+			assert.ok(!owned(runPath, instance));
+			assert.deepStrictEqual(fs.readdirSync(runDir), [], 'no file remains');
+
+			ServerDataCache.resetInstance();
+			assert.strictEqual(attempts.length, 1, 'a reset after the writer settled does nothing');
+		});
+
+		test('reset before a pending write lands, then the writer\'s delete fails EBUSY: the next explicit reset still reaches the file', async () => {
+			// NEGATIVE CONTROL: make resetInstance skip a pending path without keeping its instance (`retired`) -> the
+			// writer's failed delete leaves a file no reset reaches: 1 attempt, the file remains -> RED.
+			const instance = ServerDataCache.getInstance();
+			const deferred = deferWrites((target, data, options) => realWriteFile(target, data, options));
+			const outcome = instance.writeRunFile(SOURCE, '1D').then(() => 'resolved', (error: Error) => error.message);
+			await deferred.started;
+			const runPath = pendingPath(instance);
+
+			assert.throws(() => ServerDataCache.resetInstance(), /its write is still in flight/);
+			ServerDataCache.initialize({ globalStorageUri: { fsPath: storageRoot } } as unknown as vscode.ExtensionContext);
+			ebusyBudget = 1;
+			deferred.release();
+			assert.match(await outcome, /was reset while run data file .* was being written; deleting it failed: EBUSY/);
+			assert.ok(owned(runPath, instance), 'the failed delete keeps the path owned');
+			assert.ok(fs.existsSync(runPath));
+
+			ServerDataCache.resetInstance();
+			assert.deepStrictEqual(attempts, [`unlink ${path.basename(runPath)}`, `unlinkSync ${path.basename(runPath)}`]);
+			assert.ok(!owned(runPath, instance));
+			assert.deepStrictEqual(fs.readdirSync(runDir), [], 'no file remains');
+		});
+
+		test('reset before a pending write FAILS with a partial file whose cleanup fails EBUSY: the next explicit reset still reaches it', async () => {
+			const instance = ServerDataCache.getInstance();
+			const deferred = deferWrites(async (target, data, options) => {
+				await realWriteFile(target, data.slice(0, 10), options);
+				throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' });
+			});
+			const outcome = instance.writeRunFile(SOURCE, '1D').then(() => 'resolved', (error: Error) => error.message);
+			await deferred.started;
+			const runPath = pendingPath(instance);
+
+			assert.throws(() => ServerDataCache.resetInstance(), /its write is still in flight/);
+			ebusyBudget = 1;
+			deferred.release();
+			assert.match(await outcome, /Failed to write run data file .*EIO.*removing the partial file also failed: EBUSY/);
+			assert.ok(owned(runPath, instance));
+			assert.ok(fs.existsSync(runPath), 'the partial file is left behind');
+
+			ServerDataCache.resetInstance();
+			assert.ok(!owned(runPath, instance));
+			assert.deepStrictEqual(fs.readdirSync(runDir), [], 'no file remains');
+		});
+
+		test('reset while a run still waits for its data: the run rejects and creates no file', async () => {
+			// NEGATIVE CONTROL: drop the assertNotReset call after the data fetch -> the run writes its file on the reset
+			// instance and resolves; no later reset reaches it -> RED.
+			const instance = ServerDataCache.getInstance();
+			let writes = 0;
+			(fsModule.promises as unknown as { writeFile: unknown }).writeFile = async (target: string, data: string, options: object): Promise<void> => {
+				writes++;
+				await realWriteFile(target, data, options as fs.WriteFileOptions);
+			};
+			let releaseBars: () => void = () => undefined;
+			barsGate = new Promise<void>(resolve => { releaseBars = resolve; });
+			const outcome = instance.writeRunFile(SOURCE, '1D').then(() => 'resolved', (error: Error) => error.message);
+			while (calls === 0) {
+				await new Promise<void>(resolve => setImmediate(resolve));
+			}
+
+			ServerDataCache.resetInstance();
+			releaseBars();
+			assert.match(await outcome, /ServerDataCache was reset: no run data file is written for TEST/);
+			assert.strictEqual(writes, 0, 'no write was started');
+			assert.deepStrictEqual(attempts, []);
+			assert.deepStrictEqual(fs.readdirSync(runDir), []);
+
+			await assert.rejects(() => instance.writeRunFile(SOURCE, '1D'), /ServerDataCache was reset/);
+			assert.strictEqual(calls, 1, 'a reset instance does not fetch either');
 		});
 
 		test('partial-write cleanup that succeeds releases the path at once', async () => {
