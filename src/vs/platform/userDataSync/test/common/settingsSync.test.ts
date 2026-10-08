@@ -5,7 +5,9 @@
 
 import assert from 'assert';
 import { VSBuffer } from '../../../../base/common/buffer.js';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Event } from '../../../../base/common/event.js';
+import { IRequestContext, IRequestOptions } from '../../../../base/parts/request/common/request.js';
 import { runWithFakedTimers } from '../../../../base/test/common/timeTravelScheduler.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { IConfigurationService } from '../../../configuration/common/configuration.js';
@@ -593,11 +595,98 @@ suite('SettingsSync - Manual', () => {
 
 });
 
+// The shared test server keeps the URL, type and headers of a request but not its body. This one also keeps the body of every
+// settings upload (a POST to `.../resource/settings`, in the default profile or in a collection), so a test can inspect all of them.
+class BodyRecordingTestServer extends UserDataSyncTestServer {
+
+	private _settingsPostBodies: string[] = [];
+	get settingsPostBodies(): readonly string[] { return this._settingsPostBodies; }
+	clearSettingsPostBodies(): void { this._settingsPostBodies = []; }
+
+	override async request(options: IRequestOptions, token: CancellationToken): Promise<IRequestContext> {
+		if (options.type === 'POST' && options.url?.endsWith(`/resource/${SyncResource.Settings}`)) {
+			if (typeof options.data !== 'string') {
+				throw new Error(`a settings POST to ${options.url} carries no string body`);
+			}
+			this._settingsPostBodies.push(options.data);
+		}
+		return super.request(options, token);
+	}
+}
+
+const neverSyncedKeys = ['qic.demo.email', 'qic.demo.password'];
+
+// A settings upload body as a client sends it: the ISyncData envelope around the ISettingsSyncContent around the settings text.
+function toSettingsPostBody(settings: Record<string, unknown>): string {
+	const syncData: ISyncData = { version: 2, machineId: 'client-before-sync-1', content: JSON.stringify({ settings: JSON.stringify(settings, null, '\t') }) };
+	return JSON.stringify(syncData);
+}
+
+// Every settings upload body must carry neither never-synced key nor any of the sentinel values. The opt-in entry `-<key>` of
+// `settingsSync.ignoredSettings` names a key without carrying a setting, so that one form is allowed in the raw text; any other
+// occurrence of a key name is a leak, and so is a key as an own property of the parsed settings. Throws on the first leak; the
+// message names the body (by position) that carries it. An empty list passes: a caller that expects uploads passes a minimum count.
+function assertNoNeverSyncedInPostBodies(bodies: readonly string[], sentinels: readonly string[], message: string): void {
+	bodies.forEach((body, index) => {
+		const where = `${message}: settings POST body #${index}`;
+		for (const sentinel of sentinels) {
+			assert.ok(!body.includes(sentinel), `${where} carries sentinel ${sentinel}`);
+		}
+		let rest = body;
+		for (const key of neverSyncedKeys) {
+			rest = rest.split(`"-${key}`).join('"');
+		}
+		for (const key of neverSyncedKeys) {
+			assert.ok(!rest.includes(key), `${where} names ${key}`);
+		}
+		const parsed: Record<string, unknown> = JSON.parse(parseSettings(body));
+		for (const key of neverSyncedKeys) {
+			assert.ok(!Object.prototype.hasOwnProperty.call(parsed, key), `${where} holds ${key} as a setting`);
+		}
+	});
+}
+
+// The inspection helper itself, with its negative control: it must fail on a credential-bearing upload even when a clean upload
+// follows it and the final remote state is clean (what a check of the latest remote content alone cannot see).
+suite('SettingsSync - never-synced settings (SYNC-1) - upload body inspection', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	const sentinels = ['SENTINEL-dirty-not-a-real-address', 'SENTINEL-dirty-not-a-real-value'];
+	const dirtyPair = { 'qic.demo.email': sentinels[0], 'qic.demo.password': sentinels[1] };
+	const optIn = { 'settingsSync.ignoredSettings': ['-qic.demo.email', '-qic.demo.password'] };
+
+	test('a clean upload passes, the opt-in entries included, and no upload passes', () => {
+		assertNoNeverSyncedInPostBodies([], sentinels, 'none');
+		assertNoNeverSyncedInPostBodies([toSettingsPostBody({ 'a': 1 }), toSettingsPostBody({ 'a': 2, ...optIn })], sentinels, 'clean');
+	});
+
+	test('negative control: a credential-bearing upload followed by a clean one fails, whatever the final state', () => {
+		const dirtyBody = toSettingsPostBody({ 'a': 1, ...dirtyPair });
+		const cleanBody = toSettingsPostBody({ 'a': 1 });
+		assert.throws(() => assertNoNeverSyncedInPostBodies([dirtyBody, cleanBody], sentinels, 'two uploads'), /settings POST body #0 /);
+		assert.throws(() => assertNoNeverSyncedInPostBodies([cleanBody, dirtyBody, cleanBody], sentinels, 'three uploads'), /settings POST body #1 /);
+		assert.doesNotThrow(() => assertNoNeverSyncedInPostBodies([cleanBody], sentinels, 'the clean final state alone'));
+	});
+
+	test('each leak form fails on its own: a sentinel value, a key name, a key as a setting', () => {
+		assert.throws(() => assertNoNeverSyncedInPostBodies([toSettingsPostBody({ 'a': sentinels[0] })], sentinels, 'sentinel under another key'), /carries sentinel/);
+		assert.throws(() => assertNoNeverSyncedInPostBodies([toSettingsPostBody({ 'qic.demo.email': 'x' })], sentinels, 'key with a non-sentinel value'), /names qic.demo.email/);
+		assert.throws(() => assertNoNeverSyncedInPostBodies([toSettingsPostBody({ 'a': ['qic.demo.password'] })], sentinels, 'key name as a value'), /names qic.demo.password/);
+		assert.throws(() => assertNoNeverSyncedInPostBodies([toSettingsPostBody({ 'a': ['-qic.demo.password', 'qic.demo.password'] })], sentinels, 'opt-in form next to the bare name'), /names qic.demo.password/);
+	});
+
+	test('an unparseable body is an error, not a pass', () => {
+		assert.throws(() => assertNoNeverSyncedInPostBodies(['not json'], sentinels, 'garbage'), SyntaxError);
+	});
+});
+
 // QuantLab carry SYNC-1, c1 repair M2: the synchroniser never uploads the never-synced pair, also when the remote already holds
 // it (applyResult rebuilds the upload against the remote), and content it writes to the local file keeps the local values.
+// c1 repair S5: every settings upload body after any deliberate seeding is inspected, not only the latest remote content.
 suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 
-	const server = new UserDataSyncTestServer();
+	const server = new BodyRecordingTestServer();
 	let client: UserDataSyncClient;
 	let testObject: SettingsSynchroniser;
 
@@ -608,6 +697,7 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 	const disposableStore = ensureNoDisposablesAreLeakedInTestSuite();
 
 	setup(async () => {
+		server.clearSettingsPostBodies();
 		client = disposableStore.add(new UserDataSyncClient(server));
 		await client.setUp(true);
 		testObject = client.getSynchronizer(SyncResource.Settings) as SettingsSynchroniser;
@@ -616,10 +706,19 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 	const remotePair = { 'qic.demo.email': 'SENTINEL-remote-not-a-real-address', 'qic.demo.password': 'SENTINEL-remote-not-a-real-value' };
 	const localPair = { 'qic.demo.email': 'SENTINEL-local-not-a-real-address', 'qic.demo.password': 'SENTINEL-local-not-a-real-value' };
 
-	// What a client from before SYNC-1 left on the server.
+	// What a client from before SYNC-1 left on the server. The seeding upload deliberately carries the pair, so it is not one of the
+	// bodies the tests inspect: the recording starts again after it.
 	async function seedRemote(settings: Record<string, unknown>): Promise<void> {
-		const syncData: ISyncData = { version: 2, machineId: 'client-before-sync-1', content: JSON.stringify({ settings: JSON.stringify(settings, null, '\t') }) };
-		await client.instantiationService.get(IUserDataSyncStoreService).writeResource(SyncResource.Settings, JSON.stringify(syncData), null);
+		await client.instantiationService.get(IUserDataSyncStoreService).writeResource(SyncResource.Settings, toSettingsPostBody(settings), null);
+		server.clearSettingsPostBodies();
+	}
+
+	const allSentinels = [...Object.values(remotePair), ...Object.values(localPair)];
+
+	// Every settings upload since the setup or the last seeding, not only what the remote holds at the end.
+	function assertEveryUploadHoldsNoPair(message: string, minimumUploads: number): void {
+		assert.ok(server.settingsPostBodies.length >= minimumUploads, `${message}: expected at least ${minimumUploads} settings uploads, recorded ${server.settingsPostBodies.length}`);
+		assertNoNeverSyncedInPostBodies(server.settingsPostBodies, allSentinels, message);
 	}
 
 	test('accepting local uploads content without the pair the remote holds', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
@@ -633,6 +732,7 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 		const { content } = await client.read(testObject.resource);
 		assert.ok(content !== null);
 		assert.deepStrictEqual(JSON.parse(parseSettings(content)), { 'b': 2 });
+		assertEveryUploadHoldsNoPair('accept local', 1);
 	}));
 
 	test('accepting the remote keeps the local values of the pair, never the remote ones', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
@@ -646,6 +746,7 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 		const settingsResource = client.instantiationService.get(IUserDataProfilesService).defaultProfile.settingsResource;
 		const local = (await client.instantiationService.get(IFileService).readFile(settingsResource)).value.toString();
 		assert.deepStrictEqual(JSON.parse(local), { 'a': 1, ...localPair });
+		assertEveryUploadHoldsNoPair('accept remote', 0);
 	}));
 
 	// The opt-back-in form of `settingsSync.ignoredSettings`, read by the real ConfigurationService from the local settings file.
@@ -654,6 +755,13 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 	async function readLocalSettings(): Promise<unknown> {
 		const settingsResource = client.instantiationService.get(IUserDataProfilesService).defaultProfile.settingsResource;
 		return JSON.parse((await client.instantiationService.get(IFileService).readFile(settingsResource)).value.toString());
+	}
+
+	// The opt-in as the configuration service holds it: the user value of `settingsSync.ignoredSettings` read from the local file.
+	// Without this the uploaded array alone would not show that the opt-in was in force when the upload was built.
+	function assertOptInHeldByConfigurationService(): void {
+		const inspected = client.instantiationService.get(IConfigurationService).inspect<string[]>('settingsSync.ignoredSettings');
+		assert.deepStrictEqual(inspected.userValue, optBackIn['settingsSync.ignoredSettings'], 'the configuration service must hold the opt-back-in entries');
 	}
 
 	// The opt-in entries themselves name the keys, so the uploaded content is checked as parsed settings (own properties) and for the sentinel values.
@@ -673,8 +781,10 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 	test('user opts both keys back in: first auto sync uploads neither key and the local file keeps them', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		const local = { 'a': 1, ...localPair, ...optBackIn };
 		await updateSettings(JSON.stringify(local), client);
+		assertOptInHeldByConfigurationService();
 
 		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
+		assertEveryUploadHoldsNoPair('first sync', 1);
 
 		const uploaded = await assertRemoteHoldsNoPair('first sync');
 		assert.strictEqual(uploaded['a'], 1, 'the ordinary setting must reach the remote');
@@ -684,15 +794,19 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 
 	test('user opts both keys back in: a later sync of an unrelated change uploads neither key and the local file keeps them', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		await updateSettings(JSON.stringify({ 'a': 1, ...localPair, ...optBackIn }), client);
+		assertOptInHeldByConfigurationService();
 		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
 		await assertRemoteHoldsNoPair('first sync');
+		assertEveryUploadHoldsNoPair('first sync', 1);
 
 		const changed = { 'a': 2, ...localPair, ...optBackIn };
 		await updateSettings(JSON.stringify(changed), client);
+		assertOptInHeldByConfigurationService();
 		await testObject.sync(await client.getLatestRef(SyncResource.Settings));
 
 		const uploaded = await assertRemoteHoldsNoPair('later sync');
 		assert.strictEqual(uploaded['a'], 2, 'the unrelated change must reach the remote');
+		assertEveryUploadHoldsNoPair('later sync', 2);
 		assert.deepStrictEqual(await readLocalSettings(), changed);
 	}));
 
@@ -700,6 +814,7 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 		await seedRemote({ 'a': 1, ...remotePair });
 		const local = { 'b': 2, ...localPair, ...optBackIn };
 		await updateSettings(JSON.stringify(local), client);
+		assertOptInHeldByConfigurationService();
 
 		const preview = await testObject.sync(await client.getLatestRef(SyncResource.Settings), true);
 		await testObject.accept(preview!.resourcePreviews[0].localResource);
@@ -707,6 +822,7 @@ suite('SettingsSync - never-synced settings (SYNC-1)', () => {
 
 		const uploaded = await assertRemoteHoldsNoPair('accept local');
 		assert.strictEqual(uploaded['b'], 2, 'the ordinary setting must reach the remote');
+		assertEveryUploadHoldsNoPair('accept local', 1);
 		assert.deepStrictEqual(await readLocalSettings(), local);
 	}));
 
