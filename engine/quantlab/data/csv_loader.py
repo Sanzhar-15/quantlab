@@ -25,6 +25,19 @@ class CSVLoaderError(Exception):
     pass
 
 
+def _rows(reader, path: Path) -> Iterator[list[str]]:
+    """The reader's rows; an error of the csv module itself (a field over csv.field_size_limit(), a bad quote)
+    is a CSVLoaderError naming the file and the line, never a bare csv.Error (review c1 S2)."""
+    while True:
+        try:
+            row = next(reader)
+        except StopIteration:
+            return
+        except csv.Error as e:
+            raise CSVLoaderError(f"{path}: line {reader.line_num} cannot be read by the csv module ({e})") from e
+        yield row
+
+
 def _utc(value: datetime) -> datetime:
     """The one timezone rule of this loader: a naive datetime is UTC (as backtest() reads its start/end);
     an aware one is converted to UTC. Every timestamp it yields and both filters go through here, so the
@@ -43,6 +56,11 @@ class CSVLoader:
     - Column mapping for different schemas
     - Date filtering
     - Lazy loading via iterator
+
+    Timestamps: a naive timestamp (no offset in the file or the format) is UTC, as backtest() reads its
+    start/end; a file written in a local exchange time must be converted, or given a format with %z,
+    before loading. Every cell of every row is validated, inside the date range or not: a file with one
+    unreadable row is rejected as a whole, naming the row.
 
     Usage:
         loader = CSVLoader("data/SPY.csv")
@@ -219,9 +237,12 @@ class CSVLoader:
         end = _utc(end) if end is not None else None
         with open(self.path, "r", newline="", encoding="utf-8-sig") as f:
             reader = csv.reader(f, delimiter=self.delimiter)
+            rows = _rows(reader, self.path)
 
             # Read and process headers
-            headers = next(reader)
+            headers = next(rows, None)
+            if headers is None:
+                raise CSVLoaderError(f"{self.path}: empty file, no header row")
             headers = [h.strip() for h in headers]
 
             # Find required columns
@@ -239,7 +260,7 @@ class CSVLoader:
 
             # Read data rows
             needed = max(i for i in (ts_idx, open_idx, high_idx, low_idx, close_idx, volume_idx) if i is not None) + 1
-            for row_num, row in enumerate(reader, start=2):
+            for row_num, row in enumerate(rows, start=2):
                 if not row:
                     continue  # a blank line: no cells, no data
                 if len(row) < needed:
@@ -247,31 +268,26 @@ class CSVLoader:
                 try:
                     timestamp = self._parse_date(row[ts_idx])
 
-                    # Apply date filters
-                    if start and timestamp < start:
-                        continue
-                    if end and timestamp > end:
-                        continue
-
-                    # Parse OHLCV (use close for missing O/H/L)
+                    # Parse OHLCV before the date filter: a row outside the range is validated too (review c1 S4) (use close for missing O/H/L)
                     close = self._parse_decimal(row[close_idx])
                     open_price = self._parse_decimal(row[open_idx]) if open_idx is not None else close
                     high = self._parse_decimal(row[high_idx]) if high_idx is not None else close
                     low = self._parse_decimal(row[low_idx]) if low_idx is not None else close
                     volume = self._parse_int(row[volume_idx]) if volume_idx is not None else 0
-
-                    yield Bar(
-                        symbol=symbol,
-                        timestamp=timestamp,
-                        open=open_price,
-                        high=high,
-                        low=low,
-                        close=close,
-                        volume=volume,
-                    )
-
                 except (ValueError, ArithmeticError, CSVLoaderError) as e:
                     raise CSVLoaderError(f"{self.path}: row {row_num} cannot be read ({e}): {row!r}") from e
+
+                if (start and timestamp < start) or (end and timestamp > end):
+                    continue
+                yield Bar(
+                    symbol=symbol,
+                    timestamp=timestamp,
+                    open=open_price,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=volume,
+                )
 
     def get_date_range(self) -> tuple[datetime, datetime] | None:
         """

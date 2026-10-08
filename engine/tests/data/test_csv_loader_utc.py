@@ -1,11 +1,12 @@
 """F-ENGINE-CSV-1: the CSV loader's one UTC rule and its named row errors (no row dropped silently)."""
 
+import csv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from quantlab.data.csv_loader import CSVLoader, CSVLoaderError
+from quantlab.data.csv_loader import CSVLoader, CSVLoaderError, _utc
 from quantlab.data.loader import load_data
 
 UTC = timezone.utc
@@ -95,3 +96,41 @@ def test_an_epoch_number_after_text_dates_is_a_named_error(tmp_path):
     path = write(tmp_path, daily(1) + "1735776000,1,1,1,1,1\n")
     with pytest.raises(CSVLoaderError, match=r"row 3 cannot be read \(date '1735776000' does not match the format %Y-%m-%d"):
         CSVLoader(path).load_bars("BARS")
+
+
+def test_a_directory_with_one_bad_file_fails_naming_it_not_a_partial_dataset(tmp_path):
+    # Review c1 M1: _load_directory caught every error and continued with the other files.
+    (tmp_path / "good.csv").write_text("date,close,volume\n2025-01-01,1,100\n")
+    (tmp_path / "bad.csv").write_text("date,close,volume\n2025-01-01,1,100\n2025-01-02,1,nan\n")
+    with pytest.raises(CSVLoaderError, match=r"bad\.csv: row 3 cannot be read"):
+        load_data(tmp_path)
+
+
+def test_a_csv_module_error_is_named_with_the_file_and_line(tmp_path):
+    # Review c1 S2: a field over csv.field_size_limit() raised a bare csv.Error.
+    path = write(tmp_path, daily(1) + "2025-01-02,1,1,1,1," + "9" * (csv.field_size_limit() + 1) + "\n")
+    with pytest.raises(CSVLoaderError, match=r"bars\.csv: line 3 cannot be read by the csv module \(field larger than field limit"):
+        CSVLoader(path).load_bars("BARS")
+
+
+def test_an_empty_file_is_a_named_error(tmp_path):
+    path = tmp_path / "empty.csv"
+    path.write_text("")
+    with pytest.raises(CSVLoaderError, match=r"empty\.csv: empty file, no header row"):
+        CSVLoader(path).load_bars("BARS")
+
+
+def test_an_offset_timestamp_is_converted_to_utc(tmp_path):
+    # Review c1 S3: the filter test passed without the conversion; this one reads the clock time and the zone.
+    path = write(tmp_path, "2025-01-01T02:00:00+0200,1,1,1,1,1\n")
+    bar = CSVLoader(path, date_format="%Y-%m-%dT%H:%M:%S%z").load_bars("BARS")[0]
+    assert bar.timestamp == datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
+    assert bar.timestamp.tzinfo is UTC
+    assert _utc(datetime(2025, 1, 3, 1, tzinfo=timezone(timedelta(hours=2)))).tzinfo is UTC
+
+
+def test_a_bad_cell_outside_the_date_range_still_rejects_the_file(tmp_path):
+    # Review c1 S4: cells were parsed only inside the range, so the claim "every bad cell is an error" did not hold.
+    path = write(tmp_path, "2025-01-01,1,1,1,1,1\n2025-01-02,1,1,1,nan,1\n")
+    with pytest.raises(CSVLoaderError, match=r"row 3 cannot be read"):
+        CSVLoader(path).load_bars("BARS", None, datetime(2025, 1, 1))

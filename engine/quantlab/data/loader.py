@@ -141,14 +141,11 @@ def _load_directory(
     if not files:
         raise DataLoaderError(f"No data files found in directory: {path}")
 
+    # A file that cannot be loaded fails the whole directory with its own error (it names the file and row):
+    # skipping it would hand the backtest a partial dataset (F-ENGINE-CSV-1 review c1 M1).
     for file_path in sorted(files):
-        try:
-            file_symbol = symbol or file_path.stem.upper()
-            bars = load_data(file_path, file_symbol, start, end, **kwargs)
-            all_bars.extend(bars)
-        except Exception as e:
-            logger.warning(f"Error loading {file_path}: {e}")
-            continue
+        file_symbol = symbol or file_path.stem.upper()
+        all_bars.extend(load_data(file_path, file_symbol, start, end, **kwargs))
 
     return sorted(all_bars, key=lambda b: b.timestamp)
 
