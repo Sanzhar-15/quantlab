@@ -51,6 +51,37 @@ suite('import – merge', () => {
 		assert.strictEqual(result.duplicates, 1);
 	});
 
+	// QL-G-FEAT c2 M4: a conflict is decided as the editor resolves keys, not by comparing the `key` strings.
+	test('keybindings: another spelling of the same key between two occurrences of A is a conflict, so A is kept last', () => {
+		for (const spelling of ['Cmd+K', 'cmd-k', ' cmd+k ', 'meta+k', 'win+k', 'CMD-K']) {
+			const other = { key: spelling, command: 'two' };
+			assert.deepStrictEqual(mergeKeybindings([A, other], [A]).merged, [other, A], `existing [A, ${JSON.stringify(spelling)}], imported [A]`);
+			assert.deepStrictEqual(mergeKeybindings([], [A, other, A]).merged, [other, A], `imported [A, ${JSON.stringify(spelling)}, A]`);
+		}
+	});
+
+	test('keybindings: modifiers in another order are the same key', () => {
+		const first = { key: 'shift+cmd+k', command: 'one' };
+		const other = { key: 'cmd+shift+k', command: 'two' };
+		assert.deepStrictEqual(mergeKeybindings([first, other], [first]).merged, [other, first]);
+	});
+
+	test('keybindings: a chord sequence that begins with the key, or that the key begins, is a conflict', () => {
+		const longer = { key: 'cmd+k cmd+x', command: 'two' };
+		assert.deepStrictEqual(mergeKeybindings([A, longer], [A]).merged, [longer, A]);
+		assert.deepStrictEqual(mergeKeybindings([], [A, longer, A]).merged, [longer, A]);
+		const chord = { key: 'Cmd+K  Cmd+X', command: 'one' };
+		const prefix = { key: 'cmd-k', command: 'two' };
+		assert.deepStrictEqual(mergeKeybindings([chord, prefix], [chord]).merged, [prefix, chord]);
+	});
+
+	test('keybindings: a different key, or a chord sequence that differs in its first chord, is no conflict', () => {
+		for (const key of ['cmd+j', 'cmd+j cmd+k', 'ctrl+k', 'cmd+shift+k', 'k']) {
+			const other = { key, command: 'two' };
+			assert.deepStrictEqual(mergeKeybindings([A, other], [A]).merged, [A, other], `key ${JSON.stringify(key)}`);
+		}
+	});
+
 	test('keybindings: an identical re-import with no conflicting binding in between adds nothing and moves nothing', () => {
 		const C = { key: 'cmd+j', command: 'three' };
 		for (const existing of [[A], [A, C], [C, A], [B, A], [A, B]]) {

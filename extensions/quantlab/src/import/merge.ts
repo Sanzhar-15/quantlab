@@ -59,15 +59,54 @@ export interface KeybindingsMerge {
 	duplicates: number;
 }
 
-/** The `key` string of a keybinding entry, or undefined when the entry has none (then it conflicts with nothing). */
-function keybindingKey(entry: unknown): string | undefined {
-	return isPlainObject(entry) && typeof entry.key === 'string' ? entry.key : undefined;
+const KEY_MODIFIER = /^(ctrl|shift|alt|meta|win|cmd)[+-]/;
+
+/**
+ * The chords of a keybinding entry's `key`, read as the editor reads them (src/vs/base/common/keybindingParser.ts):
+ * lower case, surrounding whitespace ignored, modifiers in any order and separated by `+` or `-`, `meta`, `win` and
+ * `cmd` one modifier, chords separated by a space. Undefined when the entry has no key string or the string holds no
+ * chord (then it conflicts with nothing).
+ */
+function keybindingChords(entry: unknown): string[] | undefined {
+	if (!isPlainObject(entry) || typeof entry.key !== 'string') {
+		return undefined;
+	}
+	const chords: string[] = [];
+	let input = entry.key.toLowerCase().trim();
+	while (input.length > 0) {
+		const modifiers = new Set<string>();
+		for (let match = KEY_MODIFIER.exec(input); match; match = KEY_MODIFIER.exec(input)) {
+			modifiers.add(match[1] === 'win' || match[1] === 'cmd' ? 'meta' : match[1]);
+			input = input.substring(match[0].length);
+		}
+		const space = input.indexOf(' ');
+		const key = space > 0 ? input.substring(0, space) : input;
+		input = space > 0 ? input.substring(space).trim() : '';
+		// A space cannot be part of a key, so it separates the modifiers from the key without ambiguity (`ctrl++`, `ctrl+-`).
+		chords.push(`${['ctrl', 'shift', 'alt', 'meta'].filter(modifier => modifiers.has(modifier)).join('+')} ${key}`);
+	}
+	return chords.length > 0 ? chords : undefined;
+}
+
+/**
+ * Two bindings compete for a key press, as in the editor's resolver, when their chord sequences are equal or one is
+ * the beginning of the other (`ctrl+k` and `ctrl+k ctrl+x`: the longer one makes the shorter wait for a second chord).
+ */
+function chordsConflict(a: string[], b: string[]): boolean {
+	const shared = Math.min(a.length, b.length);
+	for (let i = 0; i < shared; i++) {
+		if (a[i] !== b[i]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /**
  * Existing entries first, then the imported ones; later entries win in VS Code, so order is precedence.
  * An imported entry equal to one already present is not added again, but it is not allowed to lose
- * precedence either: when a different entry bound to the same key sits between its first and its last
+ * precedence either: when a different entry competing for the same key press (the same chords however they are
+ * spelled, or a chord sequence one of which begins the other) sits between its first and its last
  * occurrence in existing + imported (`[A, B, A]` for two commands on one key), the LAST occurrence is
  * kept and the earlier ones dropped, so A still wins over B; when nothing conflicts between them, the
  * first occurrence stays where it is, so an identical re-import changes nothing. Existing entries that
@@ -87,10 +126,11 @@ export function mergeKeybindings(existing: unknown[], imported: unknown[]): Keyb
 		}
 		const first = indices[0];
 		const last = indices[indices.length - 1];
-		const key = keybindingKey(sequence[first]);
+		const chords = keybindingChords(sequence[first]);
 		let conflictBetween = false;
-		for (let j = first + 1; j < last && key !== undefined; j++) {
-			if (canon[j] !== c && keybindingKey(sequence[j]) === key) {
+		for (let j = first + 1; j < last && chords !== undefined; j++) {
+			const other = canon[j] !== c ? keybindingChords(sequence[j]) : undefined;
+			if (other !== undefined && chordsConflict(chords, other)) {
 				conflictBetween = true;
 				break;
 			}
