@@ -135,6 +135,7 @@ export class WebviewHtmlAnalysis {
 	private names: Map<string, ts.Node[]> | undefined;
 	private computed: ts.ElementAccessExpression[] | undefined;
 	private castList: (ts.AsExpression | ts.TypeAssertion)[] | undefined;
+	private reflectiveList: ts.CallExpression[] | undefined;
 
 	constructor(program: ts.Program, private readonly srcRoot: string) {
 		this.checker = program.getTypeChecker();
@@ -427,9 +428,14 @@ export class WebviewHtmlAnalysis {
 					&& ((this.symbolOf(parent.expression)?.flags ?? 0) & ts.SymbolFlags.Class) !== 0) {
 					continue;
 				}
-				// A typed receiver that an instance of this class is not assignable to holds one only through a cast (failed below).
+				// A typed receiver that an instance of this class is not assignable to holds one only through a cast (failed below), or
+				// through any, unknown or a value this check does not follow: skipped only when its value is traced, else it fails.
 				if (found !== undefined && instance !== undefined && ts.isPropertyAccessExpression(parent) && parent.name === occurrence
 					&& !this.checker.isTypeAssignableTo(instance, this.checker.getTypeAtLocation(parent.expression))) {
+					const untraced = this.untracedProvenance(parent.expression, 0);
+					if (untraced !== undefined) {
+						failures.push(`${this.where(occurrence)}: ${member} is reached through a receiver whose value is not traced to its declared type, so it may be an instance of ${owner?.name} (${untraced})`);
+					}
 					continue;
 				}
 				const call = calleeCall(occurrence);
@@ -453,6 +459,142 @@ export class WebviewHtmlAnalysis {
 			}
 		}
 		return out;
+	}
+
+	/**
+	 * Why a receiver's value is not traced to an origin of its declared type, or undefined when it is. Traced: a fresh `new` or
+	 * literal, `this`, a const's initializer or an unwritten parameter's arguments at every call site, through parentheses, casts
+	 * and conditionals, with no step typed any or unknown. Anything else (any, unknown, a call's return, a member read, a mutable
+	 * binding) is named.
+	 */
+	private untracedProvenance(value: ts.Expression, depth: number): string | undefined {
+		const type = this.checker.getTypeAtLocation(value);
+		if ([type, ...(type.isUnionOrIntersection() ? type.types : [])].some(t => (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0)) {
+			return `${this.where(value)}: ${short(value)} is any or unknown`;
+		}
+		if (depth > MAX_TRACE_DEPTH) {
+			return `${this.where(value)}: ${short(value)} is beyond the trace depth`;
+		}
+		if (ts.isParenthesizedExpression(value) || ts.isAsExpression(value) || ts.isTypeAssertionExpression(value)
+			|| ts.isNonNullExpression(value) || ts.isSatisfiesExpression(value)) {
+			return this.untracedProvenance(value.expression, depth + 1);
+		}
+		if (ts.isConditionalExpression(value)) {
+			return this.untracedProvenance(value.whenTrue, depth + 1) ?? this.untracedProvenance(value.whenFalse, depth + 1);
+		}
+		if (value.kind === ts.SyntaxKind.ThisKeyword || value.kind === ts.SyntaxKind.NullKeyword || ts.isNewExpression(value)
+			|| (ts.isIdentifier(value) && value.text === 'undefined' && this.symbolOf(value)?.valueDeclaration === undefined) || ts.isObjectLiteralExpression(value)
+			|| ts.isArrayLiteralExpression(value) || ts.isStringLiteralLike(value) || ts.isTemplateExpression(value) || ts.isNumericLiteral(value)) {
+			return undefined;
+		}
+		if (ts.isIdentifier(value)) {
+			const declaration = this.symbolOf(value)?.valueDeclaration;
+			if (declaration !== undefined && isConstWithInitializer(declaration)) {
+				return this.untracedProvenance(declaration.initializer, depth + 1);
+			}
+			if (declaration !== undefined && ts.isParameter(declaration)) {
+				const write = this.parameterWrite(declaration);
+				if (write !== undefined) {
+					return `${this.where(write)}: the parameter ${declaration.name.getText()} is written inside its function`;
+				}
+				const problems: string[] = [];
+				const args = this.argumentsFor(declaration, problems);
+				if (problems.length > 0) {
+					return problems.join('; ');
+				}
+				for (const argument of args) {
+					const untraced = this.untracedProvenance(argument, depth + 1);
+					if (untraced !== undefined) {
+						return untraced;
+					}
+				}
+				return undefined;
+			}
+			return `${this.where(value)}: ${value.text} is not a const or an unwritten parameter`;
+		}
+		if (ts.isCallExpression(value)) {
+			const callee = this.checker.getResolvedSignature(value)?.declaration;
+			const results = callee !== undefined && isTraceableFunction(callee) && this.inSource(callee)
+				? (ts.isBlock(callee.body) ? returnsOf(callee.body) : [callee.body]) : [];
+			if (results.length === 0 || results.includes(undefined)) {
+				return `${this.where(value)}: ${short(value)} is a function's return this check does not trace`;
+			}
+			for (const result of results) {
+				const untraced = this.untracedProvenance(result!, depth + 1);
+				if (untraced !== undefined) {
+					return untraced;
+				}
+			}
+			return undefined;
+		}
+		if (ts.isPropertyAccessExpression(value)) {
+			return this.untracedMember(value, depth);
+		}
+		return `${this.where(value)}: ${short(value)} is not followed`;
+	}
+
+	/**
+	 * A property read is traced when the property is declared in the source and every value it can hold is: its initializer and
+	 * each plain \`=\` to it. Any other write, a reflective write that may reach it, or an occurrence of its name that resolves to
+	 * no symbol (an untyped receiver, a string) is named.
+	 */
+	private untracedMember(access: ts.PropertyAccessExpression, depth: number): string | undefined {
+		const symbol = this.symbolOf(access.name);
+		const declaration = symbol?.valueDeclaration;
+		const name = access.name.text;
+		if (symbol === undefined || declaration === undefined || !ts.isPropertyDeclaration(declaration) || !this.inSource(declaration)) {
+			return `${this.where(access)}: ${short(access)} is a member read this check does not trace`;
+		}
+		const values: ts.Expression[] = declaration.initializer === undefined ? [] : [declaration.initializer];
+		for (const occurrence of this.nameIndex().get(name) ?? []) {
+			if (occurrence === declaration.name) {
+				continue;
+			}
+			const found = this.symbolOf(occurrence);
+			if (found === undefined) {
+				return `${this.where(occurrence)}: the name ${name} appears where it resolves to no member (${short(occurrence.parent)}), so ${short(access)} may hold another value`;
+			}
+			if (found !== symbol) {
+				continue;
+			}
+			const parent = occurrence.parent;
+			const target = (ts.isPropertyAccessExpression(parent) && parent.name === occurrence) || (ts.isElementAccessExpression(parent) && parent.argumentExpression === occurrence)
+				? assignmentTarget(parent) : undefined;
+			if (target === undefined) {
+				return `${this.where(occurrence)}: ${name} is written other than by a plain \`=\` (${short(parent)})`;
+			}
+			if (target.kind === 'assign') {
+				values.push(target.value);
+			}
+		}
+		for (const call of this.reflectiveWrites()) {
+			if (call.arguments.length > 0 && this.mayHaveMember(call.arguments[0], name)) {
+				return `${this.where(call)}: a reflective write may set ${name} (${short(call)})`;
+			}
+		}
+		for (const v of values) {
+			const untraced = this.untracedProvenance(v, depth + 1);
+			if (untraced !== undefined) {
+				return untraced;
+			}
+		}
+		return undefined;
+	}
+
+	/** Every reflective write call in the source (Object.assign, Reflect.set, ...). */
+	private reflectiveWrites(): ts.CallExpression[] {
+		if (this.reflectiveList === undefined) {
+			const out: ts.CallExpression[] = [];
+			const visit = (node: ts.Node): void => {
+				if (ts.isCallExpression(node) && isReflectiveWrite(node)) {
+					out.push(node);
+				}
+				ts.forEachChild(node, visit);
+			};
+			this.files.forEach(visit);
+			this.reflectiveList = out;
+		}
+		return this.reflectiveList;
 	}
 
 	/** Every identifier and string literal in the source, by its text. */
@@ -1080,6 +1222,27 @@ export function show(panel: vscode.WebviewPanel): void { const html = build(pane
 			'an instance of Holder is cast to another type');
 		assertFails(`${traced}\nexport function other<K extends keyof Holder>(panel: vscode.WebviewPanel, k: K): void { const h = new Holder(panel); (h[k] as unknown as (s: string) => void)(${plain}); }`,
 			'a computed key may select initialize');
+		// a receiver not assignable from Holder is skipped only when its value is traced: any, unknown or an untraced return fails
+		const unrelated = (body: string) => `${traced}\nclass Other { private x = 0; initialize(html: string): void { void html; void this.x; } }
+${body}\nexport function other(panel: vscode.WebviewPanel): void { o(panel).initialize(${plain}); }`;
+		const untraced = 'is reached through a receiver whose value is not traced to its declared type, so it may be an instance of Holder';
+		assertFails(unrelated(`declare function o(panel: vscode.WebviewPanel): Other;`), 'is a function\'s return this check does not trace');
+		assertFails(unrelated(`function o(panel: vscode.WebviewPanel): Other { const a: any = new Holder(panel); const x = a as Other; return x; }`), 'a is any or unknown');
+		assertFails(`${traced}\nclass Other { private x = 0; initialize(html: string): void { void html; void this.x; } }
+export function other(panel: vscode.WebviewPanel): void { const a: any = new Holder(panel); const o = a as Other; o.initialize(${plain}); }`, untraced);
+		assertFails(`${traced}\nclass Other { private x = 0; initialize(html: string): void { void html; void this.x; } }
+export function other(panel: vscode.WebviewPanel): void { const a: any = new Holder(panel); const o: Other = a; o.initialize(${plain}); }`, 'a is any or unknown');
+		assertFails(`${traced}\nclass Other { private x = 0; initialize(html: string): void { void html; void this.x; } }\nfunction launder(x: unknown): any { return x; }
+export function other(panel: vscode.WebviewPanel): void { const o: Other = launder(new Holder(panel)); o.initialize(${plain}); }`, untraced);
+		assertFails(`${traced}\nclass Other { private x = 0; initialize(html: string): void { void html; void this.x; } }
+export function other(panel: vscode.WebviewPanel): void { let o = new Other(); o = new Holder(panel) as unknown as Other; o.initialize(${plain}); }`, 'o is not a const or an unwritten parameter');
+		// a singleton's return is traced through every write of its field; a laundered write fails
+		const singleton = (extra: string) => `${traced}\nclass Other { private x = 0; static inst: Other | undefined; static get(): Other { if (!Other.inst) { Other.inst = new Other(); } return Other.inst; }
+initialize(html: string): void { void html; void this.x; } dispose(): void { Other.inst = undefined; } }
+export function boot(): void { Other.get().initialize(${plain}); }\n${extra}`;
+		assert.deepStrictEqual(fixtureFailures(singleton('')), []);
+		assertFails(singleton(`export function poison(panel: vscode.WebviewPanel): void { const a: any = new Holder(panel); Other.inst = a; }`), 'a is any or unknown');
+		assertFails(singleton(`export function poison(panel: vscode.WebviewPanel): void { const c: any = Other; c.inst = new Holder(panel); }`), 'the name inst appears where it resolves to no member');
 		// (2) computed writes: keys through their constraints, receivers through casts, consts and every call site
 		assertFails(`export function overwrite<K extends 'html'>(panel: vscode.WebviewPanel, key: K): void { const view: { html: string } = panel.webview; view[key] = ${plain}; }`, noMeta);
 		assertFails(`export function overwrite<K extends string>(panel: vscode.WebviewPanel, key: K): void { const view: { html: string } = panel.webview; view[key as 'html'] = ${plain}; }`, noMeta);
@@ -1115,6 +1278,8 @@ export function show(panel: vscode.WebviewPanel): void { panel.webview.html = bu
 		assert.deepStrictEqual(fixtureFailures(traced), []);
 		assert.deepStrictEqual(fixtureFailures(`${traced}\nclass Registry { static initialize(n: number): void { void n; } }\nexport function boot(): void { Registry.initialize(1); }`), []);
 		assert.deepStrictEqual(fixtureFailures(`${traced}\nclass Store { private n = 0; initialize(n: number): void { this.n = n; } }\nexport function boot(): void { new Store().initialize(1); }`), []);
+		assert.deepStrictEqual(fixtureFailures(`${traced}\nclass Store { private n = 0; initialize(n: number): void { this.n = n; } }
+function start(store: Store): void { store.initialize(1); }\nexport function boot(): void { const s = new Store(); s.initialize(2); start(s); }`), []);
 		assert.deepStrictEqual(fixtureFailures(`${traced}\nfunction put(target: object, key: string): void { const m = target as { [k: string]: string }; m[key] = 'x'; }\nexport function boot(): void { put({}, 'a'); }`), []);
 		assert.deepStrictEqual(fixtureFailures(`${traced}\nexport function count(values: string[], key: number, map: { [k: string]: number }, name: string): void { values[key] = 'x'; map[name] = 1; }`), []);
 	});
