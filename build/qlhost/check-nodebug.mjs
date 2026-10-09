@@ -15,7 +15,7 @@
 // argument -> row B1 RED; (e) the r3 policy (15814dca0af: debugger tokens cut, not renamed) -> rows D1 D2 RED, among them
 // `--log --inspect-ptyhost=1 /workspace/project`, `--user-data-dir --inspect-extensions=1 /workspace/project` and
 // `--remote-debugging-port 9222 /workspace/project` (review c1 MF2).
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
@@ -203,6 +203,173 @@ if (present) {
 	delete globalThis.QL_TEST_BUILD;
 }
 
+// ---- DevTools (MF1 of review c1; owner R-228 / R-225 (A)): platform/windows/electron-main/qlDevToolsPolicy.ts, run on fixtures
+// under the three values of QL_TEST_BUILD, and the main-process sources read syntax-aware (the fork's typescript parser).
+const DEVTOOLS = join(src, 'vs/platform/windows/electron-main/qlDevToolsPolicy.ts');
+const devPresent = existsSync(DEVTOOLS);
+row('V0 platform/windows/electron-main/qlDevToolsPolicy.ts present', devPresent, devPresent ? DEVTOOLS : `${DEVTOOLS} does not exist`);
+if (devPresent) {
+	const dev = {};
+	new Function('exports', 'require', ts.transpileModule(readFileSync(DEVTOOLS, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText)(dev, id => {
+		throw new Error(`qlDevToolsPolicy.ts requires ${id} at run time`);
+	});
+	const ROUTE = 'toggleDevTools (native host: the Toggle Developer Tools action)';
+	const outcome = testBuild => {
+		globalThis.QL_TEST_BUILD = testBuild;
+		const lines = [];
+		const allowed = dev.allowDevToolsRoute(ROUTE, line => lines.push(line));
+		return { devTools: dev.devToolsAllowed(), allowed, lines };
+	};
+	let o = outcome(false);
+	row('V1 product: webPreferences.devTools is false and a route is refused by a named line', o.devTools === false && o.allowed === false
+		&& same(o.lines, [`QuantLab: refused DevTools via ${ROUTE}: a product build opens no DevTools (F-HOST-NODEBUG-1)`]), JSON.stringify(o));
+	for (const [id, value] of [['V2 test bundle', true], ['V3 source run', undefined]]) {
+		o = outcome(value);
+		row(`${id}: DevTools allowed, nothing refused`, o.devTools === true && o.allowed === true && o.lines.length === 0, JSON.stringify(o));
+	}
+	delete globalThis.QL_TEST_BUILD;
+}
+
+// The main-process sources: electron-main and electron-utility folders under vs/code and vs/platform, tests excluded.
+const mainSources = [];
+const walk = dir => {
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (entry.name !== 'test') {
+				walk(path);
+			}
+		} else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts') && !entry.name.endsWith('.d.ts') && /\/electron-(main|utility)\//.test(path)) {
+			mainSources.push(path);
+		}
+	}
+};
+walk(join(src, 'vs/code'));
+walk(join(src, 'vs/platform'));
+const parsed = new Map(mainSources.map(path => [path, ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true)]));
+const rel = path => path.slice(src.length + 1);
+const where = node => `${rel(node.getSourceFile().fileName)}:${node.getSourceFile().getLineAndCharacterOfPosition(node.getStart()).line + 1}`;
+const visit = (node, fn) => {
+	fn(node);
+	ts.forEachChild(node, child => visit(child, fn));
+};
+const isRouteCall = node => ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'allowDevToolsRoute';
+const containsRouteCall = node => {
+	let found = false;
+	visit(node, child => found ||= isRouteCall(child));
+	return found;
+};
+// A call is guarded when (a) it sits in the then-branch of an `if` whose condition calls allowDevToolsRoute without negating it, or
+// (b) an earlier statement of an enclosing block is `if (!allowDevToolsRoute(...)) { return; }`. The one named exception: the stock
+// opener that runs only from sources (`!this.environmentMainService.isBuilt`), never in a built app, TEST or PRODUCT.
+const guarded = call => {
+	for (let node = call, parent = call.parent; parent; node = parent, parent = parent.parent) {
+		if (ts.isIfStatement(parent) && parent.thenStatement === node) {
+			const condition = parent.expression.getText();
+			if (containsRouteCall(parent.expression) && !condition.trimStart().startsWith('!')) {
+				return 'route';
+			}
+			if (condition.startsWith('!this.environmentMainService.isBuilt')) {
+				return 'sources only';
+			}
+		}
+		if (ts.isBlock(parent)) {
+			const before = parent.statements.slice(0, parent.statements.indexOf(node));
+			if (before.some(statement => ts.isIfStatement(statement) && statement.expression.getText().startsWith('!allowDevToolsRoute(')
+				&& /^\{?\s*return;?\s*\}?$/.test(statement.thenStatement.getText()))) {
+				return 'route';
+			}
+		}
+	}
+	return undefined;
+};
+const openers = [];
+const constructions = [];
+for (const file of parsed.values()) {
+	visit(file, node => {
+		if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && ['openDevTools', 'toggleDevTools'].includes(node.expression.name.text)
+			&& !/^this\.nativeHostMainService\b/.test(node.expression.expression.getText())) {
+			openers.push({ at: where(node), guard: guarded(node) });
+		}
+		if (ts.isNewExpression(node) && /(^|\.)(BrowserWindow|WebContentsView|BrowserView|BaseWindow)$/.test(node.expression.getText())) {
+			constructions.push(where(node).replace(/:\d+$/, ''));
+		}
+	});
+}
+const unguarded = openers.filter(({ guard }) => guard === undefined);
+let sourceRouteCalls = 0;
+for (const file of parsed.values()) {
+	visit(file, node => {
+		if (isRouteCall(node)) {
+			sourceRouteCalls++;
+		}
+	});
+}
+row('W1 every DevTools-opening call in the main process is refused by name in PRODUCT (allowDevToolsRoute) or runs from sources only',
+	openers.length > 0 && unguarded.length === 0,
+	`${openers.length} call(s): ${openers.map(({ at, guard }) => `${at} ${guard ?? 'UNGUARDED'}`).join('; ')}`);
+// Each place the main process constructs a window or view, and where its webPreferences.devTools comes from. A new place is RED
+// until it is named here with its source.
+const KNOWN_CONSTRUCTIONS = {
+	'vs/platform/windows/electron-main/windowImpl.ts': 'defaultBrowserWindowOptions (W2)',
+	'vs/platform/native/electron-main/nativeHostMainService.ts': 'openChildWindow sets devTools after any override (W3)',
+	'vs/code/electron-main/qlHost/adopt.ts': 'the webPreferences the windows.ts seam recorded from defaultBrowserWindowOptions (W2)',
+	'vs/platform/webContentExtractor/electron-main/webContentExtractorService.ts': 'webPageLoader.ts options (W4)'
+};
+const unknown = [...new Set(constructions)].filter(path => !(path in KNOWN_CONSTRUCTIONS));
+row('W5 every window/view the main process constructs is a named one', constructions.length > 0 && unknown.length === 0,
+	`${constructions.length} construction(s) in [${[...new Set(constructions)].join(', ')}]; not named [${unknown.join(', ')}]`);
+// The DevTools property of an object literal, and whether it is the last write of that key (after every spread).
+const devToolsLast = (literal, label) => {
+	if (!literal) {
+		return `${label}: not found`;
+	}
+	const props = literal.properties;
+	const index = props.findIndex(prop => ts.isPropertyAssignment(prop) && prop.name.getText() === 'devTools');
+	if (index < 0) {
+		return `${label}: no devTools property`;
+	}
+	if (props[index].initializer.getText() !== 'devToolsAllowed()') {
+		return `${label}: devTools is \`${props[index].initializer.getText()}\``;
+	}
+	const later = props.slice(index + 1).filter(prop => ts.isSpreadAssignment(prop) || (ts.isPropertyAssignment(prop) && prop.name.getText() === 'devTools'));
+	return later.length === 0 ? 'ok' : `${label}: ${later.length} later spread/devTools write(s)`;
+};
+const findLiteral = (file, owner, key) => {
+	let result;
+	visit(parsed.get(join(src, file)) ?? ts.createSourceFile('missing', '', ts.ScriptTarget.Latest), node => {
+		if (result === undefined && ts.isPropertyAssignment(node) && node.name.getText() === key && ts.isObjectLiteralExpression(node.initializer)) {
+			for (let up = node.parent; up; up = up.parent) {
+				if ((ts.isFunctionDeclaration(up) || ts.isMethodDeclaration(up) || ts.isConstructorDeclaration(up)) && up.name?.getText() === owner) {
+					result = node.initializer;
+					return;
+				}
+				if (ts.isClassDeclaration(up) && up.name?.getText() === owner) {
+					result = node.initializer;
+					return;
+				}
+			}
+		}
+	});
+	return result;
+};
+let verdict = devToolsLast(findLiteral('vs/platform/windows/electron-main/windows.ts', 'defaultBrowserWindowOptions', 'webPreferences'), 'windows.ts defaultBrowserWindowOptions');
+row('W2 defaultBrowserWindowOptions (CodeWindows, child and auxiliary windows, adopted views) writes devTools: devToolsAllowed() after its spread', verdict === 'ok', verdict);
+verdict = devToolsLast(findLiteral('vs/platform/native/electron-main/nativeHostMainService.ts', 'openChildWindow', 'webPreferences'), 'nativeHostMainService.ts openChildWindow');
+row('W3 openChildWindow writes devTools: devToolsAllowed() after any override\'s webPreferences', verdict === 'ok', verdict);
+verdict = devToolsLast(findLiteral('vs/platform/webContentExtractor/electron-main/webPageLoader.ts', 'WebPageLoader', 'webPreferences'), 'webPageLoader.ts');
+row('W4 the web content extractor\'s window writes devTools: devToolsAllowed()', verdict === 'ok', verdict);
+
+// The client's terminal host and overlay windows take their DevTools value from the fork's ports (app.ts): false in any built app.
+let portsLiteral;
+visit(parsed.get(join(src, 'vs/code/electron-main/app.ts')), node => {
+	if (portsLiteral === undefined && ts.isVariableDeclaration(node) && node.name.getText() === 'ports' && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+		portsLiteral = node.initializer;
+	}
+});
+const portsValue = portsLiteral?.properties.find(prop => ts.isPropertyAssignment(prop) && prop.name.getText() === 'devTools')?.initializer.getText();
+row('W6 the terminal host\'s ports give the client devTools false in a built app', portsValue === '!this.environmentMainService.isBuilt', `ports.devTools = ${portsValue === undefined ? '(not found)' : `\`${portsValue}\``}`);
+
 // ---- a PRODUCT bundle
 if (bundle) {
 	const code = readFileSync(bundle, 'utf8');
@@ -212,6 +379,23 @@ if (bundle) {
 		`${leftover} QL_TEST_BUILD reference(s); isProductBundle returns ${body === undefined ? '(function not found: give the un-minified out-vscode/main.js)' : `\`${body}\``}`);
 	const marker = (code.match(/a product build accepts no debugger \(F-HOST-NODEBUG-1\)/g) ?? []).length;
 	row('B2 the bundle carries the policy', marker === 1, `${marker} occurrence(s) of the refusal text`);
+	// SF3 of review c1: the bundled CALL, not only the function. Exactly one top-level statement calling refuseDebuggers with the
+	// app's command line and process.argv, after the argv.json switches are configured and before ready and electron-main's load.
+	const bundleLines = code.split('\n');
+	const callAt = bundleLines.flatMap((text, i) => /^refuseDebuggers\d*\([\w$]+\.commandLine, process\.argv, [\w$]+, /.test(text) ? [i] : []);
+	const configureAt = bundleLines.findIndex(text => /^var [\w$]+ = configureCommandlineSwitchesSync\d*\([\w$]+\);$/.test(text));
+	const readyAt = bundleLines.findIndex(text => /^[\w$]+\.once\("ready", /.test(text));
+	const loadAt = bundleLines.findIndex(text => /\(init_main\d*\(\), main_exports\d*\)/.test(text));
+	row('B3 the bundle CALLS the policy once at top level, after the argv.json switches and before ready and electron-main',
+		callAt.length === 1 && configureAt >= 0 && readyAt >= 0 && loadAt >= 0 && configureAt < callAt[0] && callAt[0] < readyAt && callAt[0] < loadAt,
+		`${callAt.length} call line(s) [${callAt.map(i => i + 1).join(', ')}]; configure ${configureAt + 1}, ready ${readyAt + 1}, electron-main load ${loadAt + 1} (1-based lines; 0 = not found)`);
+	const devBody = code.match(/function devToolsAllowed\d*\(\) \{\s*return ([^;]+);/)?.[1];
+	row('B4 the define reached devToolsAllowed as false (PRODUCT windows are created with devTools false)', devBody === 'false' || devBody === 'false !== false',
+		`devToolsAllowed returns ${devBody === undefined ? '(function not found)' : `\`${devBody}\``}`);
+	const routeCalls = (code.match(/\ballowDevToolsRoute\d*\("/g) ?? []).length;
+	const refusalText = (code.match(/a product build opens no DevTools \(F-HOST-NODEBUG-1\)/g) ?? []).length;
+	row('B5 the bundle carries every DevTools refusal of the sources (W1) and the refusal text once', routeCalls === sourceRouteCalls && sourceRouteCalls > 0 && refusalText === 1,
+		`${routeCalls} allowDevToolsRoute("…") call(s) in the bundle, ${sourceRouteCalls} in the sources; ${refusalText} occurrence(s) of the refusal text`);
 }
 
 for (const { line } of rows) {

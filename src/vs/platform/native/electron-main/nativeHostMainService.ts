@@ -47,6 +47,7 @@ import { IConfigurationService } from '../../configuration/common/configuration.
 import { IProxyAuthService } from './auth.js';
 import { AuthInfo, Credentials, IRequestService } from '../../request/common/request.js';
 import { randomPath } from '../../../base/common/extpath.js';
+import { allowDevToolsRoute, devToolsAllowed } from '../../windows/electron-main/qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
 
 export interface INativeHostMainService extends AddFirstParameterToFunctions<ICommonNativeHostService, Promise<unknown> /* only methods, not events */, number | undefined /* window ID */> { }
 
@@ -1022,17 +1023,27 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 	private gpuInfoWindowId: number | undefined;
 	private contentTracingWindowId: number | undefined;
 
+	// QuantLab host (F-HOST-NODEBUG-1): the three DevTools methods are refused by name in a PRODUCT build (qlDevToolsPolicy.ts)
 	async openDevTools(windowId: number | undefined, options?: Partial<OpenDevToolsOptions> & INativeHostOptions): Promise<void> {
+		if (!allowDevToolsRoute('openDevTools (native host)', line => console.error(line))) {
+			return;
+		}
 		const window = this.windowById(options?.targetWindowId, windowId);
 		window?.win?.webContents.openDevTools(options?.mode ? { mode: options.mode, activate: options.activate } : undefined);
 	}
 
 	async toggleDevTools(windowId: number | undefined, options?: INativeHostOptions): Promise<void> {
+		if (!allowDevToolsRoute('toggleDevTools (native host: the Toggle Developer Tools action)', line => console.error(line))) {
+			return;
+		}
 		const window = this.windowById(options?.targetWindowId, windowId);
 		window?.win?.webContents.toggleDevTools();
 	}
 
 	async openDevToolsWindow(windowId: number | undefined, url: string): Promise<void> {
+		if (!allowDevToolsRoute('openDevToolsWindow (native host)', line => console.error(line))) {
+			return;
+		}
 		const parentWindow = this.codeWindowById(windowId);
 		if (!parentWindow) {
 			return;
@@ -1047,7 +1058,9 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 		const windowOptions: Electron.BrowserWindowConstructorOptions = {
 			...options,
 			parent: parentWindow ?? undefined,
-			...overrideWindowOptions
+			...overrideWindowOptions,
+			// QuantLab host (F-HOST-NODEBUG-1): an override's webPreferences replace the defaults', so the DevTools value is set again
+			webPreferences: { ...(overrideWindowOptions.webPreferences ?? options.webPreferences), devTools: devToolsAllowed() }
 		};
 
 		const window = new BrowserWindow(windowOptions);

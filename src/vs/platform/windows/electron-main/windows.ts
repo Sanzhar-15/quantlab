@@ -20,6 +20,7 @@ import { IProductService } from '../../product/common/productService.js';
 import { IThemeMainService } from '../../theme/electron-main/themeMainService.js';
 import { IOpenEmptyWindowOptions, IWindowOpenable, IWindowSettings, TitlebarStyle, WindowMinimumSize, hasNativeTitlebar, useNativeFullScreen, useWindowControlsOverlay, zoomLevelToZoomFactor } from '../../window/common/window.js';
 import { ICodeWindow, IWindowState, WindowMode, defaultWindowState } from '../../window/electron-main/window.js';
+import { devToolsAllowed } from './qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
 
 export const IWindowsMainService = createDecorator<IWindowsMainService>('windowsMainService');
 
@@ -171,6 +172,8 @@ export function defaultBrowserWindowOptions(accessor: ServicesAccessor, windowSt
 			// Refs https://github.com/microsoft/vscode/issues/140098
 			enableBlinkFeatures: 'HighlightAPI',
 			sandbox: true,
+			// QuantLab host (F-HOST-NODEBUG-1): no DevTools in a PRODUCT build (qlDevToolsPolicy.ts); after the spread, so no caller re-enables them
+			devTools: devToolsAllowed(),
 			// TODO(deepak1556): Should be removed once migration is complete
 			// https://github.com/microsoft/vscode/issues/239228
 			enableDeprecatedPaste: true,

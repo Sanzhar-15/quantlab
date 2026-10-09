@@ -135,6 +135,7 @@ import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
 import { QlWorkbenchHost } from './qlHost/workbenchHost.js';
 // QuantLab host (U6): the chrome seed (the four chrome settings of a fresh default profile)
 import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
+import { allowDevToolsRoute } from '../../platform/windows/electron-main/qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
 
 /**
  * The main VS Code application. There will only ever be one instance,
@@ -545,8 +546,17 @@ export class CodeApplication extends Disposable {
 			return this.resolveShellEnvironment(args, env, false);
 		});
 
-		validatedIpcMain.on('vscode:toggleDevTools', event => event.sender.toggleDevTools());
-		validatedIpcMain.on('vscode:openDevTools', event => event.sender.openDevTools());
+		// QuantLab host (F-HOST-NODEBUG-1): refused by name in a PRODUCT build (qlDevToolsPolicy.ts)
+		validatedIpcMain.on('vscode:toggleDevTools', event => {
+			if (allowDevToolsRoute('vscode:toggleDevTools (IPC)', line => console.error(line))) {
+				event.sender.toggleDevTools();
+			}
+		});
+		validatedIpcMain.on('vscode:openDevTools', event => {
+			if (allowDevToolsRoute('vscode:openDevTools (IPC)', line => console.error(line))) {
+				event.sender.openDevTools();
+			}
+		});
 
 		validatedIpcMain.on('vscode:reloadWindow', event => event.sender.reload());
 
