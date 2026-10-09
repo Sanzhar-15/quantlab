@@ -370,6 +370,141 @@ visit(parsed.get(join(src, 'vs/code/electron-main/app.ts')), node => {
 const portsValue = portsLiteral?.properties.find(prop => ts.isPropertyAssignment(prop) && prop.name.getText() === 'devTools')?.initializer.getText();
 row('W6 the terminal host\'s ports give the client devTools false in a built app', portsValue === '!this.environmentMainService.isBuilt', `ports.devTools = ${portsValue === undefined ? '(not found)' : `\`${portsValue}\``}`);
 
+// W7 (review c2 SHOULD-FIX): each refusal names ITS route. The site of an allowDevToolsRoute call = file + the IPC channel of the
+// handler it sits in (`<x>.on('<channel>', …)`), else the enclosing method/constructor/function name.
+const siteOf = node => {
+	for (let up = node.parent; up; up = up.parent) {
+		if ((ts.isArrowFunction(up) || ts.isFunctionExpression(up)) && ts.isCallExpression(up.parent) && ts.isPropertyAccessExpression(up.parent.expression)
+			&& up.parent.expression.name.text === 'on' && up.parent.arguments.length > 0 && ts.isStringLiteral(up.parent.arguments[0])) {
+			return `ipc:${up.parent.arguments[0].text}`;
+		}
+		if (ts.isConstructorDeclaration(up)) {
+			return 'constructor';
+		}
+		if ((ts.isMethodDeclaration(up) || ts.isFunctionDeclaration(up)) && up.name) {
+			return up.name.getText();
+		}
+	}
+	return '(top level)';
+};
+const EXPECTED_ROUTES = {
+	'vs/code/electron-main/app.ts ipc:vscode:toggleDevTools': 'vscode:toggleDevTools (IPC)',
+	'vs/code/electron-main/app.ts ipc:vscode:openDevTools': 'vscode:openDevTools (IPC)',
+	'vs/platform/native/electron-main/nativeHostMainService.ts openDevTools': 'openDevTools (native host)',
+	'vs/platform/native/electron-main/nativeHostMainService.ts toggleDevTools': 'toggleDevTools (native host: the Toggle Developer Tools action)',
+	'vs/platform/native/electron-main/nativeHostMainService.ts openDevToolsWindow': 'openDevToolsWindow (native host)',
+	'vs/platform/windows/electron-main/windowImpl.ts setWin': '--open-devtools (command line)',
+	'vs/platform/debug/electron-main/extensionHostDebugIpc.ts attachToCurrentWindowRenderer': 'attachToCurrentWindowRenderer (extension host debug IPC)',
+	'vs/platform/debug/electron-main/extensionHostDebugIpc.ts openExtensionDevelopmentHostWindow': 'openExtensionDevelopmentHostWindow debugRenderer (extension host debug IPC)'
+};
+const foundRoutes = [];
+const sourceRouteLiterals = [];
+for (const file of parsed.values()) {
+	visit(file, node => {
+		if (isRouteCall(node)) {
+			const literal = node.arguments[0] && ts.isStringLiteral(node.arguments[0]) ? node.arguments[0].text : `(not a literal: ${node.arguments[0]?.getText()})`;
+			foundRoutes.push({ site: `${rel(file.fileName)} ${siteOf(node)}`, literal });
+			sourceRouteLiterals.push(literal);
+		}
+	});
+}
+const routeProblems = [
+	...foundRoutes.filter(({ site, literal }) => EXPECTED_ROUTES[site] !== literal).map(({ site, literal }) => `${site}: "${literal}" (expected ${EXPECTED_ROUTES[site] === undefined ? 'no refusal here' : `"${EXPECTED_ROUTES[site]}"`})`),
+	...Object.keys(EXPECTED_ROUTES).filter(site => foundRoutes.filter(found => found.site === site).length !== 1).map(site => `${site}: ${foundRoutes.filter(found => found.site === site).length} refusal(s), expected 1`)
+];
+row('W7 every refusal names its own route, at its own site (no missing, extra or swapped label)', routeProblems.length === 0,
+	routeProblems.length === 0 ? `${foundRoutes.length} site(s) as expected` : routeProblems.join('; '));
+
+// W8 (review c2 MUST-FIX class): every main-process use of a renderer's CDP debugger (`<x>.debugger`) is a named one. Only the
+// extension-host debug channel forwards CDP out of the process (a listening server): refused in PRODUCT (W7, X1-X3).
+const KNOWN_DEBUGGER_USES = {
+	'vs/platform/debug/electron-main/extensionHostDebugIpc.ts': 'the renderer CDP bridge (a listening server): refused in PRODUCT',
+	'vs/platform/webContentExtractor/electron-main/webPageLoader.ts': 'in process: the extractor reads its own offscreen page; no listener',
+	'vs/platform/profiling/electron-main/windowProfiling.ts': 'in process: the window profiler; no listener',
+	'vs/platform/browserElements/electron-main/nativeBrowserElementsMainService.ts': 'in process: browser-element capture; no listener'
+};
+const debuggerUses = [];
+for (const file of parsed.values()) {
+	visit(file, node => {
+		if (ts.isPropertyAccessExpression(node) && node.name.text === 'debugger') {
+			debuggerUses.push(rel(file.fileName));
+		}
+	});
+}
+const unnamedDebugger = [...new Set(debuggerUses)].filter(path => !(path in KNOWN_DEBUGGER_USES));
+row('W8 every main-process use of a renderer\'s CDP debugger is a named one', debuggerUses.length > 0 && unnamedDebugger.length === 0,
+	`${debuggerUses.length} use(s) in [${[...new Set(debuggerUses)].join(', ')}]; not named [${unnamedDebugger.join(', ')}]`);
+
+// X1-X3 (review c2 MUST-FIX proving fixture): the channel's real method bodies under the three build values, electron/http mocked;
+// no socket is opened. PRODUCT: refusal line, no debugger address, zero listens/attaches/windows; TEST/source: the bridge works.
+const EHD = join(src, 'vs/platform/debug/electron-main/extensionHostDebugIpc.ts');
+if (devPresent && existsSync(EHD)) {
+	const policyModule = {};
+	new Function('exports', 'require', ts.transpileModule(readFileSync(DEVTOOLS, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText)(policyModule, () => {
+		throw new Error('unexpected require');
+	});
+	const counts = { listens: 0, attaches: 0, windows: 0 };
+	const fakeWin = () => ({ webContents: { debugger: { isAttached: () => false, attach: () => counts.attaches++, detach: () => undefined, addListener: () => undefined, removeListener: () => undefined } }, on: () => undefined, addListener: () => undefined, removeListener: () => undefined });
+	const stubs = {
+		'electron': {}, 'net': {}, 'http': { createServer: () => ({ on: () => undefined, listen: (_port, _host, cb) => { counts.listens++; cb(); }, address: () => ({ port: 9 }), close: () => undefined }) },
+		'../../../base/common/buffer.js': { VSBuffer: { fromString: text => text } },
+		'../../../base/common/lifecycle.js': { DisposableStore: class { add(d) { return d; } dispose() { } get isDisposed() { return false; } }, toDisposable: fn => ({ dispose: fn }) },
+		'../../../base/common/uuid.js': { generateUuid: () => 'uuid' },
+		'../../../base/parts/ipc/common/ipc.net.js': {}, '../../../base/parts/ipc/node/ipc.net.js': { upgradeToISocket: () => undefined },
+		'../../environment/node/argv.js': { OPTIONS: {}, parseArgs: () => ({ extensionDevelopmentPath: ['/ext'] }) },
+		'../../windows/electron-main/windows.js': { OpenContext: { API: 0 } },
+		'../common/extensionHostDebug.js': {},
+		'../common/extensionHostDebugIpc.js': { ExtensionHostDebugBroadcastChannel: class { call() { return Promise.resolve('base'); } } },
+		'../../windows/electron-main/qlDevToolsPolicy.js': policyModule
+	};
+	const ehd = {};
+	new Function('exports', 'require', ts.transpileModule(readFileSync(EHD, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText)(ehd, id => {
+		if (!(id in stubs)) {
+			throw new Error(`extensionHostDebugIpc.ts requires ${id} in this check`);
+		}
+		return stubs[id];
+	});
+	const channelFor = () => new ehd.ElectronExtensionHostDebugBroadcastChannel({ getWindowById: () => ({ win: fakeWin() }), openExtensionDevelopmentHostWindow: async () => { counts.windows++; return [{ win: fakeWin() }]; } });
+	const fixture = async (testBuild, command, args) => {
+		globalThis.QL_TEST_BUILD = testBuild;
+		counts.listens = 0; counts.attaches = 0; counts.windows = 0;
+		const lines = [];
+		const original = console.error;
+		console.error = line => lines.push(String(line));
+		let result;
+		try {
+			result = await channelFor().call(undefined, command, args);
+		} catch (error) {
+			result = { thrown: String(error) };
+		} finally {
+			console.error = original;
+		}
+		return { result, lines, ...counts };
+	};
+	const cases = [['X1 attachToCurrentWindowRenderer', 'attachToCurrentWindowRenderer', [1], 'attachToCurrentWindowRenderer (extension host debug IPC)'],
+		['X2 openExtensionDevelopmentHostWindow(debugRenderer)', 'openExtensionDevelopmentHostWindow', [['--extensionDevelopmentPath=/ext'], true], 'openExtensionDevelopmentHostWindow debugRenderer (extension host debug IPC)']];
+	for (const [id, command, args, route] of cases) {
+		const product = await fixture(false, command, args);
+		const productOk = product.result?.success === false && product.result.rendererDebugAddr === undefined && product.listens === 0 && product.attaches === 0 && product.windows === 0
+			&& same(product.lines, [`QuantLab: refused DevTools via ${route}: a product build opens no DevTools (F-HOST-NODEBUG-1)`]);
+		const controls = [await fixture(true, command, args), await fixture(undefined, command, args)];
+		const controlsOk = controls.every(control => control.result?.success === true && typeof control.result.rendererDebugAddr === 'string' && control.listens === 1 && control.lines.length === 0);
+		row(`${id}: PRODUCT refuses by name with no address, listen, attach or window; TEST and source keep the bridge`, productOk && controlsOk,
+			JSON.stringify({ product, test: controls[0], source: controls[1] }));
+	}
+	globalThis.QL_TEST_BUILD = false;
+	let bridgeThrow = '';
+	try {
+		await channelFor().openCdp(fakeWin());
+	} catch (error) {
+		bridgeThrow = String(error);
+	}
+	row('X3 product: the bridge itself throws by name if any caller reaches it', bridgeThrow.includes('the renderer CDP bridge was reached in a product build'), bridgeThrow || 'no error');
+	delete globalThis.QL_TEST_BUILD;
+} else {
+	row('X0 extensionHostDebugIpc.ts and qlDevToolsPolicy.ts present for the bridge fixture', false, `${EHD} or ${DEVTOOLS} missing`);
+}
+
 // ---- a PRODUCT bundle
 if (bundle) {
 	const code = readFileSync(bundle, 'utf8');
@@ -392,10 +527,12 @@ if (bundle) {
 	const devBody = code.match(/function devToolsAllowed\d*\(\) \{\s*return ([^;]+);/)?.[1];
 	row('B4 the define reached devToolsAllowed as false (PRODUCT windows are created with devTools false)', devBody === 'false' || devBody === 'false !== false',
 		`devToolsAllowed returns ${devBody === undefined ? '(function not found)' : `\`${devBody}\``}`);
-	const routeCalls = (code.match(/\ballowDevToolsRoute\d*\("/g) ?? []).length;
+	const bundledRoutes = [...code.matchAll(/\ballowDevToolsRoute\d*\("([^"]*)"/g)].map(match => match[1]).sort();
+	const routeCalls = bundledRoutes.length;
+	const sameRoutes = same(bundledRoutes, [...sourceRouteLiterals].sort());
 	const refusalText = (code.match(/a product build opens no DevTools \(F-HOST-NODEBUG-1\)/g) ?? []).length;
-	row('B5 the bundle carries every DevTools refusal of the sources (W1) and the refusal text once', routeCalls === sourceRouteCalls && sourceRouteCalls > 0 && refusalText === 1,
-		`${routeCalls} allowDevToolsRoute("…") call(s) in the bundle, ${sourceRouteCalls} in the sources; ${refusalText} occurrence(s) of the refusal text`);
+	row('B5 the bundle carries every DevTools refusal of the sources (W1) and the refusal text once', routeCalls === sourceRouteCalls && sourceRouteCalls > 0 && sameRoutes && refusalText === 1,
+		`${routeCalls} allowDevToolsRoute("…") call(s) in the bundle, ${sourceRouteCalls} in the sources; route labels ${sameRoutes ? 'identical' : `differ: bundle [${bundledRoutes.join(' | ')}]`}; ${refusalText} occurrence(s) of the refusal text`);
 }
 
 for (const { line } of rows) {

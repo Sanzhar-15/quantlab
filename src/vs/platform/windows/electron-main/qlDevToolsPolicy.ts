@@ -11,7 +11,8 @@
 //     webPreferences (qlHost/adopt.ts), so it inherits the value.
 //   - Each route that would open them is refused by name where it is taken: the `--open-devtools` startup option (windowImpl.ts),
 //     the `vscode:openDevTools` / `vscode:toggleDevTools` IPC (app.ts), and the native host's openDevTools / toggleDevTools /
-//     openDevToolsWindow (nativeHostMainService.ts), which the workbench's Toggle Developer Tools action calls.
+//     openDevToolsWindow (nativeHostMainService.ts), which the workbench's Toggle Developer Tools action calls, and the two
+//     extension-host debug requests that would open the renderer CDP bridge (extensionHostDebugIpc.ts; review c2).
 // A TEST build (QL_TEST_BUILD=1) and an un-bundled source run keep DevTools: the test instruments and development use them.
 
 /** A route by which a renderer's DevTools are opened. */
@@ -21,7 +22,9 @@ export type DevToolsRoute =
 	| 'vscode:toggleDevTools (IPC)'
 	| 'openDevTools (native host)'
 	| 'toggleDevTools (native host: the Toggle Developer Tools action)'
-	| 'openDevToolsWindow (native host)';
+	| 'openDevToolsWindow (native host)'
+	| 'attachToCurrentWindowRenderer (extension host debug IPC)'
+	| 'openExtensionDevelopmentHostWindow debugRenderer (extension host debug IPC)';
 
 /**
  * False in a PRODUCT bundle, where the esbuild define (build/lib/optimize.ts) makes `globalThis.QL_TEST_BUILD` the constant
