@@ -132,7 +132,9 @@ export class WebviewHtmlAnalysis {
 	private readonly checker: ts.TypeChecker;
 	private readonly files: ts.SourceFile[];
 	private references: Map<ts.Symbol, ts.Node[]> | undefined;
-	private untypedMembers: Map<string, ts.Node[]> | undefined;
+	private names: Map<string, ts.Node[]> | undefined;
+	private computed: ts.ElementAccessExpression[] | undefined;
+	private castList: (ts.AsExpression | ts.TypeAssertion)[] | undefined;
 
 	constructor(program: ts.Program, private readonly srcRoot: string) {
 		this.checker = program.getTypeChecker();
@@ -197,38 +199,96 @@ export class WebviewHtmlAnalysis {
 
 	/** A computed key whose type admits the string `html` (string, any, unknown, a template type, or a union with 'html'). */
 	private mayBeHtmlKey(key: ts.Expression): boolean {
-		const type = this.checker.getTypeAtLocation(key);
-		return [type, ...(type.isUnion() ? type.types : [])].some(t =>
-			(t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.String | ts.TypeFlags.TemplateLiteral | ts.TypeFlags.StringMapping)) !== 0
-			|| (t.isStringLiteral() && t.value === 'html'));
+		return this.keyAdmits(this.checker.getTypeAtLocation(key), 'html', 0);
+	}
+
+	/** A key type that admits the string `name`: string, any, unknown, a template or mapping type, the literal itself, or a union
+	 * holding one; a type parameter or other generic type by its constraint, and admitting when it has none. */
+	private keyAdmits(type: ts.Type, name: string, depth: number): boolean {
+		return [type, ...(type.isUnion() ? type.types : [])].some(t => {
+			if ((t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.String | ts.TypeFlags.TemplateLiteral | ts.TypeFlags.StringMapping)) !== 0
+				|| (t.isStringLiteral() && t.value === name)) {
+				return true;
+			}
+			if ((t.flags & ts.TypeFlags.Instantiable) !== 0) {
+				const constraint = this.checker.getBaseConstraintOfType(t);
+				return constraint === undefined || constraint === t || depth > MAX_TRACE_DEPTH || this.keyAdmits(constraint, name, depth + 1);
+			}
+			return false;
+		});
 	}
 
 	/**
-	 * A receiver that may be a webview: a Webview, any or unknown, a type with an `html` property, or a cast or const alias of such
-	 * a value. (A Webview is an interface, so it reaches an index-signature type only through a cast, which is followed here and
-	 * reported by name in `collect`.)
+	 * A receiver that may be a webview, fail closed. Its provenance is followed through casts, consts and parameters (every call
+	 * site's argument): a Webview there means yes, and only a fresh object, array or literal means no. Where provenance stops (a
+	 * call, a member, a parameter whose callers cannot all be found or that is written), the declared type decides: any, unknown,
+	 * object or {}, a generic type, a type with an \`html\` property, or an index signature whose values admit a string.
 	 */
 	private mayHoldWebview(receiver: ts.Expression, depth: number): boolean {
-		let e = receiver;
-		while (ts.isParenthesizedExpression(e)) {
-			e = e.expression;
-		}
-		if (this.isWebview(e)) {
+		const e = skipOuter(receiver);
+		if (this.isWebview(receiver) || this.isWebview(e)) {
 			return true;
 		}
-		const type = this.checker.getTypeAtLocation(e);
-		if ([type, ...(type.isUnionOrIntersection() ? type.types : [])].some(t => (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0
-			|| this.checker.getPropertyOfType(this.checker.getApparentType(t), 'html') !== undefined)) {
-			return true;
+		if (ts.isObjectLiteralExpression(e) || ts.isArrayLiteralExpression(e) || ts.isNewExpression(e) || ts.isStringLiteralLike(e)
+			|| ts.isTemplateExpression(e) || ts.isNumericLiteral(e)) {
+			return false;
 		}
-		if (depth > MAX_TRACE_DEPTH) {
-			return true;
+		if (depth <= MAX_TRACE_DEPTH && ts.isIdentifier(e)) {
+			const declaration = this.symbolOf(e)?.valueDeclaration;
+			if (declaration !== undefined && isConstWithInitializer(declaration)) {
+				return this.mayHoldWebview(declaration.initializer, depth + 1);
+			}
+			if (declaration !== undefined && ts.isParameter(declaration)) {
+				const problems: string[] = [];
+				const args = this.parameterWrite(declaration) === undefined ? this.argumentsFor(declaration, problems) : [];
+				if (problems.length === 0 && args.length > 0) {
+					return args.some(a => this.mayHoldWebview(a, depth + 1));
+				}
+			}
 		}
-		if (ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isSatisfiesExpression(e) || ts.isNonNullExpression(e)) {
-			return this.mayHoldWebview(e.expression, depth + 1);
+		return [receiver, e].some(x => this.typeMayHoldWebview(this.checker.getTypeAtLocation(x)));
+	}
+
+	private typeMayHoldWebview(type: ts.Type): boolean {
+		return [type, ...(type.isUnionOrIntersection() ? type.types : [])].some(t => {
+			if ((t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive | ts.TypeFlags.Instantiable)) !== 0) {
+				return true;
+			}
+			const apparent = this.checker.getApparentType(t);
+			if (this.checker.getPropertyOfType(apparent, 'html') !== undefined) {
+				return true;
+			}
+			if ((t.flags & ts.TypeFlags.Object) !== 0 && this.checker.getPropertiesOfType(apparent).length === 0
+				&& this.checker.getIndexInfosOfType(apparent).length === 0 && this.checker.getSignaturesOfType(apparent, ts.SignatureKind.Call).length === 0) {
+				return true;
+			}
+			return this.checker.getIndexInfosOfType(apparent).some(info => this.keyAdmits(info.keyType, 'html', 0)
+				&& this.checker.isTypeAssignableTo(this.checker.getStringType(), info.type));
+		});
+	}
+
+	/** The first write to a parameter inside its function (any assignment, ++/--, destructuring or for-in/of target), if any. */
+	private parameterWrite(parameter: ts.ParameterDeclaration): ts.Node | undefined {
+		const fn = parameter.parent;
+		const own = ts.isIdentifier(parameter.name) ? this.checker.getSymbolAtLocation(parameter.name) : undefined;
+		const body = (fn as ts.FunctionLikeDeclaration).body;
+		if (own === undefined || body === undefined) {
+			return own === undefined ? parameter : undefined;
 		}
-		const declaration = ts.isIdentifier(e) ? this.symbolOf(e)?.valueDeclaration : undefined;
-		return declaration !== undefined && isConstWithInitializer(declaration) && this.mayHoldWebview(declaration.initializer, depth + 1);
+		let written: ts.Node | undefined;
+		const visit = (node: ts.Node): void => {
+			if (written === undefined && ts.isIdentifier(node) && node !== parameter.name) {
+				const symbol = ts.isShorthandPropertyAssignment(node.parent) && node.parent.name === node
+					? this.checker.getShorthandAssignmentValueSymbol(node.parent)
+					: this.checker.getSymbolAtLocation(node);
+				if (symbol === own && assignmentTarget(node)?.kind !== 'read') {
+					written = node;
+				}
+			}
+			ts.forEachChild(node, visit);
+		};
+		visit(body);
+		return written;
 	}
 
 	private unaccounted(node: ts.Node, what: string): void {
@@ -255,6 +315,11 @@ export class WebviewHtmlAnalysis {
 			if (declaration !== undefined && isConstWithInitializer(declaration)) {
 				this.trace(declaration.initializer, depth + 1, documents, failures);
 			} else if (declaration !== undefined && ts.isParameter(declaration)) {
+				const write = this.parameterWrite(declaration);
+				if (write !== undefined) {
+					failures.push(`${this.where(write)}: the HTML parameter \`${e.text}\` is written inside its function, so its callers' arguments are not what is assigned`);
+					return;
+				}
 				for (const argument of this.argumentsFor(declaration, failures)) {
 					this.trace(argument, depth + 1, documents, failures);
 				}
@@ -293,7 +358,9 @@ export class WebviewHtmlAnalysis {
 			failures.push(`${this.where(parameter)}: the HTML is a parameter of a function this check cannot find the callers of`);
 			return [];
 		}
-		if (ts.isMethodDeclaration(fn) && ts.isClassLike(fn.parent) && (fn.parent.heritageClauses?.length ?? 0) > 0) {
+		// A private method is reachable only from inside its class, never through a base type or an interface.
+		const isPrivate = ts.isMethodDeclaration(fn) && (ts.isPrivateIdentifier(fn.name) || (ts.getCombinedModifierFlags(fn) & ts.ModifierFlags.Private) !== 0);
+		if (ts.isMethodDeclaration(fn) && ts.isClassLike(fn.parent) && (fn.parent.heritageClauses?.length ?? 0) > 0 && !isPrivate) {
 			failures.push(`${this.where(parameter)}: the HTML is a method parameter of a class with heritage clauses (callers through a base type are not traced)`);
 			return [];
 		}
@@ -318,52 +385,130 @@ export class WebviewHtmlAnalysis {
 				take(call);
 			}
 		}
-		// A method is also reachable through any structural type (an interface or type-literal member of the same name) and
-		// through an untyped receiver: each such call's argument is traced, and any other reference to such a member fails.
+		// A method is also reachable through any other member of the same name (structural typing lets any object with that
+		// member stand in), through an untyped receiver, and by its name as a string or a computed key. Fail closed: every occurrence
+		// of the name is a direct call, whose argument is traced, or a named failure; only a binding that is not a member is skipped.
 		if (ts.isMethodDeclaration(fn) && (ts.isIdentifier(fn.name) || ts.isStringLiteral(fn.name))) {
 			const member = fn.name.text;
-			for (const [other, otherReferences] of this.referenceIndex()) {
-				if (other === symbol || other.name !== member || !other.declarations?.some(d => ts.isMethodSignature(d) || ts.isPropertySignature(d))) {
+			const owner = ts.isClassLike(fn.parent) && fn.parent.name !== undefined ? this.checker.getSymbolAtLocation(fn.parent.name) : undefined;
+			const instance = owner === undefined ? undefined : this.checker.getDeclaredTypeOfSymbol(owner);
+			for (const occurrence of this.nameIndex().get(member) ?? []) {
+				if (occurrence === fn.name || references.includes(occurrence)) {
 					continue;
 				}
-				for (const reference of otherReferences) {
-					if ((ts.isMethodSignature(reference.parent) || ts.isPropertySignature(reference.parent)) && reference.parent.name === reference) {
-						continue;
-					}
-					const call = calleeCall(reference);
+				const parent = occurrence.parent;
+				if ((ts.isBindingElement(parent) && (parent.propertyName === occurrence || (parent.propertyName === undefined && parent.name === occurrence)))
+					|| (ts.isShorthandPropertyAssignment(parent) && parent.name === occurrence && assignmentTarget(parent.name)?.kind !== 'read')) {
+					failures.push(`${this.where(occurrence)}: ${member} is destructured, so a call through it is not traced (${short(parent)})`);
+					continue;
+				}
+				if (ts.isStringLiteralLike(occurrence)) {
+					const call = ts.isElementAccessExpression(parent) && parent.argumentExpression === occurrence ? calleeCall(occurrence) : undefined;
 					if (call === undefined) {
-						failures.push(`${this.where(reference)}: ${member} is reached through a structural type other than by a direct call (${short(reference.parent)})`);
+						failures.push(`${this.where(occurrence)}: the name ${member} appears as a string other than a direct call's key, so it may select the method (${short(parent)})`);
 					} else {
 						take(call);
 					}
+					continue;
 				}
-			}
-			for (const reference of this.untypedMemberIndex().get(member) ?? []) {
-				const call = calleeCall(reference);
+				const found = this.symbolOf(occurrence);
+				const isMember = found === undefined
+					? ts.isPropertyAccessExpression(parent) && parent.name === occurrence
+					: found.declarations?.some(d => ts.isClassElement(d) || ts.isTypeElement(d) || ts.isObjectLiteralElement(d)) === true;
+				if (!isMember) {
+					continue;
+				}
+				if ((ts.isMethodDeclaration(parent) || ts.isMethodSignature(parent) || ts.isPropertySignature(parent) || ts.isPropertyDeclaration(parent)
+					|| ts.isPropertyAssignment(parent)) && parent.name === occurrence) {
+					continue;
+				}
+				// \`C.member(...)\` on a class itself is that class's static member: positively not this method.
+				if (ts.isPropertyAccessExpression(parent) && parent.name === occurrence && ts.isIdentifier(parent.expression)
+					&& ((this.symbolOf(parent.expression)?.flags ?? 0) & ts.SymbolFlags.Class) !== 0) {
+					continue;
+				}
+				// A typed receiver that an instance of this class is not assignable to holds one only through a cast (failed below).
+				if (found !== undefined && instance !== undefined && ts.isPropertyAccessExpression(parent) && parent.name === occurrence
+					&& !this.checker.isTypeAssignableTo(instance, this.checker.getTypeAtLocation(parent.expression))) {
+					continue;
+				}
+				const call = calleeCall(occurrence);
 				if (call === undefined) {
-					failures.push(`${this.where(reference)}: ${member} is reached through an untyped receiver other than by a direct call (${short(reference.parent)})`);
+					failures.push(`${this.where(occurrence)}: ${member} is reached through ${found === undefined ? 'an untyped receiver' : 'another member of that name'} other than by a direct call (${short(parent)})`);
 				} else {
 					take(call);
+				}
+			}
+			if (instance !== undefined) {
+				for (const cast of this.casts()) {
+					if (this.checker.getTypeAtLocation(cast.expression).getSymbol() === instance.getSymbol() && this.checker.getTypeAtLocation(cast).getSymbol() !== instance.getSymbol()) {
+						failures.push(`${this.where(cast)}: an instance of ${owner?.name} is cast to another type, so a call of ${member} through it is not traced (${short(cast)})`);
+					}
+				}
+			}
+			for (const access of this.computedAccesses()) {
+				if (this.keyAdmits(this.checker.getTypeAtLocation(access.argumentExpression), member, 0) && this.mayHaveMember(access.expression, member)) {
+					failures.push(`${this.where(access)}: a computed key may select ${member} (${short(access)})`);
 				}
 			}
 		}
 		return out;
 	}
 
-	/** Member names accessed on a receiver the checker cannot type (`x.name` with no symbol, as through `any`). */
-	private untypedMemberIndex(): Map<string, ts.Node[]> {
-		if (this.untypedMembers === undefined) {
+	/** Every identifier and string literal in the source, by its text. */
+	private nameIndex(): Map<string, ts.Node[]> {
+		if (this.names === undefined) {
 			const index = new Map<string, ts.Node[]>();
 			const visit = (node: ts.Node): void => {
-				if (ts.isIdentifier(node) && ts.isPropertyAccessExpression(node.parent) && node.parent.name === node && this.symbolOf(node) === undefined) {
+				if (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) {
 					index.set(node.text, [...(index.get(node.text) ?? []), node]);
 				}
 				ts.forEachChild(node, visit);
 			};
 			this.files.forEach(visit);
-			this.untypedMembers = index;
+			this.names = index;
 		}
-		return this.untypedMembers;
+		return this.names;
+	}
+
+	/** Every element access in the source whose key is not a string literal. */
+	private computedAccesses(): ts.ElementAccessExpression[] {
+		if (this.computed === undefined) {
+			const out: ts.ElementAccessExpression[] = [];
+			const visit = (node: ts.Node): void => {
+				if (ts.isElementAccessExpression(node) && !ts.isStringLiteralLike(skipOuter(node.argumentExpression))) {
+					out.push(node);
+				}
+				ts.forEachChild(node, visit);
+			};
+			this.files.forEach(visit);
+			this.computed = out;
+		}
+		return this.computed;
+	}
+
+	/** Every cast in the source (\`as\`, \`<T>\`, \`satisfies\` excluded: it keeps the type). */
+	private casts(): (ts.AsExpression | ts.TypeAssertion)[] {
+		if (this.castList === undefined) {
+			const out: (ts.AsExpression | ts.TypeAssertion)[] = [];
+			const visit = (node: ts.Node): void => {
+				if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
+					out.push(node);
+				}
+				ts.forEachChild(node, visit);
+			};
+			this.files.forEach(visit);
+			this.castList = out;
+		}
+		return this.castList;
+	}
+
+	/** A receiver whose type may carry the member: any, unknown, object, a generic type, or a type with that property. */
+	private mayHaveMember(receiver: ts.Expression, member: string): boolean {
+		const type = this.checker.getTypeAtLocation(receiver);
+		return [type, ...(type.isUnionOrIntersection() ? type.types : [])].some(t =>
+			(t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive | ts.TypeFlags.Instantiable)) !== 0
+			|| this.checker.getPropertyOfType(this.checker.getApparentType(t), member) !== undefined);
 	}
 
 	private referenceIndex(): Map<ts.Symbol, ts.Node[]> {
@@ -496,6 +641,11 @@ export class WebviewHtmlAnalysis {
 			if (declaration !== undefined && isConstWithInitializer(declaration)) {
 				this.terminals(declaration.initializer, depth + 1, out, problems);
 			} else if (declaration !== undefined && ts.isParameter(declaration)) {
+				const write = this.parameterWrite(declaration);
+				if (write !== undefined) {
+					problems.push(`the parameter \`${e.text}\` is written inside its function (${this.where(write)})`);
+					return;
+				}
 				for (const argument of this.argumentsFor(declaration, problems)) {
 					this.terminals(argument, depth + 1, out, problems);
 				}
@@ -507,10 +657,39 @@ export class WebviewHtmlAnalysis {
 		}
 	}
 
-	/** `<x>.cspSource` where the member is vscode's Webview.cspSource. */
+	/** `<x>.cspSource` where the member is vscode's Webview.cspSource and x is a webview vscode handed over (`isVscodeWebview`). */
 	private isWebviewCspSource(e: ts.Expression): boolean {
 		return ts.isPropertyAccessExpression(e) && this.symbolOf(e.name)?.declarations?.some(d =>
-			ts.isPropertySignature(d) && d.name.getText() === 'cspSource' && isVscodeWebviewInterface(d.parent as ts.Declaration)) === true;
+			ts.isPropertySignature(d) && d.name.getText() === 'cspSource' && isVscodeWebviewInterface(d.parent as ts.Declaration)) === true
+			&& this.isVscodeWebview(e.expression, 0);
+	}
+
+	/**
+	 * A receiver that is a webview vscode handed over, fail closed: `<y>.webview` where the member is a \`webview\` property of a
+	 * vscode API interface (a panel's or a view's), reached through consts and unwritten parameters (every call site). A cast, a
+	 * locally built object, or anything else is not one.
+	 */
+	private isVscodeWebview(receiver: ts.Expression, depth: number): boolean {
+		let e = receiver;
+		while (ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e)) {
+			e = e.expression;
+		}
+		if (depth > MAX_TRACE_DEPTH) {
+			return false;
+		}
+		if (ts.isPropertyAccessExpression(e)) {
+			return e.name.text === 'webview' && this.symbolOf(e.name)?.declarations?.some(d => ts.isPropertySignature(d) && isInVscodeModule(d)) === true;
+		}
+		const declaration = ts.isIdentifier(e) ? this.symbolOf(e)?.valueDeclaration : undefined;
+		if (declaration !== undefined && isConstWithInitializer(declaration)) {
+			return this.isVscodeWebview(declaration.initializer, depth + 1);
+		}
+		if (declaration !== undefined && ts.isParameter(declaration) && this.parameterWrite(declaration) === undefined) {
+			const problems: string[] = [];
+			const args = this.argumentsFor(declaration, problems);
+			return problems.length === 0 && args.length > 0 && args.every(a => this.isVscodeWebview(a, depth + 1));
+		}
+		return false;
 	}
 
 	/** A call, with no arguments, of an in-source function with no parameters whose returns are all computed (no string literal). */
@@ -647,6 +826,15 @@ function calleeCall(reference: ts.Node): ts.CallExpression | undefined {
 		return ts.isCallExpression(parent.parent) && parent.parent.expression === parent ? parent.parent : undefined;
 	}
 	return undefined;
+}
+
+function isInVscodeModule(node: ts.Node): boolean {
+	for (let n: ts.Node = node.parent; n !== undefined; n = n.parent) {
+		if (ts.isModuleDeclaration(n) && ts.isStringLiteral(n.name) && n.name.text === 'vscode') {
+			return true;
+		}
+	}
+	return false;
 }
 
 function isVscodeWebviewInterface(declaration: ts.Declaration): boolean {
@@ -832,7 +1020,7 @@ export function show(panel: vscode.WebviewPanel): void { const html = build(pane
 		assertFails(`${traced}\nexport function other(panel: vscode.WebviewPanel): void { const h: { initialize(html: string): void } = new Holder(panel); h.initialize(${plain}); }`,
 			'the assigned HTML has no Content-Security-Policy meta');
 		assertFails(`${traced}\nexport function other(panel: vscode.WebviewPanel): void { const h: { initialize(html: string): void } = new Holder(panel); const f = h.initialize; f(${plain}); }`,
-			'initialize is reached through a structural type other than by a direct call');
+			'initialize is reached through another member of that name other than by a direct call');
 		assertFails(`${traced}\nexport function other(panel: vscode.WebviewPanel): void { const h: any = new Holder(panel); h.initialize(${plain}); }`,
 			'the assigned HTML has no Content-Security-Policy meta');
 		// computed writes through aliases, and the controls that stay out of the inventory
@@ -870,6 +1058,65 @@ export function show(panel: vscode.WebviewPanel): void {
 		assert.deepStrictEqual(fixtureFailures(inactive(m => m)), []);
 		assertFails(inactive(m => `<!-- ${m} -->`), 'the Content-Security-Policy meta is not active');
 		assertFails(inactive(m => `<title>${m}</title>`), 'the Content-Security-Policy meta is not active');
+	});
+
+	test('c3: what the analysis does not positively recognise as a site, receiver, key or binding fails by name (fail closed)', () => {
+		const plain = '"<html><body>plain</body></html>"';
+		const holder = `class Holder { constructor(private readonly panel: vscode.WebviewPanel) { } initialize(html: string): void { this.panel.webview.html = html; } }`;
+		const traced = `${GOOD_BUILDER}\n${holder}
+export function show(panel: vscode.WebviewPanel): void { const html = build(panel.webview, makeNonce()); new Holder(panel).initialize(html); }`;
+		const other = (body: string) => `${traced}\nexport function other(panel: vscode.WebviewPanel): void { ${body} }`;
+		const noMeta = 'the assigned HTML has no Content-Security-Policy meta';
+		// (1) every occurrence of a traced method's name is a direct call, or fails
+		assertFails(other(`const h: any = new Holder(panel); h['initialize'](${plain});`), noMeta);
+		assertFails(other(`const h: { initialize(html: string): void } = new Holder(panel); const key: 'initialize' = 'initialize'; h[key](${plain});`),
+			'the name initialize appears as a string other than a direct call\'s key');
+		assertFails(other(`const h: { initialize(html: string): void } = new Holder(panel); const key: 'initialize' = 'initialize'; h[key](${plain});`),
+			'a computed key may select initialize');
+		assertFails(other(`const h = new Holder(panel); const { initialize } = h; initialize.call(h, ${plain});`), 'initialize is destructured');
+		assertFails(other(`const h = new Holder(panel); h.initialize.call(h, ${plain});`), 'initialize is referenced other than by a direct call');
+		assertFails(`${traced}\nclass Other { initialize(html: string): void { void html; } }\nexport function other(panel: vscode.WebviewPanel): void { const o: Other = new Holder(panel); o.initialize(${plain}); }`, noMeta);
+		assertFails(`${traced}\nclass Other { private x = 0; initialize(html: string): void { void html; void this.x; } }\nexport function other(panel: vscode.WebviewPanel): void { (new Holder(panel) as unknown as Other).initialize(${plain}); }`,
+			'an instance of Holder is cast to another type');
+		assertFails(`${traced}\nexport function other<K extends keyof Holder>(panel: vscode.WebviewPanel, k: K): void { const h = new Holder(panel); (h[k] as unknown as (s: string) => void)(${plain}); }`,
+			'a computed key may select initialize');
+		// (2) computed writes: keys through their constraints, receivers through casts, consts and every call site
+		assertFails(`export function overwrite<K extends 'html'>(panel: vscode.WebviewPanel, key: K): void { const view: { html: string } = panel.webview; view[key] = ${plain}; }`, noMeta);
+		assertFails(`export function overwrite<K extends string>(panel: vscode.WebviewPanel, key: K): void { const view: { html: string } = panel.webview; view[key as 'html'] = ${plain}; }`, noMeta);
+		assertFails(`function overwrite(target: object, key: string): void { const view = target as { [key: string]: string }; view[key] = ${plain}; }
+export function show(panel: vscode.WebviewPanel): void { overwrite(panel.webview, 'html'); }`, noMeta);
+		assertFails(`function overwrite(target: object, key: string): void { const view = target as { [key: string]: string }; view[key] = ${plain}; }`, noMeta);
+		// (3) a cspSource counts only from a webview vscode handed over
+		const source = (declarations: string, receiver: string) => `${NONCE_SOURCE}
+export function show(panel: vscode.WebviewPanel): void {
+	const nonce = makeNonce();
+	${declarations}
+	const csp = \`default-src 'none'; script-src 'nonce-\${nonce}'; connect-src \${${receiver}.cspSource}\`;
+	panel.webview.html = ${GOOD_DOCUMENT};
+}`;
+		assert.deepStrictEqual(fixtureFailures(source('const w = panel.webview;', 'w')), []);
+		assertFails(source(`const policyWebview: vscode.Webview = { ...panel.webview, cspSource: '*' };`, 'policyWebview'), 'which this check cannot resolve');
+		assertFails(source(`const w: vscode.Webview = { html: '', cspSource: '*' };`, 'w'), 'which this check cannot resolve');
+		assertFails(source(`const w = panel.webview as vscode.Webview;`, 'w'), 'which this check cannot resolve');
+		// (4) a traced parameter that is written inside its function fails, whatever the write
+		const written = (write: string) => `${GOOD_BUILDER}\n${holder.replace('{ this.panel.webview.html = html; }', `{ ${write}; this.panel.webview.html = html; }`)}
+export function show(panel: vscode.WebviewPanel): void { new Holder(panel).initialize(build(panel.webview, makeNonce())); }`;
+		for (const write of [`html = ${plain}`, `html += ''`, `[html] = [${plain}]`, `({ html } = { html: ${plain} })`]) {
+			assertFails(written(write), 'the HTML parameter `html` is written inside its function');
+		}
+		assertFails(`${NONCE_SOURCE}
+function build(cspSource: string, nonce: string): string {
+	cspSource = '*';
+	const csp = \`default-src 'none'; script-src 'nonce-\${nonce}'; connect-src \${cspSource}\`;
+	return ${GOOD_DOCUMENT};
+}
+export function show(panel: vscode.WebviewPanel): void { panel.webview.html = build(panel.webview.cspSource, makeNonce()); }`, 'the parameter `cspSource` is written inside its function');
+		// regressions: what is positively recognised still passes
+		assert.deepStrictEqual(fixtureFailures(traced), []);
+		assert.deepStrictEqual(fixtureFailures(`${traced}\nclass Registry { static initialize(n: number): void { void n; } }\nexport function boot(): void { Registry.initialize(1); }`), []);
+		assert.deepStrictEqual(fixtureFailures(`${traced}\nclass Store { private n = 0; initialize(n: number): void { this.n = n; } }\nexport function boot(): void { new Store().initialize(1); }`), []);
+		assert.deepStrictEqual(fixtureFailures(`${traced}\nfunction put(target: object, key: string): void { const m = target as { [k: string]: string }; m[key] = 'x'; }\nexport function boot(): void { put({}, 'a'); }`), []);
+		assert.deepStrictEqual(fixtureFailures(`${traced}\nexport function count(values: string[], key: number, map: { [k: string]: number }, name: string): void { values[key] = 'x'; map[name] = 1; }`), []);
 	});
 
 	test('every source file that writes a webview html is listed, with its number of writes', () => {
