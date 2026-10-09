@@ -433,6 +433,17 @@ export class Menubar extends Disposable {
 			{ type: 'separator' },
 			{ label: nls.localize('miQuit', "Quit {0}", name), accelerator: 'Command+Q', click: (item, window, event) => this.quitFromMenu(event) }
 		]);
+		// QuantLab host (F-HOST-EDITMENU-1): macOS sends the clipboard key equivalents to the menu's Edit roles; without them Cmd+V,
+		// Cmd+C and Cmd+A do nothing in the sign-in inputs before the workbench sends its menus
+		const editMenu = Menu.buildFromTemplate([
+			{ label: nls.localize('mUndo', "Undo"), role: 'undo', accelerator: 'Command+Z' },
+			{ label: nls.localize('mRedo', "Redo"), role: 'redo', accelerator: 'Command+Shift+Z' },
+			{ type: 'separator' },
+			{ label: nls.localize('mCut', "Cut"), role: 'cut', accelerator: 'Command+X' },
+			{ label: nls.localize('mCopy', "Copy"), role: 'copy', accelerator: 'Command+C' },
+			{ label: nls.localize('mPaste', "Paste"), role: 'paste', accelerator: 'Command+V' },
+			{ label: nls.localize('mSelectAll', "Select All"), role: 'selectAll', accelerator: 'Command+A' }
+		]);
 		const windowMenu = Menu.buildFromTemplate([
 			{ label: nls.localize('mMinimize', "Minimize"), role: 'minimize', accelerator: 'Command+M' },
 			{ label: nls.localize('mZoom', "Zoom"), role: 'zoom' },
@@ -441,6 +452,7 @@ export class Menubar extends Disposable {
 		]);
 		const menubar = new Menu();
 		menubar.append(new MenuItem({ label: this.productService.nameShort, submenu: applicationMenu }));
+		menubar.append(new MenuItem({ label: this.mnemonicLabel(nls.localize({ key: 'mEdit', comment: ['&& denotes a mnemonic'] }, "&&Edit")), submenu: editMenu }));
 		menubar.append(new MenuItem({ label: nls.localize('mWindow', "Window"), submenu: windowMenu }));
 		return menubar;
 	}
