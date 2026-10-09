@@ -13,8 +13,11 @@ import * as ts from 'typescript';
 // default-src 'none'; scripts by nonce only (no 'unsafe-inline', no host source, the effective script-src-elem and
 // script-src-attr included); no 'unsafe-eval' in any directive; connect-src the webview's cspSource only. A webview with no
 // policy fails. No vscode runtime: the TypeScript checker reads the source. Every write to a property named `html` is a site,
-// whatever the object is called; the value each site assigns is traced (consts, calls, parameters through their call sites) to
-// the HTML literal it is, and that document's policy is judged. Anything the trace cannot account for is a named failure.
+// whatever the object is called, and so is a computed write whose key may be `html` into a receiver that may be a webview; the
+// value each site assigns is traced (consts, calls, parameters through every call site, structural and untyped ones included)
+// to the HTML literal it is. That document's policy meta must be active (only the doctype, <html>, <head> and plain metas
+// before it), and each interpolation in the policy is judged by its binding: a Webview's cspSource or a generated nonce.
+// Anything the trace cannot account for is a named failure.
 
 const EXTENSION_ROOT = path.resolve(__dirname, '..', '..', '..');
 const SRC = path.join(EXTENSION_ROOT, 'src');
@@ -37,8 +40,6 @@ const WEBVIEW_HTML_ASSIGNMENTS: Record<string, number> = {
 
 const CSP_SOURCE = 'CSP-SOURCE';
 const NONCE = 'NONCE';
-const CSP_SOURCE_EXPRESSIONS = new Set(['webview.cspSource', 'cspSource']);
-const NONCE_EXPRESSIONS = new Set(['nonce', 'n']);
 const MAX_TRACE_DEPTH = 12;
 
 export function parsePolicy(policy: string): Map<string, string[]> {
@@ -131,6 +132,7 @@ export class WebviewHtmlAnalysis {
 	private readonly checker: ts.TypeChecker;
 	private readonly files: ts.SourceFile[];
 	private references: Map<ts.Symbol, ts.Node[]> | undefined;
+	private untypedMembers: Map<string, ts.Node[]> | undefined;
 
 	constructor(program: ts.Program, private readonly srcRoot: string) {
 		this.checker = program.getTypeChecker();
@@ -155,30 +157,78 @@ export class WebviewHtmlAnalysis {
 
 	private collect(node: ts.Node): void {
 		if (isHtmlTarget(node)) {
+			this.htmlSite(node, assignmentTarget(node));
+		} else if (ts.isElementAccessExpression(node) && !ts.isStringLiteralLike(skipOuter(node.argumentExpression))) {
 			const target = assignmentTarget(node);
-			const failures: string[] = [];
-			const policies: string[] = [];
-			if (target === undefined) {
-				failures.push(`${this.where(node)}: an html property is written other than by a plain \`=\` (${short(node.parent)})`);
-			} else if (target.kind === 'assign') {
-				const documents = new Set<ts.Node>();
-				this.trace(target.value, 0, documents, failures);
-				if (documents.size === 0 && failures.length === 0) {
-					failures.push(`${this.where(node)}: the assigned value resolves to no HTML document`);
-				}
-				for (const document of documents) {
-					policies.push(...this.policiesOfDocument(document, failures));
-				}
+			if (target?.kind !== 'read' && this.mayBeHtmlKey(node.argumentExpression) && this.mayHoldWebview(node.expression, 0)) {
+				this.htmlSite(node, target);
+			} else if (this.isWebview(node.expression)) {
+				this.unaccounted(node, 'a Webview member is accessed by a computed key');
 			}
-			if (target === undefined || target.kind === 'assign') {
-				this.sites.push({ file: this.relative(node), where: this.where(node), policies, failures });
-			}
-		} else if (ts.isElementAccessExpression(node) && !ts.isStringLiteralLike(skipOuter(node.argumentExpression)) && this.isWebview(node.expression)) {
-			this.unaccounted(node, 'a Webview member is accessed by a computed key');
-		} else if (ts.isCallExpression(node) && isReflectiveWrite(node) && node.arguments.some(a => this.isWebview(a) || carriesHtmlKey(a))) {
-			this.unaccounted(node, 'a Webview, or an `html` key, is passed to a reflective write');
+		} else if ((ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) && this.isWebview(node.expression) && !this.isWebview(node)) {
+			this.unaccounted(node, 'a Webview is cast to another type');
+		} else if (ts.isCallExpression(node) && isReflectiveWrite(node)
+			&& node.arguments.some((a, i) => this.isWebview(a) || carriesHtmlKey(a) || (i === 0 && this.mayHoldWebview(a, 0)))) {
+			this.unaccounted(node, 'a Webview, a receiver that may be one, or an `html` key, is passed to a reflective write');
 		}
 		ts.forEachChild(node, child => this.collect(child));
+	}
+
+	/** A write that may set a webview's html: a plain `=` is traced and its documents judged; any other write fails by name. */
+	private htmlSite(node: ts.Expression, target: ReturnType<typeof assignmentTarget>): void {
+		const failures: string[] = [];
+		const policies: string[] = [];
+		if (target === undefined) {
+			failures.push(`${this.where(node)}: an html property is written other than by a plain \`=\` (${short(node.parent)})`);
+		} else if (target.kind === 'assign') {
+			const documents = new Set<ts.Node>();
+			this.trace(target.value, 0, documents, failures);
+			if (documents.size === 0 && failures.length === 0) {
+				failures.push(`${this.where(node)}: the assigned value resolves to no HTML document`);
+			}
+			for (const document of documents) {
+				policies.push(...this.policiesOfDocument(document, failures));
+			}
+		}
+		if (target === undefined || target.kind === 'assign') {
+			this.sites.push({ file: this.relative(node), where: this.where(node), policies, failures });
+		}
+	}
+
+	/** A computed key whose type admits the string `html` (string, any, unknown, a template type, or a union with 'html'). */
+	private mayBeHtmlKey(key: ts.Expression): boolean {
+		const type = this.checker.getTypeAtLocation(key);
+		return [type, ...(type.isUnion() ? type.types : [])].some(t =>
+			(t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.String | ts.TypeFlags.TemplateLiteral | ts.TypeFlags.StringMapping)) !== 0
+			|| (t.isStringLiteral() && t.value === 'html'));
+	}
+
+	/**
+	 * A receiver that may be a webview: a Webview, any or unknown, a type with an `html` property, or a cast or const alias of such
+	 * a value. (A Webview is an interface, so it reaches an index-signature type only through a cast, which is followed here and
+	 * reported by name in `collect`.)
+	 */
+	private mayHoldWebview(receiver: ts.Expression, depth: number): boolean {
+		let e = receiver;
+		while (ts.isParenthesizedExpression(e)) {
+			e = e.expression;
+		}
+		if (this.isWebview(e)) {
+			return true;
+		}
+		const type = this.checker.getTypeAtLocation(e);
+		if ([type, ...(type.isUnionOrIntersection() ? type.types : [])].some(t => (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0
+			|| this.checker.getPropertyOfType(this.checker.getApparentType(t), 'html') !== undefined)) {
+			return true;
+		}
+		if (depth > MAX_TRACE_DEPTH) {
+			return true;
+		}
+		if (ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isSatisfiesExpression(e) || ts.isNonNullExpression(e)) {
+			return this.mayHoldWebview(e.expression, depth + 1);
+		}
+		const declaration = ts.isIdentifier(e) ? this.symbolOf(e)?.valueDeclaration : undefined;
+		return declaration !== undefined && isConstWithInitializer(declaration) && this.mayHoldWebview(declaration.initializer, depth + 1);
 	}
 
 	private unaccounted(node: ts.Node, what: string): void {
@@ -253,17 +303,67 @@ export class WebviewHtmlAnalysis {
 			failures.push(`${this.where(parameter)}: ${name.getText()} has no call site in the source`);
 		}
 		const out: ts.Expression[] = [];
-		for (const reference of references) {
-			const call = calleeCall(reference);
-			if (call === undefined || this.checker.getResolvedSignature(call)?.declaration !== fn) {
-				failures.push(`${this.where(reference)}: ${name.getText()} is referenced other than by a direct call (${short(reference.parent)})`);
-			} else if (call.arguments.slice(0, index + 1).some(ts.isSpreadElement) || call.arguments.length <= index) {
+		const take = (call: ts.CallExpression): void => {
+			if (call.arguments.slice(0, index + 1).some(ts.isSpreadElement) || call.arguments.length <= index) {
 				failures.push(`${this.where(call)}: the call passes no plain argument for ${parameter.name.getText()}`);
 			} else {
 				out.push(call.arguments[index]);
 			}
+		};
+		for (const reference of references) {
+			const call = calleeCall(reference);
+			if (call === undefined || this.checker.getResolvedSignature(call)?.declaration !== fn) {
+				failures.push(`${this.where(reference)}: ${name.getText()} is referenced other than by a direct call (${short(reference.parent)})`);
+			} else {
+				take(call);
+			}
+		}
+		// A method is also reachable through any structural type (an interface or type-literal member of the same name) and
+		// through an untyped receiver: each such call's argument is traced, and any other reference to such a member fails.
+		if (ts.isMethodDeclaration(fn) && (ts.isIdentifier(fn.name) || ts.isStringLiteral(fn.name))) {
+			const member = fn.name.text;
+			for (const [other, otherReferences] of this.referenceIndex()) {
+				if (other === symbol || other.name !== member || !other.declarations?.some(d => ts.isMethodSignature(d) || ts.isPropertySignature(d))) {
+					continue;
+				}
+				for (const reference of otherReferences) {
+					if ((ts.isMethodSignature(reference.parent) || ts.isPropertySignature(reference.parent)) && reference.parent.name === reference) {
+						continue;
+					}
+					const call = calleeCall(reference);
+					if (call === undefined) {
+						failures.push(`${this.where(reference)}: ${member} is reached through a structural type other than by a direct call (${short(reference.parent)})`);
+					} else {
+						take(call);
+					}
+				}
+			}
+			for (const reference of this.untypedMemberIndex().get(member) ?? []) {
+				const call = calleeCall(reference);
+				if (call === undefined) {
+					failures.push(`${this.where(reference)}: ${member} is reached through an untyped receiver other than by a direct call (${short(reference.parent)})`);
+				} else {
+					take(call);
+				}
+			}
 		}
 		return out;
+	}
+
+	/** Member names accessed on a receiver the checker cannot type (`x.name` with no symbol, as through `any`). */
+	private untypedMemberIndex(): Map<string, ts.Node[]> {
+		if (this.untypedMembers === undefined) {
+			const index = new Map<string, ts.Node[]>();
+			const visit = (node: ts.Node): void => {
+				if (ts.isIdentifier(node) && ts.isPropertyAccessExpression(node.parent) && node.parent.name === node && this.symbolOf(node) === undefined) {
+					index.set(node.text, [...(index.get(node.text) ?? []), node]);
+				}
+				ts.forEachChild(node, visit);
+			};
+			this.files.forEach(visit);
+			this.untypedMembers = index;
+		}
+		return this.untypedMembers;
 	}
 
 	private referenceIndex(): Map<ts.Symbol, ts.Node[]> {
@@ -293,24 +393,28 @@ export class WebviewHtmlAnalysis {
 		return this.files.includes(node.getSourceFile());
 	}
 
-	/** The policies of one HTML document: its Content-Security-Policy meta must precede every interpolation and script. */
+	/**
+	 * The policies of one HTML document. Its first Content-Security-Policy meta must be active and first: before it the document
+	 * may hold only the doctype, <html>, <head> and plain charset or name/content metas (no comment, other element
+	 * or interpolation).
+	 */
 	private policiesOfDocument(document: ts.Node, failures: string[]): string[] {
 		const { text, spans } = templateParts(document);
-		const metas = [...text.matchAll(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"/gi)];
+		const metas = [...text.matchAll(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"\s*\/?>/gi)];
 		if (metas.length === 0) {
 			failures.push(`${this.where(document)}: the assigned HTML has no Content-Security-Policy meta`);
 			return [];
 		}
 		const before = text.slice(0, metas[0].index);
-		if (/\u0000\d+\u0000/.test(before) || /<script/i.test(before)) {
-			failures.push(`${this.where(document)}: an interpolation or a script precedes the Content-Security-Policy meta`);
+		if (!ACTIVE_META_PREFIX.test(before)) {
+			failures.push(`${this.where(document)}: the Content-Security-Policy meta is not active: only the doctype, <html>, <head> and plain charset or name/content metas may precede it (${JSON.stringify(before.slice(-60))})`);
 		}
 		const policies: string[] = [];
 		for (const meta of metas) {
 			const single = /^\u0000(\d+)\u0000$/.exec(meta[1].trim());
 			const policy = single !== null
 				? this.policyOfExpression(spans[Number(single[1])], 0, failures)
-				: resolveInterpolations(meta[1], spans, this.where(document), failures);
+				: this.resolveInterpolations(meta[1], spans, this.where(document), failures);
 			if (policy !== undefined) {
 				policies.push(policy);
 			}
@@ -335,7 +439,7 @@ export class WebviewHtmlAnalysis {
 		}
 		if (ts.isStringLiteralLike(e) || ts.isTemplateExpression(e)) {
 			const { text, spans } = templateParts(e);
-			return resolveInterpolations(text, spans, this.where(e), failures);
+			return this.resolveInterpolations(text, spans, this.where(e), failures);
 		}
 		const join = ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression) && e.expression.name.text === 'join' ? e.expression : undefined;
 		const array = join !== undefined ? skipOuter(join.expression) : undefined;
@@ -346,7 +450,7 @@ export class WebviewHtmlAnalysis {
 			for (const element of array.elements) {
 				if (ts.isStringLiteralLike(element) || ts.isTemplateExpression(element)) {
 					const { text, spans } = templateParts(element);
-					const part = resolveInterpolations(text, spans, this.where(element), failures);
+					const part = this.resolveInterpolations(text, spans, this.where(element), failures);
 					complete = complete && part !== undefined;
 					parts.push(part ?? '');
 				} else {
@@ -359,7 +463,73 @@ export class WebviewHtmlAnalysis {
 		failures.push(`${this.where(e)}: unsupported CSP expression, a ${ts.SyntaxKind[e.kind]} (${short(e)})`);
 		return undefined;
 	}
+
+	/** Replaces each interpolation by what its binding is (a Webview's cspSource, a generated nonce); anything else fails by name. */
+	private resolveInterpolations(text: string, spans: ts.Expression[], where: string, failures: string[]): string | undefined {
+		let complete = true;
+		const resolved = text.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => {
+			const span = spans[Number(index)];
+			const terminals: ts.Expression[] = [];
+			const problems: string[] = [];
+			this.terminals(span, 0, terminals, problems);
+			if (problems.length === 0 && terminals.length > 0 && terminals.every(t => this.isWebviewCspSource(t))) {
+				return CSP_SOURCE;
+			}
+			if (problems.length === 0 && terminals.length > 0 && terminals.every(t => this.isGeneratedNonce(t))) {
+				return NONCE;
+			}
+			const why = problems.length > 0 ? problems.join('; ') : `its value is neither a Webview's cspSource nor a generated nonce: ${terminals.map(short).join(', ')}`;
+			failures.push(`${where}: the policy interpolates \${${span.getText().trim()}}, which this check cannot resolve (${why})`);
+			complete = false;
+			return '';
+		});
+		return complete ? resolved : undefined;
+	}
+
+	/** The expressions a value comes from: through consts, and through parameters at every call site. */
+	private terminals(expression: ts.Expression, depth: number, out: ts.Expression[], problems: string[]): void {
+		const e = skipOuter(expression);
+		if (depth > MAX_TRACE_DEPTH) {
+			problems.push(`not resolved within ${MAX_TRACE_DEPTH} steps`);
+		} else if (ts.isIdentifier(e)) {
+			const declaration = this.symbolOf(e)?.valueDeclaration;
+			if (declaration !== undefined && isConstWithInitializer(declaration)) {
+				this.terminals(declaration.initializer, depth + 1, out, problems);
+			} else if (declaration !== undefined && ts.isParameter(declaration)) {
+				for (const argument of this.argumentsFor(declaration, problems)) {
+					this.terminals(argument, depth + 1, out, problems);
+				}
+			} else {
+				problems.push(`\`${e.text}\` is neither a const with an initializer nor a parameter`);
+			}
+		} else {
+			out.push(e);
+		}
+	}
+
+	/** `<x>.cspSource` where the member is vscode's Webview.cspSource. */
+	private isWebviewCspSource(e: ts.Expression): boolean {
+		return ts.isPropertyAccessExpression(e) && this.symbolOf(e.name)?.declarations?.some(d =>
+			ts.isPropertySignature(d) && d.name.getText() === 'cspSource' && isVscodeWebviewInterface(d.parent as ts.Declaration)) === true;
+	}
+
+	/** A call, with no arguments, of an in-source function with no parameters whose returns are all computed (no string literal). */
+	private isGeneratedNonce(e: ts.Expression): boolean {
+		if (!ts.isCallExpression(e) || e.arguments.length !== 0) {
+			return false;
+		}
+		const callee = this.checker.getResolvedSignature(e)?.declaration;
+		if (callee === undefined || !isTraceableFunction(callee) || !this.inSource(callee) || callee.parameters.length !== 0) {
+			return false;
+		}
+		const results = ts.isBlock(callee.body) ? returnsOf(callee.body) : [callee.body];
+		return results.length > 0 && results.every(r => r !== undefined && !ts.isStringLiteralLike(skipOuter(r)) && !ts.isTemplateExpression(skipOuter(r)));
+	}
 }
+
+// Before an active policy meta: the doctype, <html>, <head>, and plain charset or name/content metas (literal attribute values),
+// nothing else: no comment, no other element, no interpolation.
+const ACTIVE_META_PREFIX = /^\s*(<!DOCTYPE html>\s*)?<html(\s+lang="[A-Za-z-]+")?\s*>\s*<head>\s*(<meta\s+(charset="[A-Za-z0-9-]+"|name="[A-Za-z-]+"\s+content="[^"<>\u0000]*")\s*\/?>\s*)*$/i;
 
 /** A literal's text with each interpolation replaced by the placeholder \u0000<index>\u0000; the interpolated expressions. */
 function templateParts(node: ts.Node): { text: string; spans: ts.Expression[] } {
@@ -373,24 +543,6 @@ function templateParts(node: ts.Node): { text: string; spans: ts.Expression[] } 
 		return { text: node.text, spans: [] };
 	}
 	throw new Error(`templateParts: a ${ts.SyntaxKind[node.kind]} is not a literal`);
-}
-
-/** Replaces the webview cspSource and nonce interpolations; any other interpolation is a named failure, not a guess. */
-function resolveInterpolations(text: string, spans: ts.Expression[], where: string, failures: string[]): string | undefined {
-	let complete = true;
-	const resolved = text.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => {
-		const e = spans[Number(index)].getText().trim();
-		if (CSP_SOURCE_EXPRESSIONS.has(e)) {
-			return CSP_SOURCE;
-		}
-		if (NONCE_EXPRESSIONS.has(e)) {
-			return NONCE;
-		}
-		failures.push(`${where}: the policy interpolates \${${e}}, which this check cannot resolve`);
-		complete = false;
-		return '';
-	});
-	return complete ? resolved : undefined;
 }
 
 function skipOuter(expression: ts.Expression): ts.Expression {
@@ -567,14 +719,18 @@ function fixtureFailures(source: string): string[] {
 	return sites.flatMap(s => [...s.failures, ...s.policies.flatMap(judgePolicy)]);
 }
 
+// A nonce generator the binding check accepts: an in-source function with no parameters whose return is computed.
+const NONCE_SOURCE = `declare function randomText(): string;
+function makeNonce(): string { return randomText(); }`;
 const GOOD_DOCUMENT = '`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><script nonce="${nonce}"></script></body></html>`';
-const arrayPolicyFixture = (element: string, declarations: string) => `
-export function show(panel: vscode.WebviewPanel, nonce: string): void {
+const arrayPolicyFixture = (element: string, declarations: string) => `${NONCE_SOURCE}
+export function show(panel: vscode.WebviewPanel): void {
+	const nonce = makeNonce();
 	${declarations}
 	const csp = [\`default-src 'none'\`, \`script-src 'nonce-\${nonce}'\`, ${element}].join('; ');
 	panel.webview.html = ${GOOD_DOCUMENT};
 }`;
-const GOOD_BUILDER = `
+const GOOD_BUILDER = `${NONCE_SOURCE}
 function build(webview: vscode.Webview, nonce: string): string {
 	const csp = \`default-src 'none'; style-src \${webview.cspSource} 'unsafe-inline'; script-src 'nonce-\${nonce}'\`;
 	return ${GOOD_DOCUMENT};
@@ -629,36 +785,91 @@ suite('webview CSP (B5)', () => {
 	});
 
 	test('the inventory follows the value each html write assigns, whatever the names; what it cannot account for fails by name', () => {
-		assert.deepStrictEqual(fixtureFailures(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel): void { panel.webview.html = build(panel.webview, 'n'); }`), []);
+		assert.deepStrictEqual(fixtureFailures(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel): void { panel.webview.html = build(panel.webview, makeNonce()); }`), []);
 		const traced = `${GOOD_BUILDER}
 class Holder { constructor(private readonly panel: vscode.WebviewPanel) { } initialize(html: string): void { this.panel.webview.html = html; } }
-export function show(panel: vscode.WebviewPanel): void { const html = build(panel.webview, 'n'); new Holder(panel).initialize(html); }`;
+export function show(panel: vscode.WebviewPanel): void { const html = build(panel.webview, makeNonce()); new Holder(panel).initialize(html); }`;
 		assert.deepStrictEqual(fixtureFailures(traced), []);
 		const plain = '"<html><body>plain</body></html>"';
 		assertFails(`export function show(panel: vscode.WebviewPanel): void { const view = panel.webview; view.html = ${plain}; }`, 'the assigned HTML has no Content-Security-Policy meta');
 		assertFails(`export function show(target: { webview: { html: string } }): void { target.webview.html = ${plain}; }`, 'the assigned HTML has no Content-Security-Policy meta');
 		assertFails(`export function show(panel: vscode.WebviewPanel): void { panel.webview['html'] = ${plain}; }`, 'the assigned HTML has no Content-Security-Policy meta');
 		assertFails(`${traced}\nexport function other(panel: vscode.WebviewPanel): void { new Holder(panel).initialize(${plain}); }`, 'the assigned HTML has no Content-Security-Policy meta');
-		assertFails(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel, ok: boolean): void { panel.webview.html = ok ? build(panel.webview, 'n') : ${plain}; }`,
+		assertFails(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel, ok: boolean): void { panel.webview.html = ok ? build(panel.webview, makeNonce()) : ${plain}; }`,
 			'the assigned HTML has no Content-Security-Policy meta');
-		const policyAfter = (prefix: string) => `export function show(panel: vscode.WebviewPanel, nonce: string, title: string): void {
+		const policyAfter = (prefix: string) => `${NONCE_SOURCE}
+export function show(panel: vscode.WebviewPanel, title: string): void {
+	const nonce = makeNonce();
 	const csp = \`default-src 'none'; script-src 'nonce-\${nonce}'\`;
 	panel.webview.html = \`<html><head>${prefix}<meta http-equiv="Content-Security-Policy" content="\${csp}"></head></html>\`;
 }`;
-		assertFails(policyAfter('<script>x</script>'), 'an interpolation or a script precedes the Content-Security-Policy meta');
-		assertFails(policyAfter('<title>${title}</title>'), 'an interpolation or a script precedes the Content-Security-Policy meta');
-		assertFails(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel): void { panel.webview.html = \`<p>\${build(panel.webview, 'n')}</p>\`; }`,
+		assert.deepStrictEqual(fixtureFailures(policyAfter('<meta charset="UTF-8">')), []);
+		assertFails(policyAfter('<script>x</script>'), 'the Content-Security-Policy meta is not active');
+		assertFails(policyAfter('<title>${title}</title>'), 'the Content-Security-Policy meta is not active');
+		assertFails(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel): void { panel.webview.html = \`<p>\${build(panel.webview, makeNonce())}</p>\`; }`,
 			'the assigned HTML has no Content-Security-Policy meta');
 		assertFails(`declare function external(): string;\nexport function show(panel: vscode.WebviewPanel): void { panel.webview.html = external(); }`,
 			'the assigned HTML comes from a call whose body is not in the source');
-		assertFails(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel): void { let html = build(panel.webview, 'n'); html = ${plain}; panel.webview.html = html; }`,
+		assertFails(`${GOOD_BUILDER}\nexport function show(panel: vscode.WebviewPanel): void { let html = build(panel.webview, makeNonce()); html = ${plain}; panel.webview.html = html; }`,
 			'`html` is neither a const with an initializer nor a parameter');
 		assertFails(`export function show(panel: vscode.WebviewPanel): void { panel.webview.html += '<p>x</p>'; }`, 'an html property is written other than by a plain `=`');
 		assertFails(`export function show(panel: vscode.WebviewPanel, v: string): void { [panel.webview.html] = [v]; }`, 'an html property is written other than by a plain `=`');
-		assertFails(`export function show(panel: vscode.WebviewPanel, key: 'html'): void { panel.webview[key] = ''; }`, 'a Webview member is accessed by a computed key');
-		assertFails(`export function show(panel: vscode.WebviewPanel): void { Object.assign(panel.webview, { html: '' }); }`, 'a Webview, or an `html` key, is passed to a reflective write');
+		assertFails(`export function show(panel: vscode.WebviewPanel, key: 'html'): void { panel.webview[key] = ''; }`, 'the assigned HTML has no Content-Security-Policy meta');
+		assertFails(`export function show(panel: vscode.WebviewPanel, key: 'cspSource'): string { return panel.webview[key]; }`, 'a Webview member is accessed by a computed key');
+		assertFails(`export function show(panel: vscode.WebviewPanel): void { Object.assign(panel.webview, { html: '' }); }`, 'a Webview, a receiver that may be one, or an `html` key, is passed to a reflective write');
+		assertFails(`export function show(panel: vscode.WebviewPanel, patch: { title: string }): void { const target: any = panel.webview; Object.assign(target, patch); }`,
+			'a Webview, a receiver that may be one, or an `html` key, is passed to a reflective write');
 		assertFails(`${traced}\nexport function leak(panel: vscode.WebviewPanel): (h: string) => void { const h = new Holder(panel); return h.initialize; }`,
 			'initialize is referenced other than by a direct call');
+	});
+
+	test('c2 classes: structural and untyped calls, computed writes through aliases, interpolation bindings, inactive metas', () => {
+		const plain = '"<html><body>plain</body></html>"';
+		const traced = `${GOOD_BUILDER}
+class Holder { constructor(private readonly panel: vscode.WebviewPanel) { } initialize(html: string): void { this.panel.webview.html = html; } }
+export function show(panel: vscode.WebviewPanel): void { const html = build(panel.webview, makeNonce()); new Holder(panel).initialize(html); }`;
+		// calls that lose the implementation's identity
+		assertFails(`${traced}\nexport function other(panel: vscode.WebviewPanel): void { const h: { initialize(html: string): void } = new Holder(panel); h.initialize(${plain}); }`,
+			'the assigned HTML has no Content-Security-Policy meta');
+		assertFails(`${traced}\nexport function other(panel: vscode.WebviewPanel): void { const h: { initialize(html: string): void } = new Holder(panel); const f = h.initialize; f(${plain}); }`,
+			'initialize is reached through a structural type other than by a direct call');
+		assertFails(`${traced}\nexport function other(panel: vscode.WebviewPanel): void { const h: any = new Holder(panel); h.initialize(${plain}); }`,
+			'the assigned HTML has no Content-Security-Policy meta');
+		// computed writes through aliases, and the controls that stay out of the inventory
+		assertFails(`export function show(panel: vscode.WebviewPanel): void { const t: { html: string } = panel.webview; const key: 'html' = 'html'; t[key] = ${plain}; }`,
+			'the assigned HTML has no Content-Security-Policy meta');
+		assertFails(`export function show(panel: vscode.WebviewPanel, key: string): void { const t: any = panel.webview; t[key] = ${plain}; }`,
+			'the assigned HTML has no Content-Security-Policy meta');
+		assertFails(`export function show(panel: vscode.WebviewPanel, key: string): void { const t = panel.webview as unknown as { [k: string]: string }; t[key] = ${plain}; }`,
+			'a Webview is cast to another type');
+		assertFails(`export function show(panel: vscode.WebviewPanel, key: string): void { const t = panel.webview as unknown as { [k: string]: string }; t[key] = ${plain}; }`,
+			'the assigned HTML has no Content-Security-Policy meta');
+		assert.deepStrictEqual(fixtureFailures(`${traced}\nexport function count(values: string[], key: number, map: { [k: string]: number }, name: string): void { values[key] = 'x'; map[name] = 1; }`), []);
+		// interpolations judged by their binding
+		const rebound = (declarations: string, directive: string) => `${NONCE_SOURCE}
+export function show(panel: vscode.WebviewPanel): void {
+	const nonce = makeNonce();
+	${declarations}
+	const csp = [\`default-src 'none'\`, \`script-src 'nonce-\${nonce}'\`, ${directive}].join('; ');
+	panel.webview.html = ${GOOD_DOCUMENT};
+}`;
+		assert.deepStrictEqual(fixtureFailures(rebound('const cspSource = panel.webview.cspSource;', '`connect-src ${cspSource}`')), []);
+		assertFails(rebound('const cspSource = "*";', '`connect-src ${cspSource}`'), 'the policy interpolates ${cspSource}, which this check cannot resolve');
+		assertFails(`export function show(panel: vscode.WebviewPanel): void {
+	const nonce = "x' 'unsafe-inline";
+	const csp = \`default-src 'none'; script-src 'nonce-\${nonce}'\`;
+	panel.webview.html = ${GOOD_DOCUMENT};
+}`, 'the policy interpolates ${nonce}, which this check cannot resolve');
+		// policy text that the browser does not apply
+		const inactive = (wrap: (meta: string) => string) => `${NONCE_SOURCE}
+export function show(panel: vscode.WebviewPanel): void {
+	const nonce = makeNonce();
+	const csp = \`default-src 'none'; script-src 'nonce-\${nonce}'\`;
+	panel.webview.html = \`<!DOCTYPE html><html><head>${wrap('<meta http-equiv="Content-Security-Policy" content="${csp}">')}</head><body></body></html>\`;
+}`;
+		assert.deepStrictEqual(fixtureFailures(inactive(m => m)), []);
+		assertFails(inactive(m => `<!-- ${m} -->`), 'the Content-Security-Policy meta is not active');
+		assertFails(inactive(m => `<title>${m}</title>`), 'the Content-Security-Policy meta is not active');
 	});
 
 	test('every source file that writes a webview html is listed, with its number of writes', () => {
