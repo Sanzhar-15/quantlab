@@ -67,11 +67,14 @@ export class WelcomeModal {
 		const themeStyles = ThemeProvider.getInstance().getInlineStyles();
 		const nonce = this.getNonce();
 
+		// style-src needs 'unsafe-inline': the webview host writes the theme's --vscode-* variables as a style attribute on <html>
+		// and prepends its own <style id="_defaultStyles"> (webview/browser/pre/index.html), and themeStyles is a <style> block.
+		// A nonce cannot admit a style attribute, and a nonce in style-src would disable 'unsafe-inline'. Scripts stay nonce-only.
 		return `<!DOCTYPE html>
 <html lang="en">
 <head>
 	<meta charset="UTF-8">
-	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource}; script-src ${webview.cspSource} 'nonce-${nonce}';">
+	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	${themeStyles}
 	<link href="${tokensUri}" rel="stylesheet" />
