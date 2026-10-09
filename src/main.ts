@@ -20,6 +20,7 @@ import { getUNCHost, addUNCHostToAllowlist } from './vs/base/node/unc.js';
 import { INLSConfiguration } from './vs/nls.js';
 import { NativeParsedArgs } from './vs/platform/environment/common/argv.js';
 import { disableBackgroundNetwork } from './vs/code/electron-main/ql-client/index.js'; // QuantLab host (EGRESS-MAIN)
+import { refuseDebuggers } from './vs/code/electron-main/qlHost/node/debuggerPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
 
 perf.mark('code/didStartMain');
 
@@ -43,6 +44,9 @@ const portable = configurePortable(product);
 const args = parseCLIArgs();
 // Configure static command line arguments
 const argvConfig = configureCommandlineSwitchesSync(args);
+// QuantLab host (F-HOST-NODEBUG-1): a PRODUCT build refuses every debugger route by name, after the argv.json switches are
+// appended and before vs/code/electron-main/main.js parses process.argv. Row: build/qlhost/check-nodebug.mjs.
+refuseDebuggers(app.commandLine, process.argv, argvConfig, line => console.error(line));
 // Enable sandbox globally unless
 // 1) disabled via command line using either
 //    `--no-sandbox` or `--disable-chromium-sandbox` argument.
