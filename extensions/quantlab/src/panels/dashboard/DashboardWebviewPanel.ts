@@ -8,6 +8,7 @@
 
 import * as vscode from 'vscode';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
+import { getNonce } from '../../utils/webview';
 
 export interface DashboardConfig<T> {
 	id: string;
@@ -104,19 +105,13 @@ export class DashboardWebviewPanel {
 	}
 }
 
-function nonce(): string {
-	const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-	let result = '';
-	for (let i = 0; i < 32; i++) { result += chars[Math.floor(Math.random() * chars.length)]; }
-	return result;
-}
-
 export function escapeHtml(s: string): string {
 	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function buildHtml(cspSource: string, tokensUri: vscode.Uri, themeStyles: string, title: string, body: string): string {
-	const n = nonce();
+/** Exported for the nonce test (F-QL-WEBVIEW-NONCE-1); `show` is the only product caller. */
+export function buildHtml(cspSource: string, tokensUri: vscode.Uri, themeStyles: string, title: string, body: string): string {
+	const n = getNonce();
 	// style-src MUST include cspSource or the linked tokens.css is silently
 	// blocked and every dashboard renders without its design tokens.
 	const csp = [

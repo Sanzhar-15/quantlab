@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { ThemeProvider } from '../tokens/ThemeProvider';
 import { ReducedMotion } from '../accessibility/ReducedMotion';
+import { getNonce } from '../../utils/webview';
 
 export type WelcomeAction = 'template' | 'open' | 'skip';
 
@@ -65,7 +66,7 @@ export class WelcomeModal {
 		const tokensUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'tokens.css'));
 		const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'onboarding.css'));
 		const themeStyles = ThemeProvider.getInstance().getInlineStyles();
-		const nonce = this.getNonce();
+		const nonce = getNonce();
 
 		// style-src needs 'unsafe-inline': the webview host writes the theme's --vscode-* variables as a style attribute on <html>
 		// and prepends its own <style id="_defaultStyles"> (webview/browser/pre/index.html), and themeStyles is a <style> block.
@@ -118,14 +119,5 @@ export class WelcomeModal {
 	</script>
 </body>
 </html>`;
-	}
-
-	private static getNonce(): string {
-		const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-		let nonce = '';
-		for (let i = 0; i < 32; i++) {
-			nonce += possible.charAt(Math.floor(Math.random() * possible.length));
-		}
-		return nonce;
 	}
 }
