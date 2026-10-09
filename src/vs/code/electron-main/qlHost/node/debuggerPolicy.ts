@@ -7,10 +7,12 @@
 // level, after the argv.json switches are appended and before `ready` and before vs/code/electron-main/main.js parses
 // process.argv. Each refusal is a named stderr line (which switch, which source); the app continues (R-212 (2)).
 //   - Chromium's remote debugger: `--remote-debugging-port` (command line, or the argv.json key main.ts appends) and
-//     `--remote-debugging-pipe` (command line) are removed from the app's command line, so no DevTools endpoint is served.
+//     `--remote-debugging-pipe` (command line) are removed from the app's command line, so no DevTools endpoint is served,
+//     and renamed in process.argv, so a relaunch never carries them.
 //   - The Node inspector options of node/argv.ts (every process the app starts with --inspect from its own arguments: the
-//     extension host, the pty host, the search and shared processes, the main process) and their deprecated aliases are cut
-//     from process.argv, so electron-main never parses them. A relaunch that adds one passes through here again.
+//     extension host, the pty host, the search and shared processes, the main process) and their deprecated aliases are renamed
+//     in process.argv (`--ql-refused-<name>`), so electron-main never parses them and every other argument keeps its meaning.
+//     A relaunch that adds one passes through here again.
 // The runtime route (enableInspectPort) is refused in a built product by extensionHostStarter.ts (F-PACK-12), not here.
 // A TEST build (QL_TEST_BUILD=1) keeps every route: the test instruments attach through them.
 
@@ -50,35 +52,6 @@ function longOptionName(entry: string): string | undefined {
 	return equals < 0 ? entry.slice(2) : entry.slice(2, equals);
 }
 
-/**
- * Cuts the inspect options from an argv, as the parser (minimist, node/argv.ts parseArgs) would read them: `--name=value`, and
- * `--name value` where the next entry is the value unless it is `--` or an option (`/^(-|--)[^-]/`). Entries after a bare `--`
- * are positional and kept.
- */
-export function cutInspectOptions(argv: readonly string[]): { readonly kept: string[]; readonly refused: string[] } {
-	const refusedNames: readonly string[] = REFUSED_INSPECT_OPTIONS;
-	const kept: string[] = [];
-	const refused: string[] = [];
-	for (let i = 0; i < argv.length; i++) {
-		const entry = argv[i];
-		if (entry === '--') {
-			kept.push(...argv.slice(i));
-			break;
-		}
-		const name = longOptionName(entry);
-		if (name === undefined || !refusedNames.includes(name)) {
-			kept.push(entry);
-			continue;
-		}
-		refused.push(name);
-		const next = argv[i + 1];
-		if (!entry.includes('=') && next !== undefined && next !== '--' && !/^(-|--)[^-]/.test(next)) {
-			i++; // the option's value, by minimist's rule for a string option
-		}
-	}
-	return { kept, refused };
-}
-
 /** The Chromium debugger switch an argv entry names (Chromium reads `-name` and `--name`, with or without `=value`), or undefined. */
 function debuggerSwitchName(entry: string): string | undefined {
 	const body = entry.startsWith('--') ? entry.slice(2) : entry.startsWith('-') ? entry.slice(1) : undefined;
@@ -105,12 +78,34 @@ export function commandLineDebuggerSwitches(argv: readonly string[]): string[] {
 	return found;
 }
 
-/** The argv without its Chromium debugger switch entries (before a bare `--`), so electron-main and a relaunch never carry them. */
-export function cutDebuggerSwitches(argv: readonly string[]): string[] {
+/** The prefix a refused entry is renamed with: `--inspect=1` becomes `--ql-refused-inspect=1`, `-remote-debugging-port=1` `--ql-refused-remote-debugging-port=1`. */
+export const NEUTRALISED_PREFIX = '--ql-refused-';
+
+/**
+ * Renames, in place, each argv entry before a bare `--` that is an inspect option (`--name`, `--name=value`) or a Chromium debugger
+ * switch (`-name`, `--name`, with or without `=value`). A renamed entry is still an option in the same position, so a parser binds to
+ * it exactly the value it bound to the refused name (`--inspect-ptyhost 9229`, `--remote-debugging-port 9222`), and binds nothing new
+ * to the option before it; node/argv.ts parseArgs drops it as an unknown option and Chromium ignores the unknown switch. Cutting the
+ * entry instead hands its value or the next path to a neighbour (`--log --inspect-ptyhost=1 /ws` would read /ws as a log level), and
+ * would make electron-main parse differently from the bootstrap. Entries after a bare `--` are positional and kept.
+ */
+export function neutraliseDebuggerArgs(argv: readonly string[]): { readonly argv: string[]; readonly inspect: string[] } {
+	const inspectNames: readonly string[] = REFUSED_INSPECT_OPTIONS;
 	const end = argv.indexOf('--');
-	const head = end < 0 ? argv : argv.slice(0, end);
-	const tail = end < 0 ? [] : argv.slice(end);
-	return [...head.filter(entry => debuggerSwitchName(entry) === undefined), ...tail];
+	const neutralised = [...argv];
+	const inspect: string[] = [];
+	for (let i = 0; i < (end < 0 ? argv.length : end); i++) {
+		const entry = argv[i];
+		const name = longOptionName(entry);
+		const isInspect = name !== undefined && inspectNames.includes(name);
+		if (isInspect) {
+			inspect.push(name);
+		}
+		if (isInspect || debuggerSwitchName(entry) !== undefined) {
+			neutralised[i] = NEUTRALISED_PREFIX + entry.replace(/^--?/, '');
+		}
+	}
+	return { argv: neutralised, inspect };
 }
 
 /** The argv.json keys main.ts appended as a debugger switch: the value `true`, `'true'` or a non-empty string (main.ts's rule). */
@@ -138,7 +133,7 @@ export function isProductBundle(): boolean {
 
 /**
  * Applies the policy in a PRODUCT bundle; does nothing otherwise. Writes one stderr line per refusal, removes the debugger
- * switches from `commandLine`, and replaces `processArgv`'s entries with the kept ones (no inspect option, no debugger switch). Throws when a switch is still present
+ * switches from `commandLine`, and renames `processArgv`'s inspect options and debugger switches (neutraliseDebuggerArgs). Throws when a switch is still present
  * after its removal (the policy did not take effect: never a silent pass).
  */
 export function refuseDebuggers(commandLine: DebuggerCommandLine, processArgv: string[], argvConfig: Readonly<Record<string, unknown>>, write: (line: string) => void): DebuggerRefusal[] {
@@ -152,8 +147,8 @@ export function refuseDebuggers(commandLine: DebuggerCommandLine, processArgv: s
 	for (const name of argvJsonDebuggerSwitches(argvConfig)) {
 		refusals.push({ name, source: 'argv.json' });
 	}
-	const { kept, refused } = cutInspectOptions(processArgv);
-	for (const name of refused) {
+	const neutralised = neutraliseDebuggerArgs(processArgv);
+	for (const name of neutralised.inspect) {
 		refusals.push({ name, source: 'command line' });
 	}
 	for (const refusal of refusals) {
@@ -167,6 +162,6 @@ export function refuseDebuggers(commandLine: DebuggerCommandLine, processArgv: s
 			}
 		}
 	}
-	processArgv.splice(0, processArgv.length, ...cutDebuggerSwitches(kept));
+	processArgv.splice(0, processArgv.length, ...neutralised.argv);
 	return refusals;
 }
