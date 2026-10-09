@@ -270,6 +270,7 @@ export class Menubar extends Disposable {
 		// fresh profile); macOS gets the application menu and a Window menu instead of an empty menu.
 		if (Object.keys(this.menubarMenus).length === 0) {
 			this.doSetApplicationMenu(isMacintosh ? this.createQlNoWorkbenchMenu() : null);
+			this.menuGC.schedule(); // QuantLab host (F-HOST-APPMENU-1 c1 SF3): release the replaced menus here too, as the full path does
 			return;
 		}
 
@@ -489,7 +490,9 @@ export class Menubar extends Disposable {
 	}
 
 	private async confirmBeforeQuit(event: KeyboardEvent): Promise<boolean> {
-		if (this.windowsMainService.getWindowCount() === 0) {
+		// QuantLab host (F-HOST-APPMENU-1 c1 MF1): before the first workbench the only window is the host's BaseWindow, which the
+		// windows service does not count; it is an open window all the same, so the user's confirmBeforeClose applies to it
+		if (this.windowsMainService.getWindowCount() === 0 && !BaseWindow.getAllWindows().some(window => !window.isDestroyed())) {
 			return true; // never confirm when no windows are opened
 		}
 
