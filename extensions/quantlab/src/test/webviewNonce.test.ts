@@ -24,6 +24,8 @@ import { getNonce } from '../utils/webview';
 // utils/webview.ts, which encodes 16 bytes of crypto.randomBytes as base64url; none comes from Math.random. Provenance is
 // checked on the value, not the text: every nonce a source file writes (`'nonce-${x}'`, `nonce="${x}"`) must resolve,
 // through consts and parameters (every call site), to a direct call of that getNonce; any other expression, and any nonce written as literal text, fails.
+// The draw must happen in the invocation that writes the document: a parameter written inside its function, a const of another
+// function or of the module, an enclosing function's parameter, and a nonce written or passed at module level all fail.
 
 const EXTENSION_ROOT = path.resolve(__dirname, '..', '..', '..');
 const SRC = path.join(EXTENSION_ROOT, 'src');
@@ -71,8 +73,9 @@ function noncesOf(html: string): { policy: string[]; attributes: string[] } {
 	};
 }
 
-/** A program over the extension's src/ files, read through this module's `fs` (so a harness can substitute contents). */
-function sourceProgram(): ts.Program {
+/** A program over the extension's src/ files, read through this module's `fs` (so a harness can substitute contents),
+ * plus any fixture files given by path under src/ (each must not exist on disk). */
+function sourceProgram(fixtures: Record<string, string>): ts.Program {
 	const config = ts.getParsedCommandLineOfConfigFile(path.join(EXTENSION_ROOT, 'tsconfig.json'), {}, {
 		...ts.sys,
 		onUnRecoverableConfigFileDiagnostic: d => { throw new Error(`tsconfig.json: ${ts.flattenDiagnosticMessageText(d.messageText, '\n')}`); },
@@ -80,12 +83,24 @@ function sourceProgram(): ts.Program {
 	if (config === undefined || config.errors.length > 0) {
 		throw new Error(`tsconfig.json does not parse: ${config?.errors.map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n')).join('; ')}`);
 	}
+	const virtual = new Map(Object.entries(fixtures).map(([rel, text]) => [path.join(SRC, rel), text]));
+	for (const file of virtual.keys()) {
+		if (fs.existsSync(file)) {
+			throw new Error(`fixture ${file} exists on disk`);
+		}
+	}
 	const host = ts.createCompilerHost(config.options, true);
-	host.getSourceFile = (fileName, languageVersion) => fs.existsSync(fileName)
-		? ts.createSourceFile(fileName, fs.readFileSync(fileName, 'utf8'), languageVersion, true)
-		: undefined;
+	const fileExists = host.fileExists;
+	host.fileExists = fileName => virtual.has(path.resolve(fileName)) || fileExists(fileName);
+	host.getSourceFile = (fileName, languageVersion) => {
+		const text = virtual.get(path.resolve(fileName));
+		if (text !== undefined) {
+			return ts.createSourceFile(fileName, text, languageVersion, true);
+		}
+		return fs.existsSync(fileName) ? ts.createSourceFile(fileName, fs.readFileSync(fileName, 'utf8'), languageVersion, true) : undefined;
+	};
 	const roots = config.fileNames.filter(f => path.resolve(f).startsWith(SRC + path.sep) || f.endsWith('/vscode.d.ts'));
-	return ts.createProgram(roots, config.options, host);
+	return ts.createProgram([...roots, ...virtual.keys()], config.options, host);
 }
 
 const NONCE_SLOT = /'nonce-$|\bnonce="$/;
@@ -115,7 +130,38 @@ function nonceProvenance(program: ts.Program): { bindings: Map<string, number>; 
 		const symbol = checker.getSymbolAtLocation(node);
 		return (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol)?.valueDeclaration;
 	};
-	const fromHelper = (expression: ts.Expression, depth: number): string | undefined => {
+	// The function whose invocation evaluates a node; undefined at module level, where a value is computed once, at load.
+	const scopeOf = (node: ts.Node): ts.SignatureDeclaration | undefined => {
+		for (let n = node.parent; n !== undefined; n = n.parent) {
+			if (ts.isFunctionLike(n) && (n as ts.FunctionLikeDeclaration).body !== undefined) {
+				return n;
+			}
+		}
+		return undefined;
+	};
+	// A write to a binding: the target of any assignment (compound and destructuring included), of ++/--, or of for-in/of.
+	const isWritten = (id: ts.Identifier): boolean => {
+		let n: ts.Node = id;
+		for (;;) {
+			const p = n.parent;
+			if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p) || ts.isTypeAssertionExpression(p)
+				|| ts.isArrayLiteralExpression(p) || ts.isSpreadElement(p) || ts.isObjectLiteralExpression(p) || ts.isSpreadAssignment(p)
+				|| (ts.isShorthandPropertyAssignment(p) && p.name === n) || (ts.isPropertyAssignment(p) && p.initializer === n)) {
+				n = p;
+				continue;
+			}
+			if (ts.isBinaryExpression(p) && p.left === n) {
+				return p.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && p.operatorToken.kind <= ts.SyntaxKind.LastAssignment;
+			}
+			if (ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) {
+				return p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken;
+			}
+			return (ts.isForInStatement(p) || ts.isForOfStatement(p)) && p.initializer === n;
+		}
+	};
+	// The draw must happen in the invocation that writes the document: a nonce traced to a const declared in another function
+	// or at module level, or to a parameter of an enclosing function, is a draw shared by several documents.
+	const fromHelper = (expression: ts.Expression, scope: ts.SignatureDeclaration, depth: number): string | undefined => {
 		let e = expression;
 		while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) {
 			e = e.expression;
@@ -132,10 +178,14 @@ function nonceProvenance(program: ts.Program): { bindings: Map<string, number>; 
 			const declaration = declarationOf(e);
 			if (declaration !== undefined && ts.isVariableDeclaration(declaration) && declaration.initializer !== undefined
 				&& (ts.getCombinedNodeFlags(declaration) & ts.NodeFlags.Const) !== 0) {
-				return fromHelper(declaration.initializer, depth + 1);
+				return scopeOf(declaration) === scope
+					? fromHelper(declaration.initializer, scope, depth + 1)
+					: `${where(e)}: the nonce \`${e.text}\` is a const declared outside the function that writes it, a draw cached across documents`;
 			}
 			if (declaration !== undefined && ts.isParameter(declaration)) {
-				return fromCallers(declaration, depth);
+				return declaration.parent === scope
+					? fromCallers(declaration, depth)
+					: `${where(e)}: the nonce \`${e.text}\` is a parameter of an enclosing function, a draw cached across documents`;
 			}
 			return `${where(e)}: the nonce \`${e.text}\` is neither a const with an initializer nor a parameter`;
 		}
@@ -145,8 +195,27 @@ function nonceProvenance(program: ts.Program): { bindings: Map<string, number>; 
 	const fromCallers = (parameter: ts.ParameterDeclaration, depth: number): string | undefined => {
 		const fn = parameter.parent;
 		const index = fn.parameters.indexOf(parameter);
-		if (!ts.isFunctionDeclaration(fn) || fn.name === undefined || parameter.dotDotDotToken !== undefined) {
+		if (!ts.isFunctionDeclaration(fn) || fn.name === undefined || fn.body === undefined || parameter.dotDotDotToken !== undefined
+			|| !ts.isIdentifier(parameter.name)) {
 			return `${where(parameter)}: the nonce is a parameter of a function this check cannot find the callers of`;
+		}
+		const name = parameter.name.text;
+		const own = checker.getSymbolAtLocation(parameter.name);
+		let written: ts.Identifier | undefined;
+		const writes = (node: ts.Node): void => {
+			if (written === undefined && ts.isIdentifier(node) && node !== parameter.name) {
+				const symbol = ts.isShorthandPropertyAssignment(node.parent) && node.parent.name === node
+					? checker.getShorthandAssignmentValueSymbol(node.parent)
+					: checker.getSymbolAtLocation(node);
+				if (symbol === own && isWritten(node)) {
+					written = node;
+				}
+			}
+			ts.forEachChild(node, writes);
+		};
+		writes(fn.body);
+		if (written !== undefined) {
+			return `${where(written)}: the nonce parameter \`${name}\` of ${fn.name.text} is written inside it`;
 		}
 		const references: ts.Identifier[] = [];
 		const collect = (node: ts.Node): void => {
@@ -165,7 +234,11 @@ function nonceProvenance(program: ts.Program): { bindings: Map<string, number>; 
 				|| call.arguments.slice(0, index + 1).some(ts.isSpreadElement)) {
 				return `${where(reference)}: ${fn.name.text} is referenced other than by a direct call passing the nonce`;
 			}
-			const failure = fromHelper(call.arguments[index], depth + 1);
+			const callScope = scopeOf(call);
+			if (callScope === undefined) {
+				return `${where(call)}: ${fn.name.text} is called outside any function, so its nonce is drawn once, at load`;
+			}
+			const failure = fromHelper(call.arguments[index], callScope, depth + 1);
 			if (failure !== undefined) {
 				return failure;
 			}
@@ -179,7 +252,10 @@ function nonceProvenance(program: ts.Program): { bindings: Map<string, number>; 
 				if (NONCE_SLOT.test(texts[i].text)) {
 					const rel = where(span).split(':')[0];
 					bindings.set(rel, (bindings.get(rel) ?? 0) + 1);
-					const failure = fromHelper(span.expression, 0);
+					const scope = scopeOf(span);
+					const failure = scope === undefined
+						? `${where(span)}: a nonce is written outside any function, into a document built once, at load`
+						: fromHelper(span.expression, scope, 0);
 					if (failure !== undefined) {
 						failures.push(failure);
 					}
@@ -239,9 +315,42 @@ suite('webview nonces (CSPRNG only)', () => {
 	});
 
 	test('every nonce a source file writes is a direct getNonce() call from utils/webview; a nonce in literal text fails', () => {
-		const { bindings, failures } = nonceProvenance(sourceProgram());
+		const { bindings, failures } = nonceProvenance(sourceProgram({}));
 		assert.deepStrictEqual(failures, []);
 		const thin = NONCE_BUILDERS.filter(f => (bindings.get(f) ?? 0) < 2).map(f => `${f}: ${bindings.get(f) ?? 0} nonce bindings`);
 		assert.deepStrictEqual(thin, [], 'each builder writes its nonce into the policy and at least one element');
+	});
+
+	test('a nonce the document-writing invocation did not draw itself fails by name; safe forwarding passes', () => {
+		const head = `import { getNonce } from './utils/webview';\n`;
+		const page = (n: string) => `\`<meta http-equiv="Content-Security-Policy" content="script-src 'nonce-\${${n}}'"><script nonce="\${${n}}"></script>\``;
+		const reassigned = (write: string) => `${head}function inner(nonce: string): string {\n\t${write};\n\treturn ${page('nonce')};\n}\nexport function outer(): string {\n\treturn inner(getNonce());\n}\n`;
+		const cases: [string, string, string][] = [
+			['reassigned.ts', reassigned(`nonce = 'fixed'`), 'reassigned.ts:3: the nonce parameter `nonce` of inner is written inside it'],
+			['compound.ts', reassigned(`nonce += ''`), 'compound.ts:3: the nonce parameter `nonce` of inner is written inside it'],
+			['logical.ts', reassigned(`nonce ||= 'fixed'`), 'logical.ts:3: the nonce parameter `nonce` of inner is written inside it'],
+			['array.ts', reassigned(`[nonce] = ['fixed']`), 'array.ts:3: the nonce parameter `nonce` of inner is written inside it'],
+			['object.ts', reassigned(`({ nonce } = { nonce: 'fixed' })`), 'object.ts:3: the nonce parameter `nonce` of inner is written inside it'],
+			['forof.ts', reassigned(`for (nonce of ['fixed']) { /* last */ }`), 'forof.ts:3: the nonce parameter `nonce` of inner is written inside it'],
+			['nested.ts', reassigned(`const reset = () => { nonce = 'fixed'; }; reset()`), 'nested.ts:3: the nonce parameter `nonce` of inner is written inside it'],
+			['modulecache.ts', `${head}const cached = getNonce();\nexport function page(): string {\n\tconst nonce = cached;\n\treturn ${page('nonce')};\n}\n`,
+				'modulecache.ts:4: the nonce `cached` is a const declared outside the function that writes it, a draw cached across documents'],
+			['closure.ts', `${head}export function make(): () => string {\n\tconst nonce = getNonce();\n\treturn () => ${page('nonce')};\n}\n`,
+				'closure.ts:4: the nonce `nonce` is a const declared outside the function that writes it, a draw cached across documents'],
+			['outerparam.ts', `${head}function make(nonce: string): () => string {\n\treturn () => ${page('nonce')};\n}\nexport const f = () => make(getNonce());\n`,
+				'outerparam.ts:3: the nonce `nonce` is a parameter of an enclosing function, a draw cached across documents'],
+			['moduledoc.ts', `${head}export const HTML = ${page('getNonce()')};\n`,
+				'moduledoc.ts:2: a nonce is written outside any function, into a document built once, at load'],
+			['modulecall.ts', `${head}function inner(nonce: string): string {\n\treturn ${page('nonce')};\n}\nexport const HTML = inner(getNonce());\n`,
+				'modulecall.ts:5: inner is called outside any function, so its nonce is drawn once, at load'],
+		];
+		const forwarding = `${head}function inner(nonce: string): string {\n\tconst n = nonce;\n\treturn ${page('n')};\n}\nexport function outer(): string {\n\tconst drawn = getNonce();\n\treturn inner(drawn);\n}\n`;
+		const fixtures: Record<string, string> = { 'nonce-fixture-forwarding.ts': forwarding };
+		cases.forEach(([file, text]) => { fixtures[`nonce-fixture-${file}`] = text; });
+		const { bindings, failures } = nonceProvenance(sourceProgram(fixtures));
+		// Each fixture writes its nonce twice (policy and script); each write fails for the case's reason, and nothing else fails.
+		// Only the fixtures are judged here; the real sources are the test above's.
+		assert.deepStrictEqual(failures.filter(f => f.startsWith('nonce-fixture-')).sort(), cases.flatMap(([, , reason]) => [`nonce-fixture-${reason}`, `nonce-fixture-${reason}`]).sort());
+		assert.strictEqual(bindings.get('nonce-fixture-forwarding.ts'), 2, 'safe forwarding is traced, not skipped');
 	});
 });
