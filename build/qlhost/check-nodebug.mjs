@@ -12,7 +12,9 @@
 // Run from the fork root: `node build/qlhost/check-nodebug.mjs src [out-vscode/main.js]`; last line `SUITE nodebug: PASS n/n`, rc 0.
 // Negatives: (a) src/main.ts without the `refuseDebuggers(...)` statement -> row S2 RED; (b) the base (no debuggerPolicy.ts)
 // -> row U0 RED; (c) an inspect option missing from REFUSED_INSPECT_OPTIONS -> row L1 RED; (d) a TEST bundle as the second
-// argument -> row B1 RED.
+// argument -> row B1 RED; (e) the r3 policy (15814dca0af: debugger tokens cut, not renamed) -> rows D1 D2 RED, among them
+// `--log --inspect-ptyhost=1 /workspace/project`, `--user-data-dir --inspect-extensions=1 /workspace/project` and
+// `--remote-debugging-port 9222 /workspace/project` (review c1 MF2).
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -79,8 +81,8 @@ if (present) {
 	const EXE = '/Applications/Delta Plus.app/Contents/MacOS/Delta Plus';
 
 	let r = run(false, [EXE, '--remote-debugging-port=9222'], {}, ['remote-debugging-port']);
-	row('U1 product: --remote-debugging-port on the command line is refused by name, removed, and cut from argv',
-		same(r.lines, [line('remote-debugging-port', 'command line')]) && same(r.removed, ['remote-debugging-port']) && same(r.processArgv, [EXE]),
+	row('U1 product: --remote-debugging-port on the command line is refused by name, removed, and renamed in argv',
+		same(r.lines, [line('remote-debugging-port', 'command line')]) && same(r.removed, ['remote-debugging-port']) && same(r.processArgv, [EXE, '--ql-refused-remote-debugging-port=9222']),
 		JSON.stringify(r));
 
 	r = run(false, [EXE], { 'remote-debugging-port': '9222' }, ['remote-debugging-port']);
@@ -89,14 +91,16 @@ if (present) {
 
 	r = run(false, [EXE, '--remote-debugging-pipe', '-remote-debugging-port=1'], { 'remote-debugging-port': false }, ['remote-debugging-pipe', 'remote-debugging-port']);
 	row('U3 product: --remote-debugging-pipe and the single-dash form are refused; a false argv.json value is not a source',
-		same(r.lines, [line('remote-debugging-pipe', 'command line'), line('remote-debugging-port', 'command line')]) && same(r.removed, ['remote-debugging-port', 'remote-debugging-pipe']) && same(r.processArgv, [EXE]),
+		same(r.lines, [line('remote-debugging-pipe', 'command line'), line('remote-debugging-port', 'command line')]) && same(r.removed, ['remote-debugging-port', 'remote-debugging-pipe'])
+			&& same(r.processArgv, [EXE, '--ql-refused-remote-debugging-pipe', '--ql-refused-remote-debugging-port=1']),
 		JSON.stringify(r));
 
 	const inspectArgv = [EXE, '--inspect-extensions=1', '--inspect-brk-extensions', '2', '--debugPluginHost=3', '--inspect-ptyhost', '--inspect-search', '--verbose',
 		'--inspect-sharedprocess', '-', '/tmp/a.txt', '--', '--inspect=4'];
 	r = run(false, inspectArgv, {}, []);
-	row('U4 product: the inspect options and their values are cut as minimist reads them; entries after -- are kept',
-		same(r.processArgv, [EXE, '--verbose', '/tmp/a.txt', '--', '--inspect=4'])
+	row('U4 product: the inspect options are renamed in place, their values left where they were; entries after -- are kept',
+		same(r.processArgv, [EXE, '--ql-refused-inspect-extensions=1', '--ql-refused-inspect-brk-extensions', '2', '--ql-refused-debugPluginHost=3', '--ql-refused-inspect-ptyhost',
+			'--ql-refused-inspect-search', '--verbose', '--ql-refused-inspect-sharedprocess', '-', '/tmp/a.txt', '--', '--inspect=4'])
 			&& same(r.lines, ['inspect-extensions', 'inspect-brk-extensions', 'debugPluginHost', 'inspect-ptyhost', 'inspect-search', 'inspect-sharedprocess'].map(name => line(name, 'command line'))),
 		JSON.stringify(r));
 
@@ -117,7 +121,66 @@ if (present) {
 
 	const names = [...policy.REFUSED_INSPECT_OPTIONS];
 	r = run(false, [EXE, ...names.map(name => `--${name}=1`)], {}, []);
-	row('U8 product: each of the inspect names is refused in the =value form', same(r.processArgv, [EXE]) && r.lines.length === names.length, `${r.lines.length} of ${names.length} refused`);
+	row('U8 product: each of the inspect names is refused in the =value form', same(r.processArgv, [EXE, ...names.map(name => `--ql-refused-${name}=1`)]) && r.lines.length === names.length, `${r.lines.length} of ${names.length} refused`);
+
+	// ---- differential (MF2 of review c1): the real node/argv.ts parseArgs(OPTIONS) and minimist, before and after the policy.
+	// Every option and positional that is not a debugger's must parse the same; only the refused names (and the renamed keys,
+	// which parseArgs drops as unknown) may differ.
+	const argvModule = {};
+	const forkRequire = createRequire(join(process.cwd(), 'package.json'));
+	new Function('exports', 'require', ts.transpileModule(readFileSync(join(src, 'vs/platform/environment/node/argv.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText)(argvModule, id => {
+		if (id === 'minimist') {
+			return forkRequire('minimist');
+		}
+		if (id.endsWith('/nls.js')) {
+			return { localize: (_key, message) => message, localize2: (_key, message) => ({ value: message, original: message }) };
+		}
+		if (id.endsWith('/platform.js')) {
+			return { isWindows: false };
+		}
+		throw new Error(`node/argv.ts requires ${id} in this check`);
+	});
+	const minimist = forkRequire('minimist');
+	const debuggerKey = key => names.includes(key) || policy.REFUSED_DEBUGGER_SWITCHES.includes(key) || key.startsWith('ql-refused-');
+	const withoutDebuggers = parsed => Object.fromEntries(Object.entries(parsed).filter(([key]) => !debuggerKey(key)).sort(([a], [b]) => a.localeCompare(b)));
+	const sanitised = args => run(false, [EXE, ...args], {}, []).processArgv.slice(1);
+	// The reference argv: a single-dash Chromium switch (`-remote-debugging-port`) spelled `--name`, as Chromium reads it. Spelled with
+	// one dash, minimist reads the debugger's own token as short letters (`-r…` = reuse-window); that is the debugger's meaning, not a
+	// neighbour's.
+	const singleDash = arg => /^-[^-]/.test(arg) && policy.REFUSED_DEBUGGER_SWITCHES.some(name => arg === `-${name}` || arg.startsWith(`-${name}=`));
+	const reference = args => {
+		const end = args.indexOf('--');
+		return args.map((arg, i) => (end < 0 || i < end) && singleDash(arg) ? `-${arg}` : arg);
+	};
+	const DIFF = [
+		['--log', '--inspect-ptyhost=1', '/workspace/project'],
+		['--user-data-dir', '--inspect-extensions=1', '/workspace/project'],
+		['--remote-debugging-port', '9222', '/workspace/project'],
+		['--user-data-dir', '--remote-debugging-pipe', '/workspace/project'],
+		['--log', 'trace', '--inspect', '--log', 'debug', '/w'],
+		['--inspect=1', '--inspect=2', '--inspect-extensions', '3', '/w'],
+		['--debugPluginHost', '5', '/w', '--extensions-dir', '--debugSearch', '/w2'],
+		['--extensionHomePath', '--debugBrkPluginHost=9', '/w'],
+		['--log', '--inspect', '--', '/w', '--inspect=4'],
+		['--inspect-brk', 'true', '/w'],
+		['--inspect-search', '', '/w'],
+		['--user-data-dir', '-remote-debugging-port=9222', '/w'],
+		['--file-uri', '-remote-debugging-port', '9222', '/w'],
+		['-n', '--inspect-sharedprocess', '/w', '--goto', 'a.ts:1']
+	];
+	const parseRows = DIFF.map(args => {
+		const before = withoutDebuggers(argvModule.parseArgs(reference(args), argvModule.OPTIONS));
+		const after = withoutDebuggers(argvModule.parseArgs(sanitised(args), argvModule.OPTIONS));
+		return { args, ok: same(after, before), before, after };
+	});
+	const parseBad = parseRows.filter(({ ok }) => !ok);
+	row(`D1 parseArgs(OPTIONS): the sanitised argv parses as the original (single-dash Chromium switches spelled --name) minus the debugger keys (${DIFF.length} fixtures)`, parseBad.length === 0,
+		parseBad.length === 0 ? `${DIFF.length}/${DIFF.length} equal` : parseBad.map(({ args, before, after }) => `${JSON.stringify(args)}: before ${JSON.stringify(before)} after ${JSON.stringify(after)}`).join(' ; '));
+	const plainBad = DIFF.filter(args => !same(withoutDebuggers(minimist(sanitised(args))), withoutDebuggers(minimist(reference(args)))));
+	row('D2 plain minimist (no option table: the bootstrap and any other reader of process.argv): the same fixtures, the same reference, parse the same',
+		plainBad.length === 0, plainBad.length === 0 ? `${DIFF.length}/${DIFF.length} equal` : plainBad.map(args => JSON.stringify(args)).join(' ; '));
+	const twice = DIFF.filter(args => !same(sanitised(sanitised(args)), sanitised(args)));
+	row('D3 a relaunch: the sanitised argv passes the policy again unchanged', twice.length === 0, twice.length === 0 ? `${DIFF.length}/${DIFF.length} unchanged` : twice.map(args => JSON.stringify(args)).join(' ; '));
 
 	// ---- the lists against their sources
 	const argvTs = readFileSync(join(src, 'vs/platform/environment/node/argv.ts'), 'utf8');
