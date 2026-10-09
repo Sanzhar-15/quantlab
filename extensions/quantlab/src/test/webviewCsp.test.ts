@@ -93,6 +93,26 @@ export function judgePolicy(policy: string): string[] {
 	return failures;
 }
 
+/**
+ * Not B5, the host's need: the webview host (src/vs/workbench/contrib/webview/browser/pre/index.html, toContentHtml) writes the
+ * theme's --vscode-* variables as a style attribute on <html> and prepends a <style id="_defaultStyles"> without a nonce. The
+ * effective style-src, style-src-elem and style-src-attr must therefore carry 'unsafe-inline' and no nonce or hash (either one
+ * makes the browser ignore 'unsafe-inline'). Style is not script: B5's script rules are judged by judgePolicy.
+ */
+export function judgeHostStyles(policy: string): string[] {
+	const directives = parsePolicy(policy);
+	const failures: string[] = [];
+	for (const chain of [['style-src', 'default-src'], ['style-src-elem', 'style-src', 'default-src'], ['style-src-attr', 'style-src', 'default-src']]) {
+		const tokens = chain.map(n => directives.get(n)).find(t => t !== undefined);
+		if (tokens === undefined || !tokens.includes(`'unsafe-inline'`)) {
+			failures.push(`${chain[0]} does not admit the host's inline styles (${tokens === undefined ? 'not declared' : tokens.join(' ')})`);
+		} else if (tokens.some(t => /^'(nonce|sha256|sha384|sha512)-/.test(t))) {
+			failures.push(`${chain[0]} carries a nonce or hash, which disables 'unsafe-inline' (${tokens.join(' ')})`);
+		}
+	}
+	return failures;
+}
+
 /** Replaces the webview cspSource and nonce interpolations; any other interpolation is an error, not a guess. */
 export function resolveInterpolations(template: string, where: string): string {
 	return template.replace(/\$\{([^}]*)\}/g, (_match, expression: string) => {
@@ -164,6 +184,19 @@ suite('webview CSP (B5)', () => {
 		}
 	});
 
+	test('the host-styles judgement: inline styles admitted passes; absent, or disabled by a nonce or hash, fails by name', () => {
+		assert.deepStrictEqual(judgeHostStyles(`default-src 'none'; style-src ${CSP_SOURCE} 'unsafe-inline'; script-src 'nonce-${NONCE}'`), []);
+		const cases: [string, string][] = [
+			[`default-src 'none'; style-src ${CSP_SOURCE}; script-src 'nonce-${NONCE}'`, `style-src does not admit the host's inline styles`],
+			[`default-src 'none'; style-src ${CSP_SOURCE} 'unsafe-inline' 'nonce-${NONCE}'`, 'style-src carries a nonce or hash'],
+			[`default-src 'none'; style-src 'unsafe-inline'; style-src-attr 'none'`, `style-src-attr does not admit the host's inline styles`],
+		];
+		for (const [policy, reason] of cases) {
+			const failures = judgeHostStyles(policy);
+			assert.ok(failures.some(f => f.startsWith(reason)), `${policy} -> ${JSON.stringify(failures)} (expected "${reason}")`);
+		}
+	});
+
 	test('every source file that assigns a webview html is listed, and every listed file carries a policy', () => {
 		const assigning = sourceFiles(SRC)
 			.filter(p => /\bwebview\.html\s*=/.test(codeLines(fs.readFileSync(p, 'utf8'))))
@@ -183,6 +216,11 @@ suite('webview CSP (B5)', () => {
 			assert.ok(policies.length > 0, `${rel}: no Content-Security-Policy meta`);
 			for (const policy of policies) {
 				assert.deepStrictEqual(judgePolicy(policy), [], `${rel}: ${policy}`);
+			}
+		});
+		test(`${rel}: every policy admits the webview host's inline styles`, () => {
+			for (const policy of policiesOf(fs.readFileSync(path.join(SRC, rel), 'utf8'), rel)) {
+				assert.deepStrictEqual(judgeHostStyles(policy), [], `${rel}: ${policy}`);
 			}
 		});
 	}
