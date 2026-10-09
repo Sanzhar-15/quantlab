@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { ThemeProvider } from '../../ui/tokens/ThemeProvider';
+import { getNonce } from '../../utils/webview';
 
 export class ActionWebview {
 	private ready = false;
@@ -44,7 +45,7 @@ export class ActionWebview {
 		const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'action-style.css'));
 		const tokensUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'tokens.css'));
 		const themeStyles = ThemeProvider.getInstance().getInlineStyles();
-		const nonce = ActionWebview.getNonce();
+		const nonce = getNonce();
 
 		return `<!DOCTYPE html>
 <html lang="en">
@@ -62,14 +63,5 @@ export class ActionWebview {
 	<script type="module" nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
-	}
-
-	private static getNonce(): string {
-		const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-		let nonce = '';
-		for (let i = 0; i < 32; i++) {
-			nonce += possible.charAt(Math.floor(Math.random() * possible.length));
-		}
-		return nonce;
 	}
 }

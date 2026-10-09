@@ -10,6 +10,7 @@
 import * as vscode from 'vscode';
 import { ServerApiClient } from '../core/server/ServerApiClient';
 import { ThemeProvider } from '../ui/tokens/ThemeProvider';
+import { getNonce } from '../utils/webview';
 
 export interface HomeUser {
 	name?: string;
@@ -155,7 +156,7 @@ export class QuantLabHome {
 		themeStyles: string,
 		user: HomeUser,
 	): string {
-		const nonce = QuantLabHome._nonce();
+		const nonce = getNonce();
 		// style-src MUST include cspSource or the linked tokens.css/welcome.css
 		// are silently blocked and the panel renders unstyled.
 		const csp = [
@@ -323,12 +324,5 @@ export class QuantLabHome {
 
 	private static _esc(s: string): string {
 		return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-	}
-
-	private static _nonce(): string {
-		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-		let result = '';
-		for (let i = 0; i < 32; i++) { result += chars[Math.floor(Math.random() * chars.length)]; }
-		return result;
 	}
 }
