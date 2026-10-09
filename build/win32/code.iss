@@ -8,7 +8,7 @@
 AppId={#AppId}
 AppName={#NameLong}
 AppVerName={#NameVersion}
-AppPublisher=Microsoft Corporation
+AppPublisher=Delta Plus Technologies
 AppPublisherURL=https://code.visualstudio.com/
 AppSupportURL=https://code.visualstudio.com/
 AppUpdatesURL=https://code.visualstudio.com/
