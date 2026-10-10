@@ -16,7 +16,8 @@
 // Review c1 M1 (row 6's form since): the services are held as an OUTCOME (QlEarlyStart: a promise made with no reject, observed
 // at once); the hook awaits `qlStart.services()`, which rethrows a failure; startup()'s catch keeps the failure (`qlStart.fail`)
 // and throws it ONCE after the host's start ended; nothing is chained on `qlStart.services()`. Negative: 295dc583a06's app.ts
-// (the DeferredPromise, rethrown at once) -> row 6 RED. The behaviour itself: check-lz1-services-failure.mjs.
+// (the DeferredPromise, rethrown at once) -> row 6 RED. The behaviour itself: check-lz1-services-failure.mjs. Review c1 M2: the
+// failure read after the host ended is `qlStart.servicesFailure` (a cancellation is not one; check-lz1-quit-before-ready.mjs).
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -144,7 +145,7 @@ const holderShaped = /this\.settled = new Promise<QlServicesOutcome<S>>\(resolve
 	&& !/\.catch\(|\(resolve, reject\)/.test(holder);
 const passed = holderShaped && (app.match(/this\.startQlTerminalHost\(qlStart\)/g)?.length ?? 0) === 1 && !/qlStart\.services\(\)\.(then|catch|finally)\(|qlStart\.outcome\(\)\.(then|catch|finally)\(/.test(app)
 	&& /\} catch \(error\) \{\n(\t\t\t\/\/[^\n]*\n)*\t\t\tqlStart\.fail\(error\);\n\t\t\}\n/.test(app)
-	&& /const started = await qlHost;\n\t\tconst services = await qlStart\.outcome\(\);\n\t\tif \(!services\.ready\) \{\n[\s\S]{0,400}?\t\t\tthrow services\.error;\n\t\t\}/.test(app);
+	&& /const started = await qlHost;\n\t\tconst services = await qlStart\.outcome\(\);\n\t\tconst servicesFailure = qlStart\.servicesFailure;\n\t\tif \(servicesFailure\) \{\n[\s\S]{0,400}?\t\t\tthrow servicesFailure\.error;\n\t\t\}/.test(app);
 const reports = app.match(/\.terminalHostKeychainPhaseSettled\(\)/g)?.length ?? 0;
 const inHook = /onBeforeShow: async started => \{\n\t\t\t\tconst \{ qlWorkbenchHost, encryptionMainService \} = await qlStart\.services\(\);\n\t\t\t\tqlWorkbenchHost\.attach\(started\);\n\t\t\t\tencryptionMainService\.terminalHostKeychainPhaseSettled\(\);\n\t\t\t\}/.test(app);
 const required = /private requireQlEncryptionMainService\(service: IEncryptionMainService\): EncryptionMainService \{\n\t\tif \(!\(service instanceof EncryptionMainService\)\) \{\n\t\t\tthrow new Error\(/.test(app);

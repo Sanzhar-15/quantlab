@@ -477,7 +477,8 @@ function makeWorld(lib, scenario) {
 			}, release.at));
 		}
 		const until = Date.now() + deadlineMs;
-		while (Date.now() < until && !(startup && (scenario.quitAt === undefined || exits.length))) {
+		// a quit scenario ends at the exit (startup() may never settle: a services stage held for ever); any other at startup()'s end
+		while (Date.now() < until && !(scenario.quitAt === undefined ? startup : exits.length)) {
 			await sleep(5);
 		}
 		// late events (a rejection with no handler is reported after the microtask queue drains)

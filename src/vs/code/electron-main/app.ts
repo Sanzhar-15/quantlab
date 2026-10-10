@@ -149,8 +149,18 @@ interface QlStartServices {
 	readonly encryptionMainService: EncryptionMainService;
 }
 
-/** QuantLab host (F-PERF-LZ1-1, review c1 M1): how the services section of `startup()` ended, as a value. */
-type QlServicesOutcome<S> = { readonly ready: true; readonly services: S } | { readonly ready: false; readonly error: unknown };
+/** QuantLab host (F-PERF-LZ1-1, review c1 M1/M2): how the services section of `startup()` ended, as a value. */
+type QlServicesOutcome<S> = { readonly ready: true; readonly services: S } | { readonly ready: false; readonly cancelled: boolean; readonly error: unknown };
+
+/** QuantLab host (F-PERF-LZ1-1, review c1 M2): the part of Electron's `app` the early quit guard uses. */
+export interface IQlEarlyQuitApp {
+	on(event: string, listener: (...args: never[]) => void): unknown;
+	removeListener(event: string, listener: (...args: never[]) => void): unknown;
+	quit(): void;
+}
+
+/** QuantLab host (F-PERF-LZ1-1, review c1 M2): the early start was cancelled (a quit before the services were ready, or the host's start ended). */
+export class QlStartCancelled extends Error { }
 
 /**
  * QuantLab host (F-PERF-LZ1-1, review c1 M1): the services the early-started terminal host waits for, held as an OUTCOME (a value,
@@ -158,31 +168,109 @@ type QlServicesOutcome<S> = { readonly ready: true; readonly services: S } | { r
  * never an unhandled rejection, whether or not the host's `onBeforeShow` ever asks for them (a host that failed before its hook
  * never does). `services()` makes one promise per caller that settles as the services did (their failure rethrown): only a caller
  * that awaits it holds a rejection. `startup()` reads `outcome()` and reports a failure ONCE, after the host's start ended.
+ *
+ * Review c1 M2: the host starts before phase `Ready`, and `LifecycleMainService` installs its `before-quit`, `window-all-closed`
+ * and guarded `will-quit` listeners only at `Ready`: until then nothing would hold a quit (a TERM, Cmd+Q) while the start and the
+ * services are under way, and Electron's own `window-all-closed` default would quit when the start closed its last window. So
+ * this holder, made BEFORE the host starts, installs its own three listeners until `lifecycleGuarding()` (right after `Ready`):
+ * a quit before then CANCELS the early start (the hook's `services()` rejects with `QlStartCancelled` at once, so nothing attaches
+ * or shows; the services section stops at its next `checkpoint`, so nothing initialises late) and its `will-quit` is prevented
+ * until `startup()` has seen the host's start end and calls `releaseHeldQuit()`, which quits once more and lets that one through.
+ * `window-all-closed` before `Ready` quits nothing (logged). A host start that ends (failed or quit) cancels too.
  */
 export class QlEarlyStart<S> {
 	private readonly settled: Promise<QlServicesOutcome<S>>;
 	private settle: ((outcome: QlServicesOutcome<S>) => void) | undefined;
 	private failure: { readonly error: unknown } | undefined;
+	private cancellation: QlStartCancelled | undefined;
+	private held = false;
+	private guarding = true;
+	private mayQuit = false;
+	private readonly onBeforeQuit = () => this.quitBeforeReady('before-quit');
+	private readonly onWillQuit = (event: { preventDefault(): void }) => {
+		if (this.mayQuit) {
+			this.removeGuard();
+			return;
+		}
+		event.preventDefault();
+		this.quitBeforeReady('will-quit');
+	};
+	private readonly onWindowAllClosed = () => this.log('QuantLab host: every window closed before the services were ready: no quit (the lifecycle quit policy is not installed yet)');
 
-	constructor() {
+	constructor(private readonly app: IQlEarlyQuitApp, private readonly log: (message: string) => void) {
 		let settle: ((outcome: QlServicesOutcome<S>) => void) | undefined;
 		this.settled = new Promise<QlServicesOutcome<S>>(resolve => { settle = resolve; });
 		this.settle = settle;
+		app.on('before-quit', this.onBeforeQuit);
+		app.on('will-quit', this.onWillQuit);
+		app.on('window-all-closed', this.onWindowAllClosed);
 	}
 
-	/** The services exist (once, or `fail` once). */
+	/** The services exist (once, or `fail` once; never after a cancellation: `checkpoint` stops the section first). */
 	complete(services: S): void {
 		this.take('complete')({ ready: true, services });
 	}
 
-	/** The services section failed (once, or `complete` once); the failure is kept for `startup()`'s one report. */
+	/**
+	 * The services section failed (once, or `complete` once); the failure is kept for `startup()`'s one report. The section's own
+	 * stop at a `checkpoint` (this holder's cancellation) is not a failure; a failure after a cancellation is kept and reported.
+	 */
 	fail(error: unknown): void {
-		const settle = this.take('fail');
+		if (error === this.cancellation) {
+			return;
+		}
 		this.failure = { error };
-		settle({ ready: false, error });
+		if (this.cancellation) {
+			return;
+		}
+		this.take('fail')({ ready: false, cancelled: false, error });
 	}
 
-	/** For the host's hook and `openQuantlab`: the services, or their failure rethrown. */
+	/** Review c1 M2: cancels the early start (idempotent); after the services exist it changes nothing. */
+	cancel(reason: string): void {
+		if (this.cancellation || !this.settle) {
+			return;
+		}
+		this.cancellation = new QlStartCancelled(`QuantLab host (F-PERF-LZ1-1): the early start was cancelled: ${reason}`);
+		this.log(this.cancellation.message);
+		this.take('cancel')({ ready: false, cancelled: true, error: this.cancellation });
+	}
+
+	/** Review c1 M2: between the services section's awaits: throws the cancellation, so nothing initialises after it. */
+	checkpoint(): void {
+		if (this.cancellation) {
+			throw this.cancellation;
+		}
+	}
+
+	/** Review c1 M2: whether a quit arrived before `Ready` (held until `releaseHeldQuit`). */
+	get quitHeld(): boolean {
+		return this.held;
+	}
+
+	/** Review c1 M2: right after phase `Ready` (no quit held: the checkpoint before it passed): the lifecycle's listeners take over. */
+	lifecycleGuarding(): void {
+		if (this.held) {
+			throw new Error('QuantLab host (F-PERF-LZ1-1): lifecycleGuarding() while a quit is held');
+		}
+		this.removeGuard();
+	}
+
+	/** Review c1 M2: the cancelled start has ended (unwound): a held quit goes through now, once (idempotent); otherwise the guard goes. */
+	releaseHeldQuit(): void {
+		if (!this.held) {
+			this.removeGuard();
+			return;
+		}
+		if (this.mayQuit) {
+			return;
+		}
+		this.log('QuantLab host: the start ended after a quit before the services were ready: the held quit goes through');
+		this.mayQuit = true;
+		this.app.quit();
+	}
+
+	/** For the host's hook and `openQuantlab`: the services, or their failure (or the cancellation) rethrown. */
 	services(): Promise<S> {
 		return this.settled.then(outcome => {
 			if (!outcome.ready) {
@@ -201,6 +289,25 @@ export class QlEarlyStart<S> {
 	/** The services section's failure once `fail` ran (the host's start then ends on it; `startup()` reports it). */
 	get servicesFailure(): { readonly error: unknown } | undefined {
 		return this.failure;
+	}
+
+	private quitBeforeReady(how: string): void {
+		if (!this.guarding || this.held) {
+			return;
+		}
+		this.held = true;
+		this.log(`QuantLab host: a quit (${how}) before the services were ready: held until the early start has ended`);
+		this.cancel(`a quit (${how}) before the services were ready`);
+	}
+
+	private removeGuard(): void {
+		if (!this.guarding) {
+			return;
+		}
+		this.guarding = false;
+		this.app.removeListener('before-quit', this.onBeforeQuit);
+		this.app.removeListener('will-quit', this.onWillQuit);
+		this.app.removeListener('window-all-closed', this.onWindowAllClosed);
 	}
 
 	private take(what: string): (outcome: QlServicesOutcome<S>) => void {
@@ -679,8 +786,22 @@ export class CodeApplication extends Disposable {
 		// value: it can neither go unhandled while the services are awaited nor be lost.
 		// Review c1 M1: so are the services' (QlEarlyStart): a failure below is never an unhandled rejection, whenever (or whether)
 		// the hook asks for them, and it is thrown to main.ts ONCE, only after the host's start ended (it unwinds on that failure).
-		const qlStart = new QlEarlyStart<QlStartServices>();
+		// Review c1 M2: the holder is made BEFORE the host starts and holds a quit until phase `Ready` (the lifecycle's own quit
+		// listeners exist only from then): a quit before it cancels the early start and is let through once the start has ended
+		const qlStart = new QlEarlyStart<QlStartServices>(app, message => this.logService.info(message));
 		const qlHost = this.startQlTerminalHost(qlStart).then(terminalHost => ({ failed: false as const, terminalHost }), (error: unknown) => ({ failed: true as const, error }));
+		// Review c1 M2: a host start that ended (failed, or a quit during it) cancels the early start: the services section stops at
+		// its next checkpoint. A quit held before `Ready` goes through once the start has unwound: it waits for nothing else (a
+		// services section that never resumes cannot hold the quit; one that resumes meets the checkpoint). `qlHost` is an outcome
+		// held as a value: this cannot reject.
+		void qlHost.then(started => {
+			if (started.failed || started.terminalHost === false) {
+				qlStart.cancel('the terminal host start ended');
+				if (qlStart.quitHeld) {
+					qlStart.releaseHeldQuit();
+				}
+			}
+		});
 		let initialProtocolUrls: IInitialProtocolUrls | undefined;
 		try {
 			// Resolve unique machine ID
@@ -690,6 +811,7 @@ export class CodeApplication extends Disposable {
 				resolveDevDeviceId(this.stateService, this.logService)
 			]);
 			mark('code/ql/didResolveMachineIds');
+			qlStart.checkpoint();
 
 			// Shared process
 			const { sharedProcessReady, sharedProcessClient } = this.setupSharedProcess(machineId, sqmId, devDeviceId);
@@ -697,6 +819,7 @@ export class CodeApplication extends Disposable {
 			// Services
 			const appInstantiationService = await this.initServices(machineId, sqmId, devDeviceId, sharedProcessReady);
 			mark('code/ql/didInitServices');
+			qlStart.checkpoint();
 
 			// Error telemetry
 			appInstantiationService.invokeFunction(accessor => this._register(new ErrorTelemetry(accessor.get(ILogService), accessor.get(ITelemetryService))));
@@ -713,19 +836,22 @@ export class CodeApplication extends Disposable {
 			// Setup Protocol URL Handlers
 			initialProtocolUrls = await appInstantiationService.invokeFunction(accessor => this.setupProtocolUrlHandlers(accessor, mainProcessElectronServer));
 			mark('code/ql/didSetupProtocolUrlHandlers');
+			qlStart.checkpoint();
 
 			// Setup vscode-remote-resource protocol handler
 			this.setupManagedRemoteResourceUrlHandler(mainProcessElectronServer);
 
 			// Signal phase: ready - before opening first window
 			this.lifecycleMainService.phase = LifecycleMainPhase.Ready;
+			// Review c1 M2: the lifecycle's quit listeners are installed now (on `Ready`, before any next event): the early guard goes
+			qlStart.lifecycleGuarding();
 
 			// QuantLab host (F-PERF-LZ1-1): what the started host's `onBeforeShow` waits for, taken from the accessor synchronously
 			const protocolUrls = initialProtocolUrls;
 			qlStart.complete(appInstantiationService.invokeFunction(accessor => this.createQlStartServices(accessor, protocolUrls)));
 		} catch (error) {
 			// Review c1 M1: kept, not thrown yet: the host's hook rethrows it (the start fails at `before-show` and unwinds); it is
-			// thrown below, once that start ended
+			// thrown below, once that start ended. Review c1 M2: a checkpoint's stop on the cancellation is not a failure (fail ignores it)
 			qlStart.fail(error);
 		}
 
@@ -733,15 +859,22 @@ export class CodeApplication extends Disposable {
 		// QuantLab host (U3): the terminal host instead of the first window (`openFirstWindow` stays for U5's lazy gate)
 		const started = await qlHost;
 		const services = await qlStart.outcome();
-		if (!services.ready) {
+		const servicesFailure = qlStart.servicesFailure;
+		if (servicesFailure) {
 			if (started.failed) {
 				// Two failures: the start's own is logged here; the services' is the one thrown to main.ts
 				this.logService.error('QuantLab host: the terminal host start failed as well as the services', started.error);
 			}
-			throw services.error;
+			throw servicesFailure.error;
 		}
 		if (started.failed) {
 			throw started.error;
+		}
+		if (!services.ready) {
+			// Review c1 M2: the early start was cancelled (a quit before `Ready`, or the host's start ended) and both halves have
+			// stopped: nothing more starts; a held quit goes through now, after the start unwound
+			qlStart.releaseHeldQuit();
+			return;
 		}
 		if (started.terminalHost === false || !await this.finishQlTerminalHost(started.terminalHost, services.services.qlWorkbenchHost, initialProtocolUrls)) {
 			return;
@@ -1535,9 +1668,12 @@ export class CodeApplication extends Disposable {
 			// quit, not a failure (the client logged `quit during start` and `exit 0`). A quit already under way ends on its own: a
 			// second `app.quit()` during the lifecycle's prevented `will-quit` ends the process under its joiners
 			// (folds/HOST/QUIT-EXIT-FIX.md). A close that started no quit (macOS: closing the only window) quits through the lifecycle.
-			if (isQuitDuringStart(error)) {
+			// Review c1 M2: a quit before `Ready` is held by the early guard (`qlStart.quitHeld`) and let through once the start has
+			// ended: not a second quit here either; and whatever ended the start after it (the hook's cancellation, a waiting window
+			// the quit closed) is that quit, not a failure.
+			if (isQuitDuringStart(error) || qlStart.quitHeld) {
 				this.logService.info('QuantLab host: the window was closed during the terminal host start; the app quits', error);
-				if (!this.lifecycleMainService.quitRequested) {
+				if (!this.lifecycleMainService.quitRequested && !qlStart.quitHeld) {
 					this.lifecycleMainService.quit().then(
 						veto => veto && this.logService.error('QuantLab host: the quit after a close during the start was vetoed'),
 						quitError => this.logService.error('QuantLab host: the quit after a close during the start failed', quitError)

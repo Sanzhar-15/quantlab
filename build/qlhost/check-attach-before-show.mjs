@@ -8,7 +8,8 @@
 // (the client's start.dtest proves the port's order), and nowhere else.
 // Run from the fork root: `node build/qlhost/check-attach-before-show.mjs src/vs`; rc 0 = GREEN.
 // Row 3: a start rejected because the window was closed (`isQuitDuringStart`) is a quit: no `app.exit` in that branch, and
-// `lifecycleMainService.quit()` only when no quit is already under way; any other rejection still exits 1.
+// `lifecycleMainService.quit()` only when no quit is already under way; any other rejection still exits 1. Review c1 M2: so is a
+// start that ended after a quit the early guard held before `Ready` (`qlStart.quitHeld`): that quit is under way too.
 // Row 4 (package K1-1): the start is a shutdown joiner (`onWillShutdown` -> `join('qlTerminalHostStart', …)`) registered before
 // it is awaited, so the lifecycle's final quit cannot end the process under the start's unwind. 34d1cd4f968's app.ts -> rows 1, 4 RED.
 // M8 (check-keychain-gate.mjs): onBeforeShow is a block whose FIRST statement is the attach (row 1 reads that form).
@@ -54,10 +55,10 @@ row('2 no other attach (none after the start resolved)', attaches === 1, `${atta
 const catchStart = app.indexOf('catch (error)', started);
 const catchEnd = catchStart < 0 ? -1 : app.indexOf('this.qlTerminalHost = terminalHost;', catchStart);
 const handler = catchStart < 0 || catchEnd < 0 ? '' : app.slice(catchStart, catchEnd);
-const quitAt = handler.indexOf('if (isQuitDuringStart(error)) {');
+const quitAt = handler.indexOf('if (isQuitDuringStart(error) || qlStart.quitHeld) {');
 const exit1At = handler.indexOf('app.exit(1);');
 const quitBranch = quitAt < 0 || exit1At < 0 ? '' : handler.slice(quitAt, exit1At);
-const guarded = /if \(!this\.lifecycleMainService\.quitRequested\) \{\s*this\.lifecycleMainService\.quit\(\)/.test(quitBranch);
+const guarded = /if \(!this\.lifecycleMainService\.quitRequested && !qlStart\.quitHeld\) \{\s*this\.lifecycleMainService\.quit\(\)/.test(quitBranch);
 const exitInQuit = /app\.(exit|quit)\(/.test(quitBranch);
 const returns = /return false;\s*\}\s*$/.test(quitBranch.trimEnd().replace(/this\.logService\.error\(error\);$/, '').trimEnd());
 row('3 a quit during the start is not an exit 1: lifecycle quit only when none is under way, no app.exit/app.quit in it, then return',
