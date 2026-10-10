@@ -9,6 +9,7 @@ import { ServerApiClient, ServerSymbol, CryptoSymbol, EtfItem, IndexItem } from 
 import { WatchlistManager, Watchlist } from './WatchlistManager';
 import { isServerSource } from '../../types/market';
 import { etfOrIndexDisplayName, mintServerSymbolHandle } from './serverSymbolHandles';
+import { markRenderedWatchlistNode } from './watchlistNodes';
 import { isHostDataError } from '../../core/host/hostDataTransport';
 
 /** A failed server load: the text shown, and whether the host refused it as signed out (by its code). */
@@ -395,7 +396,8 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				{ command: 'quantlab.watchlist.create', title: 'New Watchlist' },
 				'Click to create one')];
 		}
-		return watchlists.map(wl => ({
+		// Marked: rename/delete accept only a node this tree rendered (watchlistNodes.ts).
+		return watchlists.map(wl => markRenderedWatchlistNode({
 			nodeKind: 'watchlist' as const,
 			id: `quantlab.watchlist.${wl.id}`,
 			label: wl.name,
@@ -416,9 +418,10 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 		if (hasServerSymbols && this.cryptoSymbolSet.size === 0) {
 			await this.loadCryptoSymbols();
 		}
+		// Marked: removeSymbol accepts only a node this tree rendered (watchlistNodes.ts).
 		return wl.symbols.map(sym => {
 			const isServerSymbol = !sym.includes('/') && !sym.includes('\\') && !sym.endsWith('.csv');
-			return {
+			return markRenderedWatchlistNode({
 				nodeKind: 'watchlistItem' as const,
 				id: `quantlab.watchlist.${wl.id}.${sym}`,
 				label: sym,
@@ -434,7 +437,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 					title: 'Open',
 					arguments: [sym]
 				},
-			} satisfies WatchlistItemNode;
+			} satisfies WatchlistItemNode);
 		});
 	}
 

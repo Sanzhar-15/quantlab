@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { DataNode } from '../panels/data/DataTreeProvider';
+import { resolveRenderedWatchlistItemNode, resolveRenderedWatchlistNode } from '../panels/data/watchlistNodes';
 import { WatchlistManager } from '../panels/data/WatchlistManager';
 
 /**
@@ -14,7 +14,10 @@ import { WatchlistManager } from '../panels/data/WatchlistManager';
  * The rename/delete/removeSymbol commands are tree-context-menu commands:
  * VS Code passes the right-clicked tree element as the first argument. They
  * are hidden from the Command Palette in package.json because they are
- * meaningless without a tree selection.
+ * meaningless without a tree selection. They are still public commands, so
+ * each first resolves its argument to a node the data tree rendered
+ * (watchlistNodes.ts) and is refused with a named error otherwise, before
+ * any input box, modal or WatchlistManager call (F-HOST-WATCHLIST-SYNC-1).
  */
 export function registerWatchlistCommands(context: vscode.ExtensionContext, watchlistManager: WatchlistManager): void {
 	context.subscriptions.push(
@@ -30,44 +33,35 @@ export function registerWatchlistCommands(context: vscode.ExtensionContext, watc
 			watchlistManager.addWatchlist(name);
 		}),
 
-		vscode.commands.registerCommand('quantlab.watchlist.rename', async (node?: DataNode) => {
-			if (!node || node.nodeKind !== 'watchlist') {
-				void vscode.window.showErrorMessage('Rename Watchlist: right-click a watchlist in the Data panel.');
-				return;
-			}
+		vscode.commands.registerCommand('quantlab.watchlist.rename', async (node: unknown) => {
+			const rendered = resolveRenderedWatchlistNode('quantlab.watchlist.rename', node);
 			const name = await vscode.window.showInputBox({
-				prompt: `Rename watchlist "${node.watchlist.name}"`,
-				value: node.watchlist.name,
+				prompt: `Rename watchlist "${rendered.watchlist.name}"`,
+				value: rendered.watchlist.name,
 				validateInput: value => value.trim() ? undefined : 'Watchlist name is required'
 			});
 			if (name === undefined) {
 				return; // user cancelled
 			}
-			watchlistManager.renameWatchlist(node.watchlist.id, name);
+			watchlistManager.renameWatchlist(rendered.watchlist.id, name);
 		}),
 
-		vscode.commands.registerCommand('quantlab.watchlist.delete', async (node?: DataNode) => {
-			if (!node || node.nodeKind !== 'watchlist') {
-				void vscode.window.showErrorMessage('Delete Watchlist: right-click a watchlist in the Data panel.');
-				return;
-			}
+		vscode.commands.registerCommand('quantlab.watchlist.delete', async (node: unknown) => {
+			const rendered = resolveRenderedWatchlistNode('quantlab.watchlist.delete', node);
 			const choice = await vscode.window.showWarningMessage(
-				`Delete watchlist "${node.watchlist.name}" (${node.watchlist.symbols.length} symbols)?`,
+				`Delete watchlist "${rendered.watchlist.name}" (${rendered.watchlist.symbols.length} symbols)?`,
 				{ modal: true },
 				'Delete'
 			);
 			if (choice !== 'Delete') {
 				return;
 			}
-			watchlistManager.removeWatchlist(node.watchlist.id);
+			watchlistManager.removeWatchlist(rendered.watchlist.id);
 		}),
 
-		vscode.commands.registerCommand('quantlab.watchlist.removeSymbol', (node?: DataNode) => {
-			if (!node || node.nodeKind !== 'watchlistItem') {
-				void vscode.window.showErrorMessage('Remove from Watchlist: right-click a symbol inside a watchlist in the Data panel.');
-				return;
-			}
-			watchlistManager.removeSymbol(node.watchlistId, node.symbol);
+		vscode.commands.registerCommand('quantlab.watchlist.removeSymbol', (node: unknown) => {
+			const rendered = resolveRenderedWatchlistItemNode('quantlab.watchlist.removeSymbol', node);
+			watchlistManager.removeSymbol(rendered.watchlistId, rendered.symbol);
 		}),
 	);
 }
