@@ -10,9 +10,13 @@
 // Run from the fork root: `node build/qlhost/check-keychain-gate.mjs src/vs`; rc 0 = GREEN.
 // Negatives: 49e35049609's encryptionMainService.ts -> rows 1-5 RED; 49e35049609's app.ts -> row 6 RED.
 // F-PERF-LZ1-1 (row 6's new form): the service is taken in the SYNCHRONOUS createQlStartServices (from the accessor); the hook
-// awaits the services, attaches, reports, and holds nothing else (no catch: a rejection fails the start at before-show); the
-// services promise is the deferred itself, nothing chained on it. Negatives: (c) a try/catch around the hook's await -> row 6 RED;
-// (d) a second terminalHostKeychainPhaseSettled() call -> row 6 RED; (e) adb6f9a0044's app.ts (the synchronous hook) -> row 6 RED.
+// awaits the services, attaches, reports, and holds nothing else (no catch: a rejection fails the start at before-show).
+// Negatives: (c) a try/catch around the hook's await -> row 6 RED; (d) a second terminalHostKeychainPhaseSettled() call -> row 6
+// RED; (e) adb6f9a0044's app.ts (the synchronous hook) -> row 6 RED.
+// Review c1 M1 (row 6's form since): the services are held as an OUTCOME (QlEarlyStart: a promise made with no reject, observed
+// at once); the hook awaits `qlStart.services()`, which rethrows a failure; startup()'s catch keeps the failure (`qlStart.fail`)
+// and throws it ONCE after the host's start ended; nothing is chained on `qlStart.services()`. Negative: 295dc583a06's app.ts
+// (the DeferredPromise, rethrown at once) -> row 6 RED. The behaviour itself: check-lz1-services-failure.mjs.
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -131,14 +135,22 @@ const startEnd = startAt < 0 ? -1 : app.indexOf('\n\t}\n', startAt);
 const takenAt = app.indexOf('const encryptionMainService = this.requireQlEncryptionMainService(accessor.get(IEncryptionMainService));', startAt);
 const synchronous = startAt >= 0 && !app.slice(startAt, startEnd).includes('await ') && app.slice(startAt, startEnd).includes('return { qlWorkbenchHost, encryptionMainService };');
 const firstAwait = startEnd;
-const passed = (app.match(/this\.startQlTerminalHost\(qlServices\.p\)/g)?.length ?? 0) === 1 && !/qlServices\.p\.(then|catch|finally)\(|\bservices\.(then|catch|finally)\(/.test(app)
-	&& /\} catch \(error\) \{\n\t\t\tqlServices\.error\(error\);\n\t\t\tthrow error;\n\t\t\}\n\t\tqlServices\.complete\(qlStartServices\);/.test(app);
+// Review c1 M1: the outcome holder (QlEarlyStart) makes its promise with no reject; `services()` rethrows the failure; startup()
+// hands the holder to the host once, keeps a failure in its catch (no rethrow there), and throws it once the host's start ended
+const holderAt = app.indexOf('export class QlEarlyStart<S> {');
+const holder = holderAt < 0 ? '' : app.slice(holderAt, app.indexOf('\n}\n', holderAt));
+const holderShaped = /this\.settled = new Promise<QlServicesOutcome<S>>\(resolve => \{ settle = resolve; \}\);/.test(holder)
+	&& /services\(\): Promise<S> \{\n\t\treturn this\.settled\.then\(outcome => \{\n\t\t\tif \(!outcome\.ready\) \{\n\t\t\t\tthrow outcome\.error;/.test(holder)
+	&& !/\.catch\(|\(resolve, reject\)/.test(holder);
+const passed = holderShaped && (app.match(/this\.startQlTerminalHost\(qlStart\)/g)?.length ?? 0) === 1 && !/qlStart\.services\(\)\.(then|catch|finally)\(|qlStart\.outcome\(\)\.(then|catch|finally)\(/.test(app)
+	&& /\} catch \(error\) \{\n(\t\t\t\/\/[^\n]*\n)*\t\t\tqlStart\.fail\(error\);\n\t\t\}\n/.test(app)
+	&& /const started = await qlHost;\n\t\tconst services = await qlStart\.outcome\(\);\n\t\tif \(!services\.ready\) \{\n[\s\S]{0,400}?\t\t\tthrow services\.error;\n\t\t\}/.test(app);
 const reports = app.match(/\.terminalHostKeychainPhaseSettled\(\)/g)?.length ?? 0;
-const inHook = /onBeforeShow: async started => \{\n\t\t\t\tconst \{ qlWorkbenchHost, encryptionMainService \} = await services;\n\t\t\t\tqlWorkbenchHost\.attach\(started\);\n\t\t\t\tencryptionMainService\.terminalHostKeychainPhaseSettled\(\);\n\t\t\t\}/.test(app);
+const inHook = /onBeforeShow: async started => \{\n\t\t\t\tconst \{ qlWorkbenchHost, encryptionMainService \} = await qlStart\.services\(\);\n\t\t\t\tqlWorkbenchHost\.attach\(started\);\n\t\t\t\tencryptionMainService\.terminalHostKeychainPhaseSettled\(\);\n\t\t\t\}/.test(app);
 const required = /private requireQlEncryptionMainService\(service: IEncryptionMainService\): EncryptionMainService \{\n\t\tif \(!\(service instanceof EncryptionMainService\)\) \{\n\t\t\tthrow new Error\(/.test(app);
 row('6 app.ts reports the phase once, from onBeforeShow after awaiting the services and the attach, to the registered service taken synchronously',
 	startAt >= 0 && takenAt > startAt && takenAt < firstAwait && synchronous && passed && reports === 1 && inHook && required,
-	`service taken in the synchronous createQlStartServices ${takenAt > startAt && takenAt < firstAwait && synchronous}, services passed uncaught ${passed}, ${reports} report call(s), in onBeforeShow (await, attach, report; nothing else) ${inHook}, instanceof guard ${required}`);
+	`service taken in the synchronous createQlStartServices ${takenAt > startAt && takenAt < firstAwait && synchronous}, services held as an outcome, rethrown once after the host ended, nothing chained ${passed}, ${reports} report call(s), in onBeforeShow (await, attach, report; nothing else) ${inHook}, instanceof guard ${required}`);
 
 console.log(rows.join('\n'));
 if (problems.length) {

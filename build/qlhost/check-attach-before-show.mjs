@@ -14,7 +14,8 @@
 // M8 (check-keychain-gate.mjs): onBeforeShow is a block whose FIRST statement is the attach (row 1 reads that form).
 // F-PERF-LZ1-1: the host starts before the services exist; the hook awaits them (`await services`), then attaches FIRST. Nothing
 // shows before the attach only because the client awaits the hook: row 1 also pins the fork's pairing check (startQlTerminalHost
-// throws by name, before the ports, when the client lacks `onBeforeShowAwaited`).
+// throws by name, before the ports, when the client lacks `onBeforeShowAwaited`). Review c1 M1: the services come from the outcome
+// holder (`await qlStart.services()`; check-keychain-gate row 6, check-lz1-services-failure).
 // Negatives: cfd0c72398f's app.ts (attach after startTerminalHost resolved) -> row 1 RED (row 2 stays GREEN: one attach there
 // too); c7401d0b279's app.ts (every rejection exits 1) -> row 3 RED. F-PERF-LZ1-1 negatives: (a) the pairing check removed from
 // startQlTerminalHost -> row 1 RED; (b) adb6f9a0044's app.ts (the synchronous hook, no await of the services) -> row 1 RED.
@@ -39,8 +40,8 @@ const app = readFileSync(join(vs, 'code/electron-main/app.ts'), 'utf8');
 const portsStart = app.indexOf('const ports: Ports = {');
 const portsEnd = portsStart < 0 ? -1 : app.indexOf('\n\t\t};', portsStart);
 const ports = portsStart < 0 || portsEnd < 0 ? '' : app.slice(portsStart, portsEnd);
-const hook = /onBeforeShow: async started => \{\n\t\t\t\tconst \{ qlWorkbenchHost, encryptionMainService \} = await services;\n\t\t\t\tqlWorkbenchHost\.attach\(started\);/.test(ports);
-const startFn = app.indexOf('private async startQlTerminalHost(services: Promise<QlStartServices>)');
+const hook = /onBeforeShow: async started => \{\n\t\t\t\tconst \{ qlWorkbenchHost, encryptionMainService \} = await qlStart\.services\(\);\n\t\t\t\tqlWorkbenchHost\.attach\(started\);/.test(ports);
+const startFn = app.indexOf('private async startQlTerminalHost(qlStart: QlEarlyStart<QlStartServices>)');
 const pairing = startFn < 0 ? -1 : app.indexOf('if (onBeforeShowAwaited() !== true) {\n\t\t\tthrow new Error(\'QuantLab host (F-PERF-LZ1-1): the client does not await onBeforeShow', startFn);
 const paired = pairing > startFn && pairing < portsStart && /import \{[^}]*\bonBeforeShowAwaited\b[^}]*\} from '\.\/ql-client\/index\.js';/.test(app);
 const started = app.indexOf('const starting = startTerminalHost(ports);');

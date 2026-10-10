@@ -103,7 +103,7 @@ import { IExtensionsScannerService } from '../../platform/extensionManagement/co
 import { ExtensionsScannerService } from '../../platform/extensionManagement/node/extensionsScannerService.js';
 import { UserDataProfilesHandler } from '../../platform/userDataProfile/electron-main/userDataProfilesHandler.js';
 import { ProfileStorageChangesListenerChannel } from '../../platform/userDataProfile/electron-main/userDataProfileStorageIpc.js';
-import { DeferredPromise, Promises, RunOnceScheduler, runWhenGlobalIdle } from '../../base/common/async.js';
+import { Promises, RunOnceScheduler, runWhenGlobalIdle } from '../../base/common/async.js';
 import { resolveMachineId, resolveSqmId, resolveDevDeviceId, validateDevDeviceId } from '../../platform/telemetry/electron-main/telemetryUtils.js';
 import { ExtensionsProfileScannerService } from '../../platform/extensionManagement/node/extensionsProfileScannerService.js';
 import { LoggerChannel } from '../../platform/log/electron-main/logIpc.js';
@@ -147,6 +147,71 @@ import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
 interface QlStartServices {
 	readonly qlWorkbenchHost: QlWorkbenchHost;
 	readonly encryptionMainService: EncryptionMainService;
+}
+
+/** QuantLab host (F-PERF-LZ1-1, review c1 M1): how the services section of `startup()` ended, as a value. */
+type QlServicesOutcome<S> = { readonly ready: true; readonly services: S } | { readonly ready: false; readonly error: unknown };
+
+/**
+ * QuantLab host (F-PERF-LZ1-1, review c1 M1): the services the early-started terminal host waits for, held as an OUTCOME (a value,
+ * as the client holds its minimum-version request): the promise held here never rejects, so a failure of the services section is
+ * never an unhandled rejection, whether or not the host's `onBeforeShow` ever asks for them (a host that failed before its hook
+ * never does). `services()` makes one promise per caller that settles as the services did (their failure rethrown): only a caller
+ * that awaits it holds a rejection. `startup()` reads `outcome()` and reports a failure ONCE, after the host's start ended.
+ */
+export class QlEarlyStart<S> {
+	private readonly settled: Promise<QlServicesOutcome<S>>;
+	private settle: ((outcome: QlServicesOutcome<S>) => void) | undefined;
+	private failure: { readonly error: unknown } | undefined;
+
+	constructor() {
+		let settle: ((outcome: QlServicesOutcome<S>) => void) | undefined;
+		this.settled = new Promise<QlServicesOutcome<S>>(resolve => { settle = resolve; });
+		this.settle = settle;
+	}
+
+	/** The services exist (once, or `fail` once). */
+	complete(services: S): void {
+		this.take('complete')({ ready: true, services });
+	}
+
+	/** The services section failed (once, or `complete` once); the failure is kept for `startup()`'s one report. */
+	fail(error: unknown): void {
+		const settle = this.take('fail');
+		this.failure = { error };
+		settle({ ready: false, error });
+	}
+
+	/** For the host's hook and `openQuantlab`: the services, or their failure rethrown. */
+	services(): Promise<S> {
+		return this.settled.then(outcome => {
+			if (!outcome.ready) {
+				throw outcome.error;
+			}
+
+			return outcome.services;
+		});
+	}
+
+	/** For `startup()`: how the services section ended; never rejects. */
+	outcome(): Promise<QlServicesOutcome<S>> {
+		return this.settled;
+	}
+
+	/** The services section's failure once `fail` ran (the host's start then ends on it; `startup()` reports it). */
+	get servicesFailure(): { readonly error: unknown } | undefined {
+		return this.failure;
+	}
+
+	private take(what: string): (outcome: QlServicesOutcome<S>) => void {
+		const settle = this.settle;
+		if (!settle) {
+			throw new Error(`QuantLab host (F-PERF-LZ1-1): the start's services were already settled (${what} called again)`);
+		}
+		this.settle = undefined;
+
+		return settle;
+	}
 }
 
 export class CodeApplication extends Disposable {
@@ -609,12 +674,13 @@ export class CodeApplication extends Disposable {
 		});
 
 		// QuantLab host (F-PERF-LZ1-1): the terminal host starts NOW, before the machine-ids await and initServices (it needs neither;
-		// MARKS-1: the ids alone took 28-239 ms). Its `onBeforeShow` waits for the services below (`qlServices`), so the window stays
-		// hidden until they exist; a failure below rejects them and the start fails at `before-show`, by name. The early start's
-		// outcome is held as a value: it can neither go unhandled while the services are awaited nor be lost.
-		const qlServices = new DeferredPromise<QlStartServices>();
-		const qlStart = this.startQlTerminalHost(qlServices.p).then(terminalHost => ({ failed: false as const, terminalHost }), (error: unknown) => ({ failed: true as const, error }));
-		let qlStartServices: QlStartServices;
+		// MARKS-1: the ids alone took 28-239 ms). Its `onBeforeShow` waits for the services below (`qlStart`), so the window stays
+		// hidden until they exist; a failure below ends the start at `before-show`, by name. The early start's outcome is held as a
+		// value: it can neither go unhandled while the services are awaited nor be lost.
+		// Review c1 M1: so are the services' (QlEarlyStart): a failure below is never an unhandled rejection, whenever (or whether)
+		// the hook asks for them, and it is thrown to main.ts ONCE, only after the host's start ended (it unwinds on that failure).
+		const qlStart = new QlEarlyStart<QlStartServices>();
+		const qlHost = this.startQlTerminalHost(qlStart).then(terminalHost => ({ failed: false as const, terminalHost }), (error: unknown) => ({ failed: true as const, error }));
 		let initialProtocolUrls: IInitialProtocolUrls | undefined;
 		try {
 			// Resolve unique machine ID
@@ -656,20 +722,28 @@ export class CodeApplication extends Disposable {
 
 			// QuantLab host (F-PERF-LZ1-1): what the started host's `onBeforeShow` waits for, taken from the accessor synchronously
 			const protocolUrls = initialProtocolUrls;
-			qlStartServices = appInstantiationService.invokeFunction(accessor => this.createQlStartServices(accessor, protocolUrls));
+			qlStart.complete(appInstantiationService.invokeFunction(accessor => this.createQlStartServices(accessor, protocolUrls)));
 		} catch (error) {
-			qlServices.error(error);
-			throw error;
+			// Review c1 M1: kept, not thrown yet: the host's hook rethrows it (the start fails at `before-show` and unwinds); it is
+			// thrown below, once that start ended
+			qlStart.fail(error);
 		}
-		qlServices.complete(qlStartServices);
 
 		// Open Windows
 		// QuantLab host (U3): the terminal host instead of the first window (`openFirstWindow` stays for U5's lazy gate)
-		const started = await qlStart;
+		const started = await qlHost;
+		const services = await qlStart.outcome();
+		if (!services.ready) {
+			if (started.failed) {
+				// Two failures: the start's own is logged here; the services' is the one thrown to main.ts
+				this.logService.error('QuantLab host: the terminal host start failed as well as the services', started.error);
+			}
+			throw services.error;
+		}
 		if (started.failed) {
 			throw started.error;
 		}
-		if (started.terminalHost === false || !await this.finishQlTerminalHost(started.terminalHost, qlStartServices.qlWorkbenchHost, initialProtocolUrls)) {
+		if (started.terminalHost === false || !await this.finishQlTerminalHost(started.terminalHost, services.services.qlWorkbenchHost, initialProtocolUrls)) {
 			return;
 		}
 
@@ -1388,11 +1462,12 @@ export class CodeApplication extends Disposable {
 
 	/**
 	 * QuantLab host (F-PERF-LZ1-1): the terminal host's start, run at the top of `startup()` before the machine-ids await and
-	 * initServices: it needs only what CodeMain made. `onBeforeShow` (and `openQuantlab`) wait for `services`; the client awaits the
-	 * hook before it shows the window. Resolves the started host, or `false` after a quit during the start or a failed start
-	 * (handled here as before: quit through the lifecycle, or exit 1).
+	 * initServices: it needs only what CodeMain made. `onBeforeShow` (and `openQuantlab`) wait for `qlStart.services()`; the client
+	 * awaits the hook before it shows the window. Resolves the started host, or `false` after a quit during the start or a failed
+	 * start (handled here as before: quit through the lifecycle, or exit 1), or after a start that ended once the services failed
+	 * (review c1 M1: `startup()` reports that failure).
 	 */
-	private async startQlTerminalHost(services: Promise<QlStartServices>): Promise<TerminalHost | false> {
+	private async startQlTerminalHost(qlStart: QlEarlyStart<QlStartServices>): Promise<TerminalHost | false> {
 		// The pairing (HOST condition 1): a client that does not await `onBeforeShow` would show the window before the services exist
 		if (onBeforeShowAwaited() !== true) {
 			throw new Error('QuantLab host (F-PERF-LZ1-1): the client does not await onBeforeShow (no onBeforeShowAwaited marker): fork and client are not a pair');
@@ -1416,7 +1491,7 @@ export class CodeApplication extends Disposable {
 			devTools: !this.environmentMainService.isBuilt,
 			preloadPath,
 			rendererDir,
-			openQuantlab: async intent => (await services).qlWorkbenchHost.openQuantlab(intent),
+			openQuantlab: async intent => (await qlStart.services()).qlWorkbenchHost.openQuantlab(intent),
 			// QuantLab host (review c1 M7): the workbench host takes over the window's close (the quit handshake runs through the
 			// lifecycle before the window goes), the toggle key and the gate's requests while the window is still hidden and nothing
 			// is loaded: no key at the first did-finish-load and no close during the start reaches a host without them
@@ -1424,7 +1499,7 @@ export class CodeApplication extends Disposable {
 			// on macOS) has settled by now: only from here may the fork's own encryption service make its synchronous safeStorage calls
 			// F-PERF-LZ1-1: the host started before the services; the client awaits this hook before it shows the window
 			onBeforeShow: async started => {
-				const { qlWorkbenchHost, encryptionMainService } = await services;
+				const { qlWorkbenchHost, encryptionMainService } = await qlStart.services();
 				qlWorkbenchHost.attach(started);
 				encryptionMainService.terminalHostKeychainPhaseSettled();
 			}
@@ -1447,6 +1522,14 @@ export class CodeApplication extends Disposable {
 			terminalHost = await starting;
 		} catch (error) {
 			startJoiner.dispose();
+
+			// Review c1 M1: the services failed (the hook rethrew their failure, or the start ended otherwise meanwhile): `startup()`
+			// throws that failure to main.ts once, after this; the start's own ending is logged here, with no exit of its own
+			if (qlStart.servicesFailure) {
+				this.logService.info('QuantLab host: the terminal host start ended after the services failed (startup reports that failure)', error);
+
+				return false;
+			}
 
 			// QuantLab host (review c1 M7): the window was closed during the start (a close, Cmd+Q, a TERM, an update restart): a
 			// quit, not a failure (the client logged `quit during start` and `exit 0`). A quit already under way ends on its own: a
