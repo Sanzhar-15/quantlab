@@ -84,7 +84,9 @@ import { QL_POLICY_CUSTOM_TITLE_BAR_VISIBILITY, QL_POLICY_DIALOG_STYLE, QL_POLIC
 			nativeHostService.quit();
 		},
 		when: undefined,
-		mac: { primary: KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyQ },
+		// QuantLab host (F-HOST-QUIT-WB-1/2): Cmd+Q is the macOS quit (product spec V10.5 section 8.1); 994d118b3f5 had moved it to Cmd+Shift+Q,
+		// which the workbench sends to main as the full menu's Quit accelerator, so Cmd+Q did nothing once the workbench was open
+		mac: { primary: KeyMod.CtrlCmd | KeyCode.KeyQ },
 		linux: { primary: KeyMod.CtrlCmd | KeyCode.KeyQ }
 	});
 
