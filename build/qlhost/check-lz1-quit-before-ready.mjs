@@ -15,6 +15,10 @@
 // Run from the fork root: `node build/qlhost/check-lz1-quit-before-ready.mjs src/vs`; rc 0 = GREEN.
 // Negative: d028d28b5d3's app.ts (M1 only: no early guard, no cancellation) -> every quit row RED (the exit at the quit, before
 // the unwind; the hook still pending at the deadline), and the unmarked rows exit when the waiting window closes.
+// W1 (INTEG proof-m1m4-2e: no Q row bites on the window-all-closed hold alone): an unmarked launch whose every window closes before
+// Ready with NO quit requested must neither quit nor exit before Ready, then start (attach, reveal) and quit through the lifecycle.
+// Negative: this app.ts with ONLY QlEarlyStart's `app.on('window-all-closed', ...)` removed -> W1 RED (Electron's default quit at
+// the waiting window's close, an exit before Ready, Ready never), Q1-Q5 and R1 GREEN.
 import { find, loadStartup, trace } from './lz1-startup-fixture.mjs';
 
 const vs = process.argv[2];
@@ -76,6 +80,33 @@ for (const { id, name, scenario, resumes, beforeWindow } of quitRows) {
 	row('R1 a quit after Ready (the started host) goes through the lifecycle: attached and shown once, exit 0 after its shutdown',
 		ok,
 		`Ready ${ready ? `at ${ready.at} ms` : 'never'}; attach ${attach ? `at ${attach.at} ms` : 'never'}; reveal ${reveal ? `at ${reveal.at} ms` : 'never'}; exits ${JSON.stringify(result.exits)}; lifecycle shutdown (state closed) ${!!find(result, /^state service closed$/)}; error logs ${result.logs.error.length}; startup ${result.startup ? (result.startup.ok ? 'returned' : `rejected ${result.startup.error}`) : 'never settled'}`,
+		result);
+}
+
+{
+	// W1 (INTEG proof-m1m4-2e): every window closes before Ready with NO quit requested. Unmarked: the start's waiting window opens
+	// and closes while initServices still runs (Ready comes at ~70 ms), so for a moment no window exists and the lifecycle's own
+	// window-all-closed listener is not installed yet: Electron's default (no listener -> app.quit()) would end the launch there.
+	// The app must not quit or exit before Ready; the start continues (attach, reveal) and a quit after Ready goes through the
+	// lifecycle, as R1.
+	const WQUIT = 300;
+	const result = await lib.world({ machineIds: fast, initServices: { at: 60 }, protocolUrls: fast, client: { waitingWindowMs: 15, hookAt: 20, boundMs: BOUND }, quitAt: WQUIT, settleMs: 250 }).run(3000);
+	const waitClosed = find(result, /^window keychain-wait closed$/);
+	const ready = find(result, /^lifecycle phase 2$/);
+	const defaultQuit = find(result, /^window-all-closed with no listener/);
+	const firstQuit = find(result, /^app\.quit\(\)$/);
+	const attach = find(result, /^fork ATTACH$/);
+	const reveal = find(result, /^client REVEAL$/);
+	const exit = result.exits[0];
+	// the scenario: the waiting window closed before any Ready (an early exit that prevents Ready is the failure, not the setup)
+	const setup = waitClosed !== undefined && (ready === undefined || waitClosed.at < ready.at);
+	const ok = setup && ready !== undefined && ready.at < WQUIT && defaultQuit === undefined && firstQuit !== undefined && firstQuit.at >= WQUIT
+		&& result.exits.length === 1 && exit.code === 0 && exit.how === 'quit' && exit.at >= WQUIT
+		&& attach !== undefined && reveal !== undefined && ready.at <= attach.at && attach.at < WQUIT && reveal.at < WQUIT
+		&& find(result, /^state service closed$/) !== undefined && result.unhandled.length === 0 && result.logs.error.length === 0 && result.startup?.ok === true;
+	row(`W1 unmarked, every window closed before Ready (the waiting window) and no quit requested: no quit or exit before Ready (Electron's window-all-closed default held), the start continues (attached, shown), a quit at ${WQUIT} ms exits 0 once through the lifecycle`,
+		ok,
+		`scenario ${setup ? 'as named' : 'NOT as named'} (waiting window closed ${waitClosed ? `at ${waitClosed.at} ms` : 'never'}, Ready ${ready ? `at ${ready.at} ms` : 'never'}); window-all-closed default quit ${defaultQuit ? `at ${defaultQuit.at} ms` : 'none'}; first app.quit() ${firstQuit ? `at ${firstQuit.at} ms` : 'never'}; exits ${JSON.stringify(result.exits)}; attach ${attach ? `at ${attach.at} ms` : 'never'}; reveal ${reveal ? `at ${reveal.at} ms` : 'never'}; lifecycle shutdown (state closed) ${!!find(result, /^state service closed$/)}; error logs ${result.logs.error.length}; unhandledRejection ${JSON.stringify(result.unhandled)}; startup ${result.startup ? (result.startup.ok ? 'returned' : `rejected "${result.startup.error}"`) : 'never settled'}`,
 		result);
 }
 
