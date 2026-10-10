@@ -460,7 +460,9 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 
 		this._windowId = targetWindow.vscodeWindowId;
 		this._encodedWebviewOriginPromise = parentOriginHash(targetWindow.origin, this.origin).then(id => this._encodedWebviewOrigin = id);
-		this._encodedWebviewOriginPromise.then(encodedWebviewOrigin => {
+		this._encodedWebviewOriginPromise.then(async encodedWebviewOrigin => {
+			// QuantLab host (review c2 M2 + M3): the main process is told of this frame before the frame navigates
+			await this.qlRegisterFrame(encodedWebviewOrigin, targetWindow);
 			if (!this._disposed) {
 				this._initElement(encodedWebviewOrigin, this.extension, this._options, targetWindow);
 			}
@@ -548,6 +550,14 @@ export class WebviewElement extends Disposable implements IWebviewElement, Webvi
 		if (this.element) {
 			this.element.style.pointerEvents = 'auto';
 		}
+	}
+
+	/**
+	 * QuantLab host (review c2 M2 + M3): runs before the frame gets its `src`. The Electron element registers the frame with
+	 * the main process; the browser element has no main process to tell.
+	 */
+	protected qlRegisterFrame(_encodedWebviewOrigin: string, _targetWindow: CodeWindow): Promise<void> {
+		return Promise.resolve();
 	}
 
 	protected webviewContentEndpoint(encodedWebviewOrigin: string): string {

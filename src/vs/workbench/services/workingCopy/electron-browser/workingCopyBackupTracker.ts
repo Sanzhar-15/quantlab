@@ -22,7 +22,7 @@ import { SaveReason } from '../../../common/editor.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { IProgressService, ProgressLocation } from '../../../../platform/progress/common/progress.js';
-import { Promises, raceCancellation } from '../../../../base/common/async.js';
+import { Promises, raceCancellation, timeout } from '../../../../base/common/async.js';
 import { IWorkingCopyEditorService } from '../common/workingCopyEditorService.js';
 import { IEditorGroupsService } from '../../editor/common/editorGroupsService.js';
 
@@ -256,6 +256,20 @@ export class NativeWorkingCopyBackupTracker extends WorkingCopyBackupTracker imp
 		let error: Error | undefined = undefined;
 
 		await this.withProgressAndCancellation(async token => {
+
+			// QuantLab host (package row A4, review c2 M5): TEST BUILDS ONLY. `globalThis.QL_TEST_BUILD` is a constant `false` in a
+			// product bundle (esbuild define, build/lib/optimize.ts), so esbuild drops this block. The built-app driver sets
+			// `globalThis.qlTestBackupDelayMs` in the workbench page to make this backup slow: the cancellable progress dialog
+			// then shows (after 800 ms), and the row drives its Cancel.
+			if (globalThis.QL_TEST_BUILD) {
+				const delay = (globalThis as { qlTestBackupDelayMs?: unknown }).qlTestBackupDelayMs;
+				if (typeof delay === 'number') {
+					await raceCancellation(timeout(delay), token);
+					if (token.isCancellationRequested) {
+						return;
+					}
+				}
+			}
 
 			// Perform a backup of all modified working copies unless a backup already exists
 			try {

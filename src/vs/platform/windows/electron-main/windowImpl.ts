@@ -47,6 +47,7 @@ import { VSBuffer } from '../../../base/common/buffer.js';
 import { errorHandler } from '../../../base/common/errors.js';
 import { FocusMode } from '../../native/common/native.js';
 import { allowDevToolsRoute } from './qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
+import { formatWindowErrorDetails } from './windowErrorDetails.js';
 
 export interface IWindowCreationOptions {
 	readonly state: IWindowState;
@@ -763,35 +764,19 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 	 */
 	qlAdoptBrowserWindow(standIn: electron.BrowserWindow): void {
 		this._win = standIn;
-		this.registerListeners();
+		this.registerContentsListeners();
 	}
 
 	private registerListeners(): void {
 
+		// QuantLab host (review c1 S1): the window's own listeners are bound once, here; the listeners on its webContents are
+		// bound by registerContentsListeners, which adoption calls again for the view's webContents (it used to re-run all of
+		// this, so every unresponsive, maximize, fullscreen, configuration and workspace event was handled twice)
+		this.registerContentsListeners();
+
 		// Window error conditions to handle
 		this._register(Event.fromNodeEventEmitter(this._win, 'unresponsive')(() => this.onWindowError(WindowError.UNRESPONSIVE)));
 		this._register(Event.fromNodeEventEmitter(this._win, 'responsive')(() => this.onWindowError(WindowError.RESPONSIVE)));
-		this._register(Event.fromNodeEventEmitter(this._win.webContents, 'render-process-gone', (event, details) => details)(details => this.onWindowError(WindowError.PROCESS_GONE, { ...details })));
-		this._register(Event.fromNodeEventEmitter(this._win.webContents, 'did-fail-load', (event, exitCode, reason) => ({ exitCode, reason }))(({ exitCode, reason }) => this.onWindowError(WindowError.LOAD, { reason, exitCode })));
-
-		// Prevent windows/iframes from blocking the unload
-		// through DOM events. We have our own logic for
-		// unloading a window that should not be confused
-		// with the DOM way.
-		// (https://github.com/microsoft/vscode/issues/122736)
-		this._register(Event.fromNodeEventEmitter<electron.Event>(this._win.webContents, 'will-prevent-unload')(event => event.preventDefault()));
-
-		// Remember that we loaded
-		this._register(Event.fromNodeEventEmitter(this._win.webContents, 'did-finish-load')(() => {
-
-			// Associate properties from the load request if provided
-			if (this.pendingLoadConfig) {
-				this._config = this.pendingLoadConfig;
-
-				this.pendingLoadConfig = undefined;
-			}
-		}));
-
 		// Window (Un)Maximize
 		this._register(this.onDidMaximize(() => {
 			if (this._config) {
@@ -819,8 +804,37 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 
 		// Handle Workspace events
 		this._register(this.workspacesManagementMainService.onDidDeleteUntitledWorkspace(e => this.onDidDeleteUntitledWorkspace(e)));
+	}
 
-		// Inject headers when requests are incoming
+	private readonly contentsListeners = this._register(new MutableDisposable<DisposableStore>());
+
+	/** The listeners on `this._win.webContents`; a second call (adoption) replaces the first call's. */
+	private registerContentsListeners(): void {
+		const store = new DisposableStore();
+		this.contentsListeners.value = store;
+
+		store.add(Event.fromNodeEventEmitter(this._win.webContents, 'render-process-gone', (event, details) => details)(details => this.onWindowError(WindowError.PROCESS_GONE, { ...details })));
+		store.add(Event.fromNodeEventEmitter(this._win.webContents, 'did-fail-load', (event, exitCode, reason) => ({ exitCode, reason }))(({ exitCode, reason }) => this.onWindowError(WindowError.LOAD, { reason, exitCode })));
+
+		// Prevent windows/iframes from blocking the unload
+		// through DOM events. We have our own logic for
+		// unloading a window that should not be confused
+		// with the DOM way.
+		// (https://github.com/microsoft/vscode/issues/122736)
+		store.add(Event.fromNodeEventEmitter<electron.Event>(this._win.webContents, 'will-prevent-unload')(event => event.preventDefault()));
+
+		// Remember that we loaded
+		store.add(Event.fromNodeEventEmitter(this._win.webContents, 'did-finish-load')(() => {
+
+			// Associate properties from the load request if provided
+			if (this.pendingLoadConfig) {
+				this._config = this.pendingLoadConfig;
+
+				this.pendingLoadConfig = undefined;
+			}
+		}));
+
+		// Inject headers when requests are incoming (one handler per session: a second call replaces it)
 		const urls = ['https://*.vsassets.io/*'];
 		if (this.productService.extensionsGallery?.serviceUrl) {
 			const serviceUrl = URI.parse(this.productService.extensionsGallery.serviceUrl);
@@ -857,7 +871,7 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 
 		switch (type) {
 			case WindowError.PROCESS_GONE:
-				this.logService.error(`CodeWindow: renderer process gone (reason: ${details?.reason || '<unknown>'}, code: ${details?.exitCode || '<unknown>'})`);
+				this.logService.error(`CodeWindow: renderer process gone (${formatWindowErrorDetails(details)})`); // QuantLab host (c1 S5): code 0 stays 0
 				break;
 			case WindowError.UNRESPONSIVE:
 				this.logService.error('CodeWindow: detected unresponsive');
@@ -866,7 +880,7 @@ export class CodeWindow extends BaseWindow implements ICodeWindow {
 				this.logService.error('CodeWindow: recovered from unresponsive');
 				break;
 			case WindowError.LOAD:
-				this.logService.error(`CodeWindow: failed to load (reason: ${details?.reason || '<unknown>'}, code: ${details?.exitCode || '<unknown>'})`);
+				this.logService.error(`CodeWindow: failed to load (${formatWindowErrorDetails(details)})`); // QuantLab host (c1 S5): code 0 stays 0
 				break;
 		}
 

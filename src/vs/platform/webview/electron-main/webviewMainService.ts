@@ -11,6 +11,12 @@ import { WebviewProtocolProvider } from './webviewProtocolProvider.js';
 import { IWindowsMainService } from '../../windows/electron-main/windows.js';
 import { IFileService } from '../../files/common/files.js';
 
+/** QuantLab host (review c2 M2 + M3): where the registrations are kept (`code/electron-main/qlHost/webviewRegistry.ts`). */
+export interface IQlWebviewRegistrar {
+	register(contents: WebContents, frameName: string, authority: string): void;
+	unregister(contents: WebContents, frameName: string): void;
+}
+
 export class WebviewMainService extends Disposable implements IWebviewManagerService {
 
 	declare readonly _serviceBrand: undefined;
@@ -19,6 +25,7 @@ export class WebviewMainService extends Disposable implements IWebviewManagerSer
 	public readonly onFoundInFrame = this._onFoundInFrame.event;
 
 	constructor(
+		private readonly qlWebviews: IQlWebviewRegistrar,
 		@IFileService fileService: IFileService,
 		@IWindowsMainService private readonly windowsMainService: IWindowsMainService,
 	) {
@@ -84,6 +91,24 @@ export class WebviewMainService extends Disposable implements IWebviewManagerSer
 		if (typeof frame.stopFindInFrame === 'function') {
 			frame.stopFindInFrame(options.keepSelection ? 'keepSelection' : 'clearSelection');
 		}
+	}
+
+	public async qlRegisterWebview(windowId: WebviewWindowId, frameName: string, authority: string): Promise<void> {
+		const window = this.windowsMainService.getWindowById(windowId.windowId);
+		if (!window?.win) {
+			throw new Error(`Invalid windowId: ${windowId.windowId}`);
+		}
+
+		this.qlWebviews.register(window.win.webContents, frameName, authority);
+	}
+
+	public async qlUnregisterWebview(windowId: WebviewWindowId, frameName: string): Promise<void> {
+		const window = this.windowsMainService.getWindowById(windowId.windowId);
+		if (!window?.win) {
+			return; // the registrations are kept per contents: they went with the window's
+		}
+
+		this.qlWebviews.unregister(window.win.webContents, frameName);
 	}
 
 	private getFrameByName(windowId: WebviewWindowId, frameName: string): WebFrameMain {

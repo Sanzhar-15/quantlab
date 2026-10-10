@@ -47,6 +47,7 @@ import { AuxiliaryBarPart } from './parts/auxiliarybar/auxiliaryBarPart.js';
 import { ITelemetryService } from '../../platform/telemetry/common/telemetry.js';
 import { IAuxiliaryWindowService } from '../services/auxiliaryWindow/browser/auxiliaryWindowService.js';
 import { CodeWindow, mainWindow } from '../../base/browser/window.js';
+import { decideCustomTitleBarAutoShow } from './layoutPolicyGuard.js';
 
 //#region Layout Implementation
 
@@ -391,9 +392,17 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 				const activityBarMovedToTopOrBottom = e.affectsConfiguration(LayoutSettings.ACTIVITY_BAR_LOCATION) && [ActivityBarPosition.TOP, ActivityBarPosition.BOTTOM].includes(this.configurationService.getValue<ActivityBarPosition>(LayoutSettings.ACTIVITY_BAR_LOCATION));
 
 				if (activityBarMovedToTopOrBottom || editorActionsMovedToTitlebar || commandCenterEnabled || layoutControlsEnabled) {
-					if (this.configurationService.getValue<CustomTitleBarVisibility>(TitleBarSetting.CUSTOM_TITLE_BAR_VISIBILITY) === CustomTitleBarVisibility.NEVER) {
+					// QuantLab host (C1-X1): a key the chrome policy pins is not written (the write was refused and toasted)
+					const autoShow = decideCustomTitleBarAutoShow(
+						this.configurationService.getValue<CustomTitleBarVisibility>(TitleBarSetting.CUSTOM_TITLE_BAR_VISIBILITY),
+						this.configurationService.inspect(TitleBarSetting.CUSTOM_TITLE_BAR_VISIBILITY).policyValue
+					);
+					if (autoShow === 'write-auto') {
 						this.configurationService.updateValue(TitleBarSetting.CUSTOM_TITLE_BAR_VISIBILITY, CustomTitleBarVisibility.AUTO);
 						return; // onDidChangeConfiguration will be triggered again
+					}
+					if (autoShow === 'policy-pinned') {
+						this.logService.trace(`Layout: ${TitleBarSetting.CUSTOM_TITLE_BAR_VISIBILITY} is pinned by policy; the custom title bar is not turned on`);
 					}
 				}
 

@@ -21,8 +21,11 @@ import { ICodeWindow } from '../../../platform/window/electron-main/window.js';
 import type { TerminalHost, WorkbenchContents } from '../ql-client/index.js';
 import { IAdoptedWorkbench } from './adopt.js';
 import { QlDialogMainService } from './dialogs.js';
-import { IQlWorkbenchListener, QlWindowsGate } from './gate.js';
+import { IQlWorkbenchListener, QlExtraWindowsRefusedError, QlWindowsGate } from './gate.js';
 import { secureWorkbenchContents } from './security.js';
+import { IQlFramePolicy } from './securityPolicy.js';
+import type { IQlVisibleTarget } from './standIn.js';
+import { createToggleSequencer, type ToggleView } from './toggleSequencer.js';
 
 /** The ONE key that toggles between the terminal and the workbench, while either has focus. Modifiers `CmdOrCtrl`, `Alt`, `Shift`, then one letter. */
 export const QL_TOGGLE_ACCELERATOR = 'CmdOrCtrl+Alt+T';
@@ -97,6 +100,9 @@ export interface IQlWorkbenchHostDeps {
 
 	/** Opens `url` in the system browser. */
 	openExternal(url: string): void;
+
+	/** Review c1 M2: the workbench document and webview scheme the adopted contents' navigation decisions use. */
+	readonly framePolicy: IQlFramePolicy;
 }
 
 export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener {
@@ -126,7 +132,7 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 
 	//#region start
 
-	/** Called once, after the terminal host started. */
+	/** Called once, from the terminal host's onBeforeShow (review c1 M7). */
 	attach(terminalHost: TerminalHost): void {
 		if (this.terminalHost) {
 			throw new Error('QuantLab host (U5): the workbench host is already attached');
@@ -147,8 +153,9 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		if (perfDelayedSwitchActive()) {
 			terminalHost.host.log(`mutant ${PERF_DELAYED_SWITCH_MUTANT} ACTIVE`);
 		}
-		// From here on the toggle key and the overlay key are watched: a key pressed on the terminal page BEFORE this line reached
-		// no watch (the page can finish loading before startTerminalHost() returns). The line makes that gap readable in the log.
+		// Review c1 M7: called from the start's onBeforeShow, before the window is shown and the terminal's first document loads,
+		// so no key and no close of the start reaches the host before these watches. From this line on the toggle key and the
+		// overlay key are watched; it precedes `show BaseWindow` in the host log, which makes that order readable there.
 		terminalHost.host.log('workbench host attached');
 		this.attached.complete(terminalHost);
 	}
@@ -192,7 +199,17 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 			// the host log's line (`shell: first-use workbench cause=…`): its absence proves the workbench was never started
 			this.requireTerminalHost().host.log(`first-use workbench cause=${cause}`);
 
-			this.ensuring = this.deps.openWorkbench().then(() => {
+			this.ensuring = this.deps.openWorkbench().then(() => undefined, (error: unknown) => {
+				// QuantLab host (P12): the first use succeeded and the workbench is open; the request only asked for more windows than the
+				// host holds, and the gate closed them (a restored session of several windows does that on every first use). The refusal is
+				// logged here, at error, once (the gate refused something), and the request goes on to the kept workbench's readiness and
+				// display checks: a load, readiness or display failure after it is an ordinary failure. Told by type, never by message.
+				if (!(error instanceof QlExtraWindowsRefusedError)) {
+					throw error;
+				}
+
+				this.deps.logService.error(`QuantLab host: ${cause}: ${error.message}; the workbench is kept`);
+			}).then(() => {
 				const workbench = this.deps.gate.workbench;
 				if (!workbench) {
 					throw new Error(`QuantLab host (U5): the ${cause} request ended without a workbench window`);
@@ -227,11 +244,24 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		this.shown = 'terminal';
 	}
 
-	/** The toggle key. The host log gets `view-switch start` at the key's receipt and `view-switch done` once the target view is shown (PERF-1b SW-1 reads both). */
+	/**
+	 * The toggle key (review c1 S3: one transition at a time, each choosing its target when its turn comes; toggleSequencer.ts).
+	 * The host log gets `view-switch start` when the transition starts (at the key's receipt unless an earlier one is running:
+	 * then `view-switch queued` at receipt) and `view-switch done` once the target view is shown (PERF-1b SW-1 reads both).
+	 */
 	async toggle(): Promise<void> {
+		await this.toggles.toggle();
+	}
+
+	private readonly toggles = createToggleSequencer({
+		shown: () => this.shown,
+		apply: to => this.applyToggle(to),
+		queued: () => this.requireTerminalHost().host.log(`view-switch queued t=${Date.now()}`)
+	});
+
+	private async applyToggle(to: ToggleView): Promise<void> {
 		const terminalHost = this.requireTerminalHost();
 		const host = terminalHost.host;
-		const to = this.shown === 'terminal' ? 'workbench' : 'terminal';
 
 		host.log(`view-switch start to=${to} t=${Date.now()}`);
 		// QuantLab host (U6): a switch closes the overlay first (the client's `show` closes it too, so no path leaves it open)
@@ -350,6 +380,17 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 	}
 
 	private reportFailure(what: string, error: unknown): void {
+
+		// QuantLab host (review c1 M7, package K2): a quit that arrives while the workbench is still opening closes its window, so
+		// the request that was waiting for it fails ("went away before it was ready"). That failure is the quit's own effect: it is
+		// logged, and no dialog is shown for it. A dialog here kept the app alive: the host window is closing or closed, so the
+		// dialog was app-modal with nobody to answer it (SIGTERM 1.5 s after the attach: alive 60 s, no will-quit).
+		if (this.closing || this.deps.lifecycleMainService.quitRequested) {
+			this.deps.logService.error(`QuantLab host: ${what} failed while the app is quitting; no dialog is shown`, error);
+
+			return;
+		}
+
 		this.showFailure('QuantLab could not show the workbench.', what, error);
 	}
 
@@ -373,18 +414,35 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 
 	//#region IQlWorkbenchListener (called by the gate)
 
+	visibleTarget(): IQlVisibleTarget {
+		const terminalHost = this.requireTerminalHost();
+
+		return {
+			window: terminalHost.window,
+			focusWorkbench: () => {
+				terminalHost.window.focus();
+				this.surface('focus');
+			}
+		};
+	}
+
 	adopted(workbench: IAdoptedWorkbench): void {
 		const terminalHost = this.requireTerminalHost();
 		const disposables = new DisposableStore();
 
 		try {
-			disposables.add(secureWorkbenchContents(workbench.webContents, { logService: this.deps.logService, openExternal: url => this.deps.openExternal(url) }));
+			disposables.add(secureWorkbenchContents(workbench.webContents, { logService: this.deps.logService, policy: this.deps.framePolicy, openExternal: url => this.deps.openExternal(url) }));
 			disposables.add(this.watchKeys(workbench.webContents)); // QuantLab host (U6): the toggle key and the overlay key
 
 			// hidden until it signalled ready: the terminal stays on screen meanwhile
 			workbench.view.setVisible(false);
 			terminalHost.addView('workbench', 'workbench', workbench.view, { ...workbench.webPreferences });
 			terminalHost.setWorkbench(this.workbenchContents(workbench, disposables));
+
+			// QuantLab host (review c2 M5): `close` on the shell is where the lifecycle service starts the workbench's unload
+			// handshake (a quit, an update restart and a close of the workbench window all close it): the workbench is on screen
+			// before its renderer is asked
+			disposables.add(Event.fromNodeEventEmitter(workbench.shell, 'close')(() => this.surfaceForUnload(workbench, 'workbench window close')));
 		} catch (error) {
 			disposables.dispose();
 			if (terminalHost.view('workbench') === workbench.view) {
@@ -466,7 +524,9 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 	// is asked to close, which happens inside `app.quit()`. So the host window is never closed before that handshake ended:
 	// every `close` of it (the user's, or Electron's own while quitting, or an update restart: all end in `app.quit()`) is
 	// held, the quit is run through `lifecycleMainService.quit()`, and the host window is closed once the CodeWindow is
-	// closed. A veto (the user cancelled a save prompt) leaves everything open and shows the workbench. With no workbench
+	// closed. The workbench is put on screen BEFORE the handshake (`surfaceForUnload`, review c2 M5), so what the handshake waits
+	// for can be seen and answered. A veto (the user cancelled a save prompt) leaves everything open and the workbench
+	// shown. With no workbench
 	// there is nothing to settle and the window closes at once (`window-all-closed` then quits, `app.ts`).
 
 	private onHostWindowClose(event: ElectronEvent): void {
@@ -482,14 +542,48 @@ export class QlWorkbenchHost extends Disposable implements IQlWorkbenchListener 
 		this.closing = true;
 		this.settleThenCloseHostWindow().catch(error => {
 			this.closing = false;
-			this.reportFailure('closing the window', error);
+			// not `reportFailure`: a quit that could not be settled leaves the window open, and that is told in a dialog on it
+			this.showFailure('QuantLab could not show the workbench.', 'closing the window', error);
 		});
+	}
+
+	/**
+	 * QuantLab host (review c2 M5): puts the workbench on screen, synchronously, before its renderer is asked to unload. The
+	 * unload handshake can wait for the user in the workbench's own DOM, which a native dialog style does not cover: the
+	 * cancellable progress of a slow backup or save (`workingCopyBackupTracker.ts`, a DOM dialog after 800 ms), and a `custom`
+	 * dialog style. Behind the terminal view or the overlay those controls could not be seen or answered and the quit hung.
+	 * Only a workbench that signalled ready is asked anything (`LifecycleMainService#unload` lets any other window go), so
+	 * only that one is surfaced. The overlay is closed first: it is above every view. Nothing is awaited here.
+	 */
+	private surfaceForUnload(workbench: IAdoptedWorkbench, cause: string): void {
+		if (this.deps.gate.workbench !== workbench || !workbench.codeWindow.isReady) {
+			return;
+		}
+
+		const terminalHost = this.requireTerminalHost();
+		if (terminalHost.window.isDestroyed()) {
+			return;
+		}
+
+		if (terminalHost.overlayOpen()) {
+			terminalHost.closeOverlay();
+		}
+		if (this.shown !== 'workbench') {
+			terminalHost.host.log(`unload surface workbench cause=${cause}`);
+			this.deps.logService.info(`QuantLab host: the workbench is shown before it is asked to unload (${cause})`);
+			terminalHost.show('workbench');
+			this.shown = 'workbench';
+		}
 	}
 
 	private async settleThenCloseHostWindow(): Promise<void> {
 		await this.deps.gate.whenOpeningSettled();
 
 		const workbench = this.deps.gate.workbench;
+		if (workbench) {
+			// before the handshake, not after its veto (review c2 M5): whatever it awaits is then on screen
+			this.surfaceForUnload(workbench, 'quit');
+		}
 		if (workbench && await this.runQuitHandshake(workbench) === 'veto') {
 			this.closing = false;
 			this.deps.logService.info('QuantLab host: the quit was vetoed; the workbench is shown');

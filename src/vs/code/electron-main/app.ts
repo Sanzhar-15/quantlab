@@ -81,6 +81,7 @@ import { IOpenURLOptions, IURLService } from '../../platform/url/common/url.js';
 import { URLHandlerChannelClient, URLHandlerRouter } from '../../platform/url/common/urlIpc.js';
 import { NativeURLService } from '../../platform/url/common/urlService.js';
 import { ElectronURLListener } from '../../platform/url/electron-main/electronUrlListener.js';
+import { UtilityProcess } from '../../platform/utilityProcess/electron-main/utilityProcess.js';
 import { IWebviewManagerService } from '../../platform/webview/common/webviewManagerService.js';
 import { WebviewMainService } from '../../platform/webview/electron-main/webviewMainService.js';
 import { isFolderToOpen, isWorkspaceToOpen, IWindowOpenable } from '../../platform/window/common/window.js';
@@ -128,11 +129,13 @@ import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetr
 // electron-updater is CommonJS with getter-defined exports: node's ESM loader finds no named export (`autoUpdater`), and
 // out/main.js is ESM, so a named import throws SyntaxError before `ready` (package 5, folds/HOST/U5-LAUNCH-1.md). Default import.
 import electronUpdater from 'electron-updater';
-import { bakedBuildValues, createUpdater, startTerminalHost, type Ports, type TerminalHost } from './ql-client/index.js';
+import { bakedBuildValues, createUpdater, isQuitDuringStart, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
 // QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
 import { QlWorkbenchHost } from './qlHost/workbenchHost.js';
+import { IQlFramePolicy, isGrantedPermission, qlPermissionFrameLines } from './qlHost/securityPolicy.js';
+import { QlWebviewRegistry } from './qlHost/webviewRegistry.js';
 // QuantLab host (U6): the chrome seed (the four chrome settings of a fresh default profile)
 import { seedQlChromeSettings } from './qlHost/chromeSeed.js';
 import { allowDevToolsRoute } from '../../platform/windows/electron-main/qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
@@ -158,6 +161,10 @@ export class CodeApplication extends Disposable {
 	// QuantLab host (U5): the host's side of the workbench view (the gate and the adoption are in qlHost/)
 	private qlWorkbenchHost: QlWorkbenchHost | undefined;
 
+	// QuantLab host (review c2 M2 + M3): the webviews the workbench registered; written by the webview manager service,
+	// read by the frame policy (navigations, redirects, both permission handlers)
+	private readonly qlWebviewRegistry = new QlWebviewRegistry();
+
 	constructor(
 		private readonly mainProcessNodeIpcServer: NodeIPCServer,
 		private readonly userEnv: IProcessEnvironment,
@@ -178,6 +185,15 @@ export class CodeApplication extends Disposable {
 		this.registerListeners();
 	}
 
+	/** QuantLab host (review c1 M2 + M3, c2 M2 + M3): the document the CodeWindow loads (`windowImpl.ts` `load`), the webview scheme and the registered webviews. */
+	private qlFramePolicy(): IQlFramePolicy {
+		return {
+			workbenchDocument: FileAccess.asBrowserUri(`vs/code/electron-browser/workbench/workbench${this.environmentMainService.isBuilt ? '' : '-dev'}.html`).toString(true),
+			webviewScheme: Schemas.vscodeWebview,
+			webviews: contents => this.qlWebviewRegistry.of(contents)
+		};
+	}
+
 	private configureSession(): void {
 
 		//#region Security related measures (https://electronjs.org/docs/tutorial/security)
@@ -185,48 +201,31 @@ export class CodeApplication extends Disposable {
 		// !!! DO NOT CHANGE without consulting the documentation !!!
 		//
 
-		const isUrlFromWindow = (requestingUrl?: string | undefined) => requestingUrl?.startsWith(`${Schemas.vscodeFileResource}://${VSCODE_AUTHORITY}`);
-		const isUrlFromWebview = (requestingUrl: string | undefined) => requestingUrl?.startsWith(`${Schemas.vscodeWebview}://`);
+		// QuantLab host (review c1 M3): one decision for the request and the check handler, by frame ownership (the exact
+		// workbench document, webviews it registered and their own frames): `clipboard-sanitized-write` and `fullscreen`, nothing
+		// else (the fork's prefix match granted `pointerLock`, clipboard reads and `local-fonts`; media and notifications were
+		// removed in U5). See qlHost/securityPolicy.ts.
+		const framePolicy = this.qlFramePolicy();
 
-		// QuantLab host (U5): `notifications` is no longer allowed (the fork allowed it for core documents and webviews)
-		const alwaysAllowedPermissions = new Set(['pointerLock']);
-
-		const allowedPermissionsInWebview = new Set([
-			...alwaysAllowedPermissions,
-			'clipboard-read',
-			'clipboard-sanitized-write',
-			// TODO(deepak1556): Should be removed once migration is complete
-			// https://github.com/microsoft/vscode/issues/239228
-			'deprecated-sync-clipboard-read',
-		]);
-
-		const allowedPermissionsInCore = new Set([
-			...alwaysAllowedPermissions,
-			// QuantLab host (U5): `media` (camera, microphone) is no longer allowed for core documents
-			'local-fonts',
-			// TODO(deepak1556): Should be removed once migration is complete
-			// https://github.com/microsoft/vscode/issues/239228
-			'deprecated-sync-clipboard-read',
-		]);
-
-		session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
-			if (isUrlFromWebview(details.requestingUrl)) {
-				return callback(allowedPermissionsInWebview.has(permission));
+		session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+			const granted = isGrantedPermission(webContents, permission, details.requestingUrl, details.isMainFrame, framePolicy);
+			if (!granted) {
+				this.logService.warn(`QuantLab host: denied permission request ${permission} from ${details.requestingUrl} (${details.isMainFrame ? 'main frame' : 'sub-frame'})`);
 			}
-			if (isUrlFromWindow(details.requestingUrl)) {
-				return callback(allowedPermissionsInCore.has(permission));
+			if (globalThis.QL_TEST_BUILD && !details.isMainFrame) {
+				// TEST BUILDS ONLY (review c3 M2/M3): the frames the decision read, as Electron reports them
+				this.logService.info(`QuantLab host: test build: permission request ${permission} granted=${granted} frames ${qlPermissionFrameLines(webContents, details.requestingUrl, framePolicy)}`);
 			}
-			return callback(false);
+			return callback(granted);
 		});
 
-		session.defaultSession.setPermissionCheckHandler((_webContents, permission, _origin, details) => {
-			if (isUrlFromWebview(details.requestingUrl)) {
-				return allowedPermissionsInWebview.has(permission);
+		session.defaultSession.setPermissionCheckHandler((webContents, permission, _origin, details) => {
+			const granted = isGrantedPermission(webContents, permission, details.requestingUrl, details.isMainFrame, framePolicy);
+			if (globalThis.QL_TEST_BUILD && !details.isMainFrame) {
+				// TEST BUILDS ONLY (review c3 M2/M3): as the request handler's line
+				this.logService.info(`QuantLab host: test build: permission check ${permission} granted=${granted} frames ${qlPermissionFrameLines(webContents, details.requestingUrl, framePolicy)}`);
 			}
-			if (isUrlFromWindow(details.requestingUrl)) {
-				return allowedPermissionsInCore.has(permission);
-			}
-			return false;
+			return granted;
 		});
 
 		//#endregion
@@ -1064,7 +1063,7 @@ export class CodeApplication extends Disposable {
 		services.set(IWebContentExtractorService, new SyncDescriptor(NativeWebContentExtractorService, undefined, false /* proxied to other processes */));
 
 		// Webview Manager
-		services.set(IWebviewManagerService, new SyncDescriptor(WebviewMainService));
+		services.set(IWebviewManagerService, new SyncDescriptor(WebviewMainService, [this.qlWebviewRegistry])); // QuantLab host (review c2 M2 + M3): the registry the frame policy reads
 
 		// Menubar
 		services.set(IMenubarMainService, new SyncDescriptor(MenubarMainService));
@@ -1309,6 +1308,7 @@ export class CodeApplication extends Disposable {
 		this.auxiliaryWindowsMainService = accessor.get(IAuxiliaryWindowsMainService);
 		const instantiationService = accessor.get(IInstantiationService);
 		const dialogMainService = accessor.get(IDialogMainService);
+		const encryptionMainService = this.requireQlEncryptionMainService(accessor.get(IEncryptionMainService));
 
 		// QuantLab host (U6): the chrome seed, first of all: before the terminal host starts and so before the gate, a launch request or
 		// a key can open a workbench window that reads the default profile's settings. A failure to create or read the file is not
@@ -1327,6 +1327,7 @@ export class CodeApplication extends Disposable {
 			dialogs: this.requireQlDialogMainService(dialogMainService),
 			lifecycleMainService: this.lifecycleMainService,
 			logService: this.logService,
+			framePolicy: this.qlFramePolicy(),
 			openWorkbench: () => {
 				const protocolUrls = launchProtocolUrls;
 				launchProtocolUrls = undefined;
@@ -1352,18 +1353,52 @@ export class CodeApplication extends Disposable {
 			devTools: !this.environmentMainService.isBuilt,
 			preloadPath,
 			rendererDir,
-			openQuantlab: intent => qlWorkbenchHost.openQuantlab(intent)
+			openQuantlab: intent => qlWorkbenchHost.openQuantlab(intent),
+			// QuantLab host (review c1 M7): the workbench host takes over the window's close (the quit handshake runs through the
+			// lifecycle before the window goes), the toggle key and the gate's requests while the window is still hidden and nothing
+			// is loaded: no key at the first did-finish-load and no close during the start reaches a host without them
+			// QuantLab host (review c1 M8): the start's Keychain phase (token store, launch cookie; behind its painted waiting window
+			// on macOS) has settled by now: only from here may the fork's own encryption service make its synchronous safeStorage calls
+			onBeforeShow: started => {
+				qlWorkbenchHost.attach(started);
+				encryptionMainService.terminalHostKeychainPhaseSettled();
+			}
 		};
 
+		// QuantLab host (review c1 M7, package K1-1): a quit during the start waits for the start to settle. A TERM destroys the
+		// window, the lifecycle's shutdown joiners settle in milliseconds and its final quit ended the process while the rejected
+		// start was still unwinding (exit 133, SIGTRAP in the isolate's disposal, no `exit 0`). The start is a shutdown joiner
+		// until it settles; the joiner only waits: the rejection itself is handled by the catch below.
+		const starting = startTerminalHost(ports);
+		const startJoiner = Event.once(this.lifecycleMainService.onWillShutdown)(e => e.join('qlTerminalHostStart', starting.then(() => undefined, () => undefined)));
 		let terminalHost: TerminalHost;
 		try {
-			terminalHost = await startTerminalHost(ports);
+			terminalHost = await starting;
 		} catch (error) {
+			startJoiner.dispose();
+
+			// QuantLab host (review c1 M7): the window was closed during the start (a close, Cmd+Q, a TERM, an update restart): a
+			// quit, not a failure (the client logged `quit during start` and `exit 0`). A quit already under way ends on its own: a
+			// second `app.quit()` during the lifecycle's prevented `will-quit` ends the process under its joiners
+			// (folds/HOST/QUIT-EXIT-FIX.md). A close that started no quit (macOS: closing the only window) quits through the lifecycle.
+			if (isQuitDuringStart(error)) {
+				this.logService.info('QuantLab host: the window was closed during the terminal host start; the app quits', error);
+				if (!this.lifecycleMainService.quitRequested) {
+					this.lifecycleMainService.quit().then(
+						veto => veto && this.logService.error('QuantLab host: the quit after a close during the start was vetoed'),
+						quitError => this.logService.error('QuantLab host: the quit after a close during the start failed', quitError)
+					);
+				}
+
+				return false;
+			}
+
 			this.logService.error(error);
 			app.exit(1);
 
 			return false;
 		}
+		startJoiner.dispose();
 		this.qlTerminalHost = terminalHost;
 
 		// QuantLab updater (PACK, folds/HOST/PACK-UPDATER-HUNK.md): the ONE updater, electron-updater injected into the client
@@ -1374,45 +1409,23 @@ export class CodeApplication extends Disposable {
 		const updater = createUpdater(terminalHost.host, { updater: autoUpdater });
 		updater.checkForUpdates().catch(err => this.logService.error('updater: check failed', err));
 
-		// QuantLab host (U5): the workbench host takes over the window's close (the quit handshake runs through the lifecycle
-		// before the window goes), the toggle key, and the gate's requests
-		qlWorkbenchHost.attach(terminalHost);
 
 		// QuantLab host (DRIVER): TEST BUILDS ONLY. `globalThis.QL_TEST_BUILD` is a constant `false` in a product bundle (esbuild define,
 		// build/lib/optimize.ts), so esbuild drops this block and the dynamic import with it: a product bundle carries neither the dump
 		// module nor its file name. The built-app driver reads the view records from the user-data dir; they are written now (the
-		// terminal view) and again after every change of the host's registry: the workbench's adoption and removal (`addView` /
-		// `removeView`) and the overlay's open and close. A failed write is thrown into the caller, never caught.
+		// terminal view) and again after EVERY change of the host's registry, published by the registry itself (review c1 S2: the
+		// overlay's Escape, renderer loss and switch close it from inside the client, which wrapping the exported methods missed).
+		// A failed write is thrown into the code that changed the registry, never caught.
 		if (globalThis.QL_TEST_BUILD) {
 			const { dump } = await import('./qlHost/viewRecordsDump.js');
+			const { qlProcessRoleLines } = await import('./qlHost/processRoles.js');
 			const userDataPath = this.environmentMainService.userDataPath;
-			const publishViewRecords = (): void => {
-				this.logService.info(`QuantLab host: test build: view records written to ${dump(terminalHost.viewRecords(), userDataPath)}`);
+			const publishViewRecords = (records: readonly ViewRecord[]): void => {
+				this.logService.info(`QuantLab host: test build: view records written to ${dump(records, userDataPath)}`);
 			};
 
-			const { addView, removeView, openOverlay, closeOverlay } = terminalHost;
-			terminalHost.addView = (name, role, view, webPreferences) => {
-				addView(name, role, view, webPreferences);
-				publishViewRecords();
-			};
-			terminalHost.removeView = name => {
-				const removed = removeView(name);
-				publishViewRecords();
-
-				return removed;
-			};
-			terminalHost.openOverlay = async () => {
-				try {
-					await openOverlay();
-				} finally {
-					publishViewRecords(); // also after a failed open: the overlay is closed again, so the file must say so
-				}
-			};
-			terminalHost.closeOverlay = () => {
-				closeOverlay();
-				publishViewRecords();
-			};
-			publishViewRecords();
+			terminalHost.onViewRecordsChanged(publishViewRecords);
+			publishViewRecords(terminalHost.viewRecords());
 
 			// The driver's `showWorkbench()`. A key injected over CDP reaches the page and never the host's `before-input-event`
 			// (measured on package 7, folds/HOST/A2-SPLIT-7.md), so the driver cannot press the toggle key: in a test build the
@@ -1440,6 +1453,41 @@ export class CodeApplication extends Disposable {
 					}
 					overlay.setVisible(false);
 					this.logService.info('QuantLab host: test build: the overlay view was hidden by the test driver (O4 negative)');
+				} else if (event.message.startsWith('ql-test:run-action ')) {
+					// Package row A4 (review c2 M5): the driver runs ONE workbench command by id, sent as a menu item's is
+					// (`vscode:runAction`): a new untitled file, then `type`, make an editor dirty without a key reaching the page.
+					// The message is `ql-test:run-action {"id":"...","args":[...]}`. The workbench must exist already.
+					const request: { id?: unknown; args?: unknown } = JSON.parse(event.message.slice('ql-test:run-action '.length));
+					const workbenchView = terminalHost.view('workbench');
+					if (typeof request.id !== 'string' || (request.args !== undefined && !Array.isArray(request.args))) {
+						throw new Error(`QuantLab host (DRIVER): ql-test:run-action: expected {"id": string, "args"?: array}, got ${event.message}`);
+					}
+					if (!workbenchView) {
+						throw new Error(`QuantLab host (DRIVER): ql-test:run-action ${request.id}: there is no workbench view`);
+					}
+					workbenchView.webContents.send('vscode:runAction', { id: request.id, from: 'menu', args: request.args });
+					this.logService.info(`QuantLab host: test build: workbench action ${request.id} sent by the test driver`);
+					terminalHost.host.log(`test driver action sent id=${request.id}`);
+				} else if (event.message === 'ql-test:process-roles') {
+					// Package rows A5a-c and the per-process egress capture: which OS process has which role, as the main process
+					// knows it (the argv does not tell the utility processes apart; no renderer pid is logged). Format: processRoles.ts.
+					const lines = qlProcessRoleLines({
+						mainPid: process.pid,
+						views: terminalHost.viewRecords().map(record => {
+							const view = terminalHost.view(record.name);
+							if (!view) {
+								throw new Error(`QuantLab host (DRIVER): ql-test:process-roles: the registered view ${record.name} is not in the window`);
+							}
+
+							return { name: record.name, pid: view.webContents.getOSProcessId() };
+						}),
+						utilities: UtilityProcess.getAll(),
+						metrics: app.getAppMetrics()
+					});
+					for (const line of lines) {
+						this.logService.info(`QuantLab host: test build: ${line}`);
+					}
+					terminalHost.host.log(`test driver process roles written lines=${lines.length}`);
 				}
 			});
 			// A console message sent before this line reached no listener (measured: PERF's test-toggle on package 10 was lost when
@@ -1498,6 +1546,16 @@ export class CodeApplication extends Disposable {
 	private requireQlDialogMainService(service: IDialogMainService): QlDialogMainService {
 		if (!(service instanceof QlDialogMainService)) {
 			throw new Error('QuantLab host (U5): IDialogMainService is not the QlDialogMainService (initServices)');
+		}
+
+		return service;
+	}
+
+	// QuantLab host (review c1 M8): `initServices` registered the `EncryptionMainService`; the host needs it as itself to
+	// report the terminal host's Keychain phase to it
+	private requireQlEncryptionMainService(service: IEncryptionMainService): EncryptionMainService {
+		if (!(service instanceof EncryptionMainService)) {
+			throw new Error('QuantLab host (M8): IEncryptionMainService is not the EncryptionMainService (initServices)');
 		}
 
 		return service;

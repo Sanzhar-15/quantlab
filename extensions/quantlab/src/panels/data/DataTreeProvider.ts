@@ -8,6 +8,7 @@ import { GlobalState } from '../../core/state/GlobalState';
 import { ServerApiClient, ServerSymbol, CryptoSymbol, EtfItem, IndexItem } from '../../core/server/ServerApiClient';
 import { WatchlistManager, Watchlist } from './WatchlistManager';
 import { isServerSource } from '../../types/market';
+import { etfOrIndexDisplayName, mintServerSymbolHandle } from './serverSymbolHandles';
 import { isHostDataError } from '../../core/host/hostDataTransport';
 
 /** A failed server load: the text shown, and whether the host refused it as signed out (by its code). */
@@ -427,7 +428,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				command: isServerSymbol ? {
 					command: 'quantlab.openServerSymbol',
 					title: 'Open',
-					arguments: [sym, sym, this.isCryptoSymbol(sym) ? 'Crypto' : undefined]
+					arguments: [mintServerSymbolHandle(sym, sym, this.isCryptoSymbol(sym) ? 'Crypto' : undefined)]
 				} : {
 					command: 'quantlab.setGlobalDataSource',
 					title: 'Open',
@@ -708,7 +709,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			command: {
 				command: 'quantlab.openServerSymbol',
 				title: 'Open',
-				arguments: [s.symbol, s.name, 'equities']
+				arguments: [mintServerSymbolHandle(s.symbol, s.name, 'equities')]
 			},
 		};
 	}
@@ -740,7 +741,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			command: {
 				command: 'quantlab.openServerSymbol',
 				title: 'Open',
-				arguments: [etf.ticker, etf.name, 'ETF']
+				arguments: [mintServerSymbolHandle(etf.ticker, etfOrIndexDisplayName(etf.ticker, etf.name), 'ETF')]
 			},
 		} satisfies InstrumentNode));
 	}
@@ -774,7 +775,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 				command: {
 					command: 'quantlab.openServerSymbol',
 					title: 'Open',
-					arguments: [sym, idx.name, 'Index']
+					arguments: [mintServerSymbolHandle(sym, etfOrIndexDisplayName(sym, idx.name), 'Index')]
 				},
 			} satisfies InstrumentNode;
 		});
@@ -855,7 +856,7 @@ export class DataTreeProvider implements vscode.TreeDataProvider<DataNode> {
 			command: {
 				command: 'quantlab.openServerSymbol',
 				title: 'Open',
-				arguments: [s.symbol, s.name ?? s.symbol, 'Crypto']
+				arguments: [mintServerSymbolHandle(s.symbol, s.name ?? s.symbol, 'Crypto')]
 			},
 		};
 	}

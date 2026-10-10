@@ -8,15 +8,17 @@
 // The stock flow (`windowsMainService.open`) creates a `CodeWindow` whose `BrowserWindow` is only a hidden shell here (the
 // `windows.ts` seam hides it). `adoptCodeWindow` runs synchronously inside `onDidOpenWindow`, before the CodeWindow loads
 // anything: it builds a `WebContentsView` from the very webPreferences the stock window was created with, and re-points the
-// CodeWindow at a stand-in whose `webContents` and `loadURL` are the view's, so `load`, `send`, the unload handshake and the
-// crash handling all talk to the view's renderer while every other window call lands on the hidden shell.
+// CodeWindow at a stand-in (standIn.ts) whose `webContents` and `loadURL` are the view's, so `load`, `send`, the unload
+// handshake and the crash handling all talk to the view's renderer; the visible operations, state queries and events are the
+// host window's (review c1 M4), and the lifecycle calls (close, destroy) stay on the hidden shell.
 
 import { WebContentsView, type BrowserWindow, type WebContents, type WebPreferences } from 'electron';
 import { Emitter, Event } from '../../../base/common/event.js';
-import { Disposable, DisposableStore } from '../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, toDisposable } from '../../../base/common/lifecycle.js';
 import { ICodeWindow } from '../../../platform/window/electron-main/window.js';
 import { registerQlAdoptedWindow } from '../../../platform/windows/electron-main/windows.js';
 import { CodeWindow } from '../../../platform/windows/electron-main/windowImpl.js';
+import { createQlStandIn, forwardQlVisibleEvents, type IQlVisibleTarget } from './standIn.js';
 
 //#region The one member of CodeWindow (windowImpl.ts) this adoption needs beyond ICodeWindow.
 
@@ -38,43 +40,6 @@ function adoptBrowserWindow(codeWindow: ICodeWindow, standIn: BrowserWindow): vo
 }
 
 //#endregion
-
-/**
- * The BrowserWindow the CodeWindow talks to after adoption: the hidden shell, but `webContents` and `loadURL` are the view's.
- * The shell must never be shown by stock code paths (`show`, `showInactive`, `focus`, `moveTop`, the 10 s "window did not
- * open" fallback that reads `isVisible`): the workbench is on screen in the view, and it is the host that shows it.
- */
-function createStandIn(shell: BrowserWindow, view: WebContentsView): BrowserWindow {
-	const webContents = view.webContents;
-
-	return new Proxy(shell, {
-		get(target, property) {
-			switch (property) {
-				case 'webContents':
-					return webContents;
-				case 'loadURL':
-					return (...args: Parameters<WebContents['loadURL']>) => webContents.loadURL(...args);
-				case 'show':
-				case 'showInactive':
-				case 'focus':
-				case 'moveTop':
-					return () => undefined;
-				case 'isVisible':
-					return () => true;
-				case 'setBackgroundColor':
-					// the theme's splash colour is the shell's, but the visible surface is the view
-					return (color: string) => {
-						target.setBackgroundColor(color);
-						view.setBackgroundColor(color);
-					};
-			}
-
-			const value = Reflect.get(target, property, target);
-
-			return typeof value === 'function' ? value.bind(target) : value;
-		}
-	});
-}
 
 export interface IAdoptedWorkbench {
 
@@ -118,11 +83,15 @@ class AdoptedWorkbench extends Disposable implements IAdoptedWorkbench {
 		readonly shell: BrowserWindow,
 		readonly standIn: BrowserWindow,
 		readonly view: WebContentsView,
-		readonly webPreferences: WebPreferences
+		readonly webPreferences: WebPreferences,
+		visible: IQlVisibleTarget
 	) {
 		super();
 
 		this._register(registerQlAdoptedWindow(shell, standIn));
+
+		// review c1 M4: the CodeWindow bound its maximize / fullscreen / focus listeners to the shell; the host window raises them
+		this._register(toDisposable(forwardQlVisibleEvents(visible.window, shell)));
 
 		// the CodeWindow listens for these on its window (the shell), but they are raised by the view's contents
 		this._register(Event.fromNodeEventEmitter(this.webContents, 'unresponsive')(() => shell.emit('unresponsive')));
@@ -208,9 +177,10 @@ class AdoptedWorkbench extends Disposable implements IAdoptedWorkbench {
 /**
  * Adopts `codeWindow`, which must have just been created (inside `onDidOpenWindow`, before its load). `webPreferences` are the
  * ones the stock window was created with, as the `windows.ts` seam recorded them; the view gets exactly those (nothing added,
- * nothing removed). Throws when the CodeWindow cannot be adopted; the caller owns the cleanup.
+ * nothing removed). `visible` is the host's window and its focus (standIn.ts). Throws when the CodeWindow cannot be adopted;
+ * the caller owns the cleanup.
  */
-export function adoptCodeWindow(codeWindow: ICodeWindow, webPreferences: WebPreferences): IAdoptedWorkbench {
+export function adoptCodeWindow(codeWindow: ICodeWindow, webPreferences: WebPreferences, visible: IQlVisibleTarget): IAdoptedWorkbench {
 	const shell = codeWindow.win;
 	if (!shell) {
 		throw new Error('QuantLab host (U5): the opened CodeWindow has no BrowserWindow');
@@ -218,7 +188,7 @@ export function adoptCodeWindow(codeWindow: ICodeWindow, webPreferences: WebPref
 
 	const recorded = { ...webPreferences };
 	const view = new WebContentsView({ webPreferences: recorded });
-	const standIn = createStandIn(shell, view);
+	const standIn = createQlStandIn(shell, view.webContents, color => view.setBackgroundColor(color), visible);
 
 	try {
 		adoptBrowserWindow(codeWindow, standIn);
@@ -229,5 +199,5 @@ export function adoptCodeWindow(codeWindow: ICodeWindow, webPreferences: WebPref
 		throw error;
 	}
 
-	return new AdoptedWorkbench(codeWindow, shell, standIn, view, { ...webPreferences });
+	return new AdoptedWorkbench(codeWindow, shell, standIn, view, { ...webPreferences }, visible);
 }

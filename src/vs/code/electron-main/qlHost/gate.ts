@@ -21,6 +21,7 @@ import { ICodeWindow, WindowMode } from '../../../platform/window/electron-main/
 import { getFocusedWindowIncludingAdopted, IOpenConfiguration, IOpenEmptyConfiguration, IWindowsCountChangedEvent, IWindowsMainService, OpenContext, setQlHostWindowSeam } from '../../../platform/windows/electron-main/windows.js';
 import { WindowsMainService } from '../../../platform/windows/electron-main/windowsMainService.js';
 import { adoptCodeWindow, IAdoptedWorkbench } from './adopt.js';
+import type { IQlVisibleTarget } from './standIn.js';
 
 export type QlGateState = 'idle' | 'opening' | 'open';
 
@@ -30,11 +31,30 @@ export interface IQlWorkbenchListener {
 	/** Synchronous, inside `onDidOpenWindow`: the CodeWindow has not loaded anything yet. A throw makes the gate discard the window. */
 	adopted(workbench: IAdoptedWorkbench): void;
 
+	/** Synchronous, inside `onDidOpenWindow`, before `adopted`: the host's visible window and its focus (review c1 M4, standIn.ts). */
+	visibleTarget(): IQlVisibleTarget;
+
 	/** The workbench's CodeWindow closed or was destroyed; the gate is `idle` again. */
 	gone(workbench: IAdoptedWorkbench): void;
 
 	/** An open request completed and a workbench exists: the request wants it on screen. */
 	surface(cause: string): void;
+
+	/** QuantLab host (P12): a launch that asked for nothing to open reached the gate and no workbench exists: bring the host's own window forward. */
+	restoreHostWindow(): void;
+}
+
+/**
+ * QuantLab host (P12): the first use succeeded and the workbench is open, but the request also opened windows the host cannot
+ * show, so the gate closed them. The refusal is expected (a restored session of several windows) and handled, so it is its own
+ * type: the host logs it and shows no dialog, while every other first-use failure still gets one. It is raised only when EVERY
+ * refused window was refused because a workbench window already existed; an adoption failure is an ordinary error (review c1 M2).
+ */
+export class QlExtraWindowsRefusedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'QlExtraWindowsRefusedError';
+	}
 }
 
 function describeOpenContext(context: OpenContext): string {
@@ -47,6 +67,22 @@ function describeOpenContext(context: OpenContext): string {
 		case OpenContext.API: return 'api';
 		case OpenContext.LINK: return 'link';
 	}
+}
+
+// QuantLab host (P12): the stock `launchMainService` answers a second launch that carries nothing to open by focusing the last
+// active CodeWindow, and opens an empty window only when it finds none. The host's window is not a CodeWindow and the
+// workbench is lazy, so it always finds none and calls `open({ forceEmpty })`: here that request must not be a first use, nobody
+// asked for a workbench. What the launch asks for is read from the request alone: a launch context (the OS or a shell, not the
+// menu, a link or the API), no openables of any kind, no explicit ask for a window (`--new-window`, a profile, a remote), and
+// not the first launch's own request (`initialStartup`, `app.ts` `openFirstWindow`, which is also how the toggle key opens it).
+function isBareSecondLaunch(openConfig: IOpenConfiguration): boolean {
+	const { cli } = openConfig;
+
+	return (openConfig.context === OpenContext.DESKTOP || openConfig.context === OpenContext.CLI)
+		&& !openConfig.initialStartup
+		&& !openConfig.urisToOpen?.length
+		&& !cli._.length && !cli['folder-uri'] && !cli['file-uri']
+		&& !cli['new-window'] && !openConfig.forceProfile && !openConfig.forceTempProfile && !openConfig.remoteAuthority;
 }
 
 export class QlWindowsGate extends Disposable implements IWindowsMainService {
@@ -80,8 +116,11 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 	/** The webPreferences of the CodeWindows created and not yet seen by `onDidOpenWindow` (always 0 or 1: both happen synchronously). */
 	private readonly pendingWebPreferences: WebPreferences[] = [];
 
-	/** CodeWindows that were opened but could not be adopted, with the reason; the request that opened them fails and closes them. */
-	private readonly unadopted: { readonly window: ICodeWindow; readonly reason: string }[] = [];
+	/**
+	 * CodeWindows that were opened but could not be adopted, with the reason; the request that opened them fails and closes them.
+	 * `capacity` (P12): refused only because a workbench window already existed; an adoption failure or a defect in the captured options is not.
+	 */
+	private readonly unadopted: { readonly window: ICodeWindow; readonly reason: string; readonly capacity: boolean }[] = [];
 
 	constructor(
 		machineId: string,
@@ -153,8 +192,15 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 
 	//#region the one gate
 
-	private async use<T>(cause: string, run: () => Promise<T>): Promise<T> {
+	/** `whenIdle`: what a request that must not be a first use does instead, when no workbench exists (P12); with a workbench it runs as any other. */
+	private async use<T>(cause: string, run: () => Promise<T>, whenIdle?: () => T): Promise<T> {
 		await this.listenerAttached.p;
+
+		// QuantLab host (P12, review c1 M1): such a request is answered at once while no workbench is open, a first use in flight
+		// included: it neither joins that first use (its failure, its extras refusal) nor reaches the stock open after it
+		if (whenIdle && this.state !== 'open') {
+			return whenIdle();
+		}
 
 		if (this.state === 'opening') {
 			await this.opening; // rejects with the first use's error: concurrent first uses share one outcome
@@ -167,7 +213,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		const { value, extras } = await this.runOpen(run);
 		this.listener?.surface(cause);
 		if (extras) {
-			throw extras;
+			throw extras.error;
 		}
 
 		return value;
@@ -180,7 +226,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 
 		const opened = this.runOpen(run).then(result => {
 			if (!this.current) {
-				throw result.extras ?? new Error(`QuantLab host (U5): the ${cause} request returned without opening a workbench window`);
+				throw result.extras?.error ?? new Error(`QuantLab host (U5): the ${cause} request returned without opening a workbench window`);
 			}
 
 			this.state = 'open';
@@ -203,7 +249,9 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		return opened.then(({ value, extras }) => {
 			this.listener?.surface(cause);
 			if (extras) {
-				throw extras; // the workbench is open and kept; the request still reports that it asked for more windows than the host holds
+				// the workbench is open and kept; the request still reports that it asked for more windows than the host holds. P12: by type,
+				// and only when every refused window was refused for that (review c1 M2); an adoption failure stays an ordinary error.
+				throw extras.capacityOnly ? new QlExtraWindowsRefusedError(extras.error.message) : extras.error;
 			}
 
 			return value;
@@ -211,7 +259,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 	}
 
 	/** Runs the stock open. Windows it opened that could not be adopted are closed here and reported as `extras` (the caller throws it). */
-	private async runOpen<T>(run: () => Promise<T>): Promise<{ readonly value: T; readonly extras: Error | undefined }> {
+	private async runOpen<T>(run: () => Promise<T>): Promise<{ readonly value: T; readonly extras: { readonly error: Error; readonly capacityOnly: boolean } | undefined }> {
 		const value = await run();
 
 		if (this.unadopted.length === 0) {
@@ -223,7 +271,9 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 			window.close();
 		}
 
-		return { value, extras: new Error(`QuantLab host (U5): the request opened ${failures.length} window(s) that cannot be shown (the host holds ONE workbench window), so they were closed: ${failures.map(failure => failure.reason).join('; ')}`) };
+		const error = new Error(`QuantLab host (U5): the request opened ${failures.length} window(s) that cannot be shown (the host holds ONE workbench window), so they were closed: ${failures.map(failure => failure.reason).join('; ')}`);
+
+		return { value, extras: { error, capacityOnly: failures.every(failure => failure.capacity) } };
 	}
 
 	private discardCurrent(): void {
@@ -247,10 +297,12 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		const listener = this.listener;
 
 		let refusal: string | undefined;
+		let capacity = false; // P12: only "a workbench window already exists" is the expected one-window limit
 		if (!listener) {
 			refusal = 'the host is not attached';
 		} else if (this.current) {
 			refusal = 'a workbench window already exists';
+			capacity = true;
 		} else if (captured.length !== 1) {
 			refusal = `${captured.length} option sets were recorded for it (expected 1)`;
 		}
@@ -258,7 +310,7 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 		if (refusal === undefined && listener) {
 			let workbench: IAdoptedWorkbench | undefined;
 			try {
-				const adopted = adoptCodeWindow(codeWindow, captured[0]);
+				const adopted = adoptCodeWindow(codeWindow, captured[0], listener.visibleTarget());
 				workbench = adopted;
 				this.current = adopted;
 				adopted.onDidGone(() => this.onWorkbenchGone(adopted));
@@ -276,8 +328,13 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 			}
 		}
 
+		// review c1 S5: every path to here set its refusal; a missing one is a host defect, raised, never filled in
+		if (refusal === undefined) {
+			throw new Error('QuantLab host: a window was left unadopted without a refusal reason (host defect: onDidOpenCodeWindow)');
+		}
+
 		this.logService.error(`QuantLab host: a window was opened that the host cannot adopt (${refusal})`);
-		this.unadopted.push({ window: codeWindow, reason: refusal ?? 'unknown' });
+		this.unadopted.push({ window: codeWindow, reason: refusal, capacity });
 	}
 
 	private onWorkbenchGone(workbench: IAdoptedWorkbench): void {
@@ -301,7 +358,20 @@ export class QlWindowsGate extends Disposable implements IWindowsMainService {
 	//#region IWindowsMainService
 
 	open(openConfig: IOpenConfiguration): Promise<ICodeWindow[]> {
-		return this.use(`open (${describeOpenContext(openConfig.context)})`, () => this.inner.open(openConfig));
+		const cause = `open (${describeOpenContext(openConfig.context)})`;
+
+		return this.use(cause, () => this.inner.open(openConfig), isBareSecondLaunch(openConfig) ? () => this.broughtForward(cause) : undefined);
+	}
+
+	/** P12: with no workbench, a launch that asks for nothing to open opens nothing; the host's window (the app's window) comes forward. */
+	private broughtForward(cause: string): ICodeWindow[] {
+		this.logService.info(`QuantLab host: ${cause} request carries nothing to open and no workbench exists; no workbench opened, the host window was brought forward`);
+		if (!this.listener) {
+			throw new Error('QuantLab host (P12): the gate has no listener to bring the host window forward'); // `use` awaited the attach: a host defect
+		}
+		this.listener.restoreHostWindow();
+
+		return [];
 	}
 
 	openEmptyWindow(openConfig: IOpenEmptyConfiguration, options?: IOpenEmptyWindowOptions): Promise<ICodeWindow[]> {
