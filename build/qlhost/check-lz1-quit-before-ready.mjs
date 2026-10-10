@@ -60,8 +60,9 @@ for (const { id, name, scenario, resumes, beforeWindow } of quitRows) {
 	const setup = (beforeWindow ? (hookCalled === undefined || hookCalled.at > QUIT) : (hookCalled !== undefined && hookCalled.at < QUIT)) && (!resumes || released !== undefined);
 	const startupState = result.startup ? (result.startup.ok ? 'returned' : `rejected "${result.startup.error}"`) : 'pending (a services stage held)';
 	const ok = setup && result.unhandled.length === 0 && result.exits.length === 1 && exit.code === 0 && exit.how === 'quit'
-		&& unwound !== undefined && unwound.at <= exit.at && exit.at - QUIT < 10_000
-		&& hook !== undefined && !hook.ok && hook.at - QUIT < 1000 && late.length === 0 && lateInit.length === 0
+		&& unwound !== undefined && unwound.at <= exit.at && exit.at >= QUIT && exit.at - QUIT < 10_000
+		// the exit and the hook's settle come AFTER the quit under test (an exit before it, e.g. a default window-all-closed quit, is not this row)
+		&& hook !== undefined && !hook.ok && hook.at >= QUIT && hook.at - QUIT < 1000 && late.length === 0 && lateInit.length === 0
 		&& result.logs.error.length === 0 && result.startup?.ok !== false && (!resumes || result.startup?.ok === true);
 	row(`${id} ${name}: a quit at ${QUIT} ms exits 0 once, after the unwind, the hook settled at once, nothing attached, shown or initialised late`,
 		ok,
