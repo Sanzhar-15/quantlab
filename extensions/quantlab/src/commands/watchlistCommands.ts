@@ -18,6 +18,12 @@ import { WatchlistManager } from '../panels/data/WatchlistManager';
  * each first resolves its argument to a node the data tree rendered
  * (watchlistNodes.ts) and is refused with a named error otherwise, before
  * any input box, modal or WatchlistManager call (F-HOST-WATCHLIST-SYNC-1).
+ *
+ * Another extension's menu command on this view can receive (and mutate) the
+ * same rendered node, so the resolver returns a frozen snapshot taken at
+ * render time, and each command acts only after the user accepts a QuantLab
+ * modal naming that snapshot, using the snapshot's ids only; a dismissed or
+ * cancelled modal writes nothing and sends nothing (F-HOST-WATCHLIST-SYNC-2).
  */
 export function registerWatchlistCommands(context: vscode.ExtensionContext, watchlistManager: WatchlistManager): void {
 	context.subscriptions.push(
@@ -34,34 +40,51 @@ export function registerWatchlistCommands(context: vscode.ExtensionContext, watc
 		}),
 
 		vscode.commands.registerCommand('quantlab.watchlist.rename', async (node: unknown) => {
-			const rendered = resolveRenderedWatchlistNode('quantlab.watchlist.rename', node);
+			const target = resolveRenderedWatchlistNode('quantlab.watchlist.rename', node);
 			const name = await vscode.window.showInputBox({
-				prompt: `Rename watchlist "${rendered.watchlist.name}"`,
-				value: rendered.watchlist.name,
+				prompt: `Rename watchlist "${target.name}"`,
+				value: target.name,
 				validateInput: value => value.trim() ? undefined : 'Watchlist name is required'
 			});
 			if (name === undefined) {
 				return; // user cancelled
 			}
-			watchlistManager.renameWatchlist(rendered.watchlist.id, name);
+			const newName = name.trim();
+			const choice = await vscode.window.showWarningMessage(
+				`Rename watchlist "${target.name}" to "${newName}"?`,
+				{ modal: true },
+				'Rename'
+			);
+			if (choice !== 'Rename') {
+				return; // dismissed or cancelled: nothing is written or sent
+			}
+			watchlistManager.renameWatchlist(target.id, newName);
 		}),
 
 		vscode.commands.registerCommand('quantlab.watchlist.delete', async (node: unknown) => {
-			const rendered = resolveRenderedWatchlistNode('quantlab.watchlist.delete', node);
+			const target = resolveRenderedWatchlistNode('quantlab.watchlist.delete', node);
 			const choice = await vscode.window.showWarningMessage(
-				`Delete watchlist "${rendered.watchlist.name}" (${rendered.watchlist.symbols.length} symbols)?`,
+				`Delete watchlist "${target.name}" (${target.symbolCount} symbols)?`,
 				{ modal: true },
 				'Delete'
 			);
 			if (choice !== 'Delete') {
-				return;
+				return; // dismissed or cancelled: nothing is written or sent
 			}
-			watchlistManager.removeWatchlist(rendered.watchlist.id);
+			watchlistManager.removeWatchlist(target.id);
 		}),
 
-		vscode.commands.registerCommand('quantlab.watchlist.removeSymbol', (node: unknown) => {
-			const rendered = resolveRenderedWatchlistItemNode('quantlab.watchlist.removeSymbol', node);
-			watchlistManager.removeSymbol(rendered.watchlistId, rendered.symbol);
+		vscode.commands.registerCommand('quantlab.watchlist.removeSymbol', async (node: unknown) => {
+			const target = resolveRenderedWatchlistItemNode('quantlab.watchlist.removeSymbol', node);
+			const choice = await vscode.window.showWarningMessage(
+				`Remove "${target.symbol}" from watchlist "${target.watchlistName}"?`,
+				{ modal: true },
+				'Remove'
+			);
+			if (choice !== 'Remove') {
+				return; // dismissed or cancelled: nothing is written or sent
+			}
+			watchlistManager.removeSymbol(target.watchlistId, target.symbol);
 		}),
 	);
 }
