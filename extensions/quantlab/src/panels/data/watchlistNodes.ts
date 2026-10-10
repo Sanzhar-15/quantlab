@@ -5,7 +5,7 @@
 
 import type { WatchlistItemNode, WatchlistNode } from './DataTreeProvider';
 
-// HOST review (F-HOST-WATCHLIST-SYNC-1, PLAN-FINAL §3.5 rule 2): `quantlab.watchlist.rename`, `.delete` and `.removeSymbol`
+// HOST review (F-HOST-WATCHLIST-SYNC-1, PLAN-FINAL section 3.5 rule 2): `quantlab.watchlist.rename`, `.delete` and `.removeSymbol`
 // are public commands, so their argument is caller-controlled; each can end in an authorised server request (the debounced
 // push, or the server delete). They take only a node object DataTreeProvider rendered: VS Code hands a context-menu command
 // the tree element object itself, so object identity is the carrier. A caller-shaped look-alike (same nodeKind, ids, symbol)

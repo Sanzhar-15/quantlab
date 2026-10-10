@@ -15,7 +15,7 @@ import { CryptoSymbol, ServerApiClient, ServerSymbol, ServerWatchlist } from '..
 import type { GlobalState } from '../core/state/GlobalState';
 import { registerWatchlistCommands } from '../commands/watchlistCommands';
 
-// F-HOST-WATCHLIST-SYNC-1 (PLAN-FINAL §3.5 rule 2): `quantlab.watchlist.rename`, `.delete` and `.removeSymbol` are public
+// F-HOST-WATCHLIST-SYNC-1 (PLAN-FINAL section 3.5 rule 2): `quantlab.watchlist.rename`, `.delete` and `.removeSymbol` are public
 // commands. Each accepts only a node object DataTreeProvider rendered (watchlistNodes.ts); a caller-shaped node naming a
 // REAL list (and symbol) is refused by name before any prompt, Memento write or server request. The commands run as
 // registered by registerWatchlistCommands against the real WatchlistManager and DataTreeProvider, a fake ServerApiClient,
