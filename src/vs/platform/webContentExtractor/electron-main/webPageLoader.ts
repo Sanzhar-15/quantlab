@@ -12,6 +12,7 @@ import { generateUuid } from '../../../base/common/uuid.js';
 import { ILogService } from '../../log/common/log.js';
 import { IWebContentExtractorOptions, WebContentExtractResult } from '../common/webContentExtractor.js';
 import { AXNode, convertAXTreeToMarkdown } from './cdpAccessibilityDomain.js';
+import { devToolsAllowed } from '../../windows/electron-main/qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
 
 type NetworkRequestEventParams = Readonly<{
 	requestId?: string;
@@ -58,6 +59,7 @@ export class WebPageLoader extends Disposable {
 				offscreen: true,
 				sandbox: true,
 				webgl: false,
+				devTools: devToolsAllowed(), // QuantLab host (F-HOST-NODEBUG-1)
 			}
 		});
 

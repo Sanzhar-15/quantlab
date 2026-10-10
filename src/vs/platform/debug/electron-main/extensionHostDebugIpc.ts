@@ -14,6 +14,7 @@ import { OPTIONS, parseArgs } from '../../environment/node/argv.js';
 import { IWindowsMainService, OpenContext } from '../../windows/electron-main/windows.js';
 import { IOpenExtensionWindowResult } from '../common/extensionHostDebug.js';
 import { ExtensionHostDebugBroadcastChannel } from '../common/extensionHostDebugIpc.js';
+import { allowDevToolsRoute, devToolsAllowed } from '../../windows/electron-main/qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
 
 export class ElectronExtensionHostDebugBroadcastChannel<TContext> extends ExtensionHostDebugBroadcastChannel<TContext> {
 
@@ -33,7 +34,12 @@ export class ElectronExtensionHostDebugBroadcastChannel<TContext> extends Extens
 		}
 	}
 
+	// QuantLab host (F-HOST-NODEBUG-1, review c2 MUST-FIX): both routes to the renderer CDP bridge (openCdp) are refused by name in
+	// a PRODUCT build, before any window, server or debugger attach (qlDevToolsPolicy.ts)
 	private async attachToCurrentWindowRenderer(windowId: number): Promise<IOpenExtensionWindowResult> {
+		if (!allowDevToolsRoute('attachToCurrentWindowRenderer (extension host debug IPC)', line => console.error(line))) {
+			return { success: false };
+		}
 		const codeWindow = this.windowsMainService.getWindowById(windowId);
 		if (!codeWindow?.win) {
 			return { success: false };
@@ -43,6 +49,9 @@ export class ElectronExtensionHostDebugBroadcastChannel<TContext> extends Extens
 	}
 
 	private async openExtensionDevelopmentHostWindow(args: string[], debugRenderer: boolean): Promise<IOpenExtensionWindowResult> {
+		if (debugRenderer && !allowDevToolsRoute('openExtensionDevelopmentHostWindow debugRenderer (extension host debug IPC)', line => console.error(line))) {
+			return { success: false };
+		}
 		const pargs = parseArgs(args, OPTIONS);
 		pargs.debugRenderer = debugRenderer;
 
@@ -96,6 +105,10 @@ export class ElectronExtensionHostDebugBroadcastChannel<TContext> extends Extens
 	}
 
 	private async openCdp(win: BrowserWindow): Promise<IOpenExtensionWindowResult> {
+		if (!devToolsAllowed()) {
+			// QuantLab host (F-HOST-NODEBUG-1): unreachable in a PRODUCT build (both callers refuse first); a new caller fails visibly
+			throw new Error('QuantLab: the renderer CDP bridge was reached in a product build (F-HOST-NODEBUG-1)');
+		}
 		const debug = win.webContents.debugger;
 
 		let listeners = debug.isAttached() ? Infinity : 0;

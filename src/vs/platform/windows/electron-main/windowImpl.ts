@@ -46,6 +46,7 @@ import { IInstantiationService } from '../../instantiation/common/instantiation.
 import { VSBuffer } from '../../../base/common/buffer.js';
 import { errorHandler } from '../../../base/common/errors.js';
 import { FocusMode } from '../../native/common/native.js';
+import { allowDevToolsRoute } from './qlDevToolsPolicy.js'; // QuantLab host (F-HOST-NODEBUG-1)
 
 export interface IWindowCreationOptions {
 	readonly state: IWindowState;
@@ -218,7 +219,7 @@ export abstract class BaseWindow extends Disposable implements IBaseWindow {
 		}
 
 		// Open devtools if instructed from command line args
-		if (this.environmentMainService.args['open-devtools'] === true) {
+		if (this.environmentMainService.args['open-devtools'] === true && allowDevToolsRoute('--open-devtools (command line)', line => console.error(line))) { // QuantLab host (F-HOST-NODEBUG-1)
 			win.webContents.openDevTools();
 		}
 
