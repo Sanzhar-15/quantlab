@@ -9,7 +9,9 @@
 // Run from the fork root: `node build/qlhost/check-process-roles.mjs src/vs`; rc 0 = GREEN.
 // Negatives: (a) processRoles.ts without the `if (named.has(pid)) { continue; }` block -> rows 1, 2 RED; (b) app.ts with a
 // static `import { qlProcessRoleLines } from './qlHost/processRoles.js';` added -> row 4 RED; (c) processRoles.ts whose
-// requirePid returns the pid untested (its `if` block removed) -> row 3 RED.
+// requirePid returns the pid untested (its `if` block removed) -> row 3 RED. R-293/R-296: app.ts with an unguarded servicesHold
+// import added, (i) a static import at a line start or (ii) a dynamic one indented inside another block -> row 5 RED; (iii) the
+// guarded hold block duplicated -> rows 4, 5 RED.
 import { readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -124,6 +126,22 @@ const same = (got, want) => got.length === want.length && got.every((line, index
 	row('4 the step and its module are reachable only inside the QL_TEST_BUILD block (a dynamic import); no other qlHost file names the module; the module imports nothing',
 		start >= 0 && oneBlock && dynamicInside && routeInside && nothingOutside && others.length === 0 && noImports,
 		`block found ${start >= 0}; one QL_TEST_BUILD block ${oneBlock}; dynamic import inside ${dynamicInside}; route inside with its three sources ${routeInside}; nothing outside the block ${nothingOutside}; other qlHost files naming it [${others.join(', ')}]; module imports nothing ${noImports}`);
+}
+
+{
+	// R-293 / R-296: the services hold (F-PERF-LZ1-1 c1 M2, arbiter P2) is reachable only inside its ONE guarded block in startup():
+	// the block's exact text occurs once, and with it cut out app.ts names neither the module nor its function anywhere (a static
+	// import at a line start, a dynamic one indented in another block, a re-export: all are outside the block).
+	const app = read('code/electron-main/app.ts');
+	const hold = '\t\tif (globalThis.QL_TEST_BUILD) {\n\t\t\t\tconst { qlServicesHold } = await import(\'./qlHost/servicesHold.js\');\n\t\t\t\tawait qlServicesHold(process.env, message => this.logService.info(message));\n\t\t\t}\n';
+	const blocks = app.split(`\n\t${hold}`).length - 1;
+	const outside = blocks === 1 ? app.replace(`\n\t${hold}`, '\n') : app;
+	const namesOutside = [...outside.matchAll(/^.*(?:servicesHold|qlServicesHold).*$/gm)].map(match => match[0].trim());
+	const directory = join(vs, 'code/electron-main/qlHost');
+	const others = readdirSync(directory).filter(name => name !== 'servicesHold.ts' && /\.(ts|json)$/.test(name) && /servicesHold|qlServicesHold/.test(readFileSync(join(directory, name), 'utf8')));
+	row('5 the services hold is reachable only inside its one QL_TEST_BUILD block (a dynamic import); nothing else in app.ts or another qlHost file names it',
+		blocks === 1 && namesOutside.length === 0 && others.length === 0,
+		`guarded hold blocks ${blocks} (want 1); lines naming it outside the block [${namesOutside.join(' | ')}]; other qlHost files naming it [${others.join(', ')}]`);
 }
 
 console.log(rows.join('\n'));

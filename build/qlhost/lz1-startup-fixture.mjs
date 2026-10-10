@@ -338,6 +338,15 @@ function makeWorld(lib, scenario) {
 	// The client's start (the PAIRED client's shape: the hook awaited, bounded; the unwind runs before the rejection)
 	const client = scenario.client;
 	const hookOutcomes = [];
+	// R-296: the client's markStartCancelled (identity, never text): a start rejected with a marked error is a quit during the start
+	const startsCancelledByHost = new WeakSet();
+	const markStartCancelled = error => {
+		if (!(error instanceof Error)) {
+			throw new Error('host-vscode: markStartCancelled: the cancellation must be an Error');
+		}
+		startsCancelledByHost.add(error);
+		return error;
+	};
 	async function startTerminalHost(ports) {
 		ev('client start');
 		const unwind = [];
@@ -381,7 +390,7 @@ function makeWorld(lib, scenario) {
 
 			return terminalHost;
 		} catch (error) {
-			const quit = shellWindow?.isDestroyed() === true;
+			const quit = shellWindow?.isDestroyed() === true || (error instanceof Error && startsCancelledByHost.has(error));
 			for (const entry of unwind.reverse()) {
 				entry();
 			}
@@ -423,6 +432,7 @@ function makeWorld(lib, scenario) {
 		validatedIpcMain: {},
 		startTerminalHost,
 		isQuitDuringStart: error => error instanceof QuitDuringStart,
+		markStartCancelled,
 		CancellationError: class extends Error { }
 	};
 	const names = Object.keys(injected);

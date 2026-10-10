@@ -129,7 +129,7 @@ import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetr
 // electron-updater is CommonJS with getter-defined exports: node's ESM loader finds no named export (`autoUpdater`), and
 // out/main.js is ESM, so a named import throws SyntaxError before `ready` (package 5, folds/HOST/U5-LAUNCH-1.md). Default import.
 import electronUpdater from 'electron-updater';
-import { bakedBuildValues, createUpdater, isQuitDuringStart, onBeforeShowAwaited, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
+import { bakedBuildValues, createUpdater, isQuitDuringStart, markStartCancelled, onBeforeShowAwaited, startTerminalHost, type Ports, type TerminalHost, type ViewRecord } from './ql-client/index.js';
 // QuantLab host (U5): the lazy gate and the adopted workbench view (qlHost/)
 import { QlDialogMainService } from './qlHost/dialogs.js';
 import { QlWindowsGate, requireQlWindowsGate } from './qlHost/gate.js';
@@ -231,7 +231,9 @@ export class QlEarlyStart<S> {
 		if (this.cancellation || !this.settle) {
 			return;
 		}
+		// R-296: marked for the client, which reads a start rejected with it as a quit during the start (exit 0), not a fatal
 		this.cancellation = new QlStartCancelled(`QuantLab host (F-PERF-LZ1-1): the early start was cancelled: ${reason}`);
+		markStartCancelled(this.cancellation);
 		this.log(this.cancellation.message);
 		this.take('cancel')({ ready: false, cancelled: true, error: this.cancellation });
 	}
