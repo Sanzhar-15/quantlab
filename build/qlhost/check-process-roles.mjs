@@ -134,8 +134,15 @@ const same = (got, want) => got.length === want.length && got.every((line, index
 	// import at a line start, a dynamic one indented in another block, a re-export: all are outside the block).
 	const app = read('code/electron-main/app.ts');
 	const hold = '\t\tif (globalThis.QL_TEST_BUILD) {\n\t\t\t\tconst { qlServicesHold } = await import(\'./qlHost/servicesHold.js\');\n\t\t\t\tawait qlServicesHold(process.env, message => this.logService.info(message));\n\t\t\t}\n';
-	const blocks = app.split(`\n\t${hold}`).length - 1;
-	const outside = blocks === 1 ? app.replace(`\n\t${hold}`, '\n') : app;
+	// every start of the block at a line start (two blocks back to back share one line break, so no split on it)
+	const starts = [];
+	for (let at = app.indexOf(`\t${hold}`); at >= 0; at = app.indexOf(`\t${hold}`, at + 1)) {
+		if (at > 0 && app[at - 1] === '\n') {
+			starts.push(at);
+		}
+	}
+	const blocks = starts.length;
+	const outside = blocks === 1 ? app.slice(0, starts[0]) + app.slice(starts[0] + hold.length + 1) : app;
 	const namesOutside = [...outside.matchAll(/^.*(?:servicesHold|qlServicesHold).*$/gm)].map(match => match[0].trim());
 	const directory = join(vs, 'code/electron-main/qlHost');
 	const others = readdirSync(directory).filter(name => name !== 'servicesHold.ts' && /\.(ts|json)$/.test(name) && /servicesHold|qlServicesHold/.test(readFileSync(join(directory, name), 'utf8')));
