@@ -811,6 +811,10 @@ export class CodeApplication extends Disposable {
 				resolveDevDeviceId(this.stateService, this.logService)
 			]);
 			mark('code/ql/didResolveMachineIds');
+			if (globalThis.QL_TEST_BUILD) {
+				const { qlServicesHold } = await import('./qlHost/servicesHold.js');
+				await qlServicesHold(process.env, message => this.logService.info(message));
+			}
 			qlStart.checkpoint();
 
 			// Shared process

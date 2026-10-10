@@ -103,14 +103,18 @@ const same = (got, want) => got.length === want.length && got.every((line, index
 }
 {
 	const app = read('code/electron-main/app.ts');
-	const start = app.indexOf('\t\tif (globalThis.QL_TEST_BUILD) {\n');
+	// anchored at a line start: the services hold's deeper-indented block (startup()) also contains this text
+	const anchor = app.indexOf('\n\t\tif (globalThis.QL_TEST_BUILD) {\n');
+	const start = anchor < 0 ? -1 : anchor + 1;
 	const end = app.indexOf('\n\t\t}\n', start);
 	const block = start < 0 ? '' : app.slice(start, end);
 	const outside = start < 0 ? app : app.slice(0, start) + app.slice(end);
 	// the comment above the block and the block's condition, plus (review c3 M2/M3) the two permission-frame guards in
 	// configureSession, which name no qlHost module but securityPolicy's line helper
 	const permissionGuards = count(app, /\t\t\tif \(globalThis\.QL_TEST_BUILD && !details\.isMainFrame\) \{\n\t+\/\/[^\n]*\n\t+this\.logService\.info\(`QuantLab host: test build: permission (request|check) /g);
-	const oneBlock = count(app, /globalThis\.QL_TEST_BUILD/g) === 2 + permissionGuards && permissionGuards === 2;
+	// and (F-PERF-LZ1-1 c1 M2, arbiter P2) the services hold in startup(), which imports qlHost/servicesHold only
+	const servicesHold = count(app, /\t\t\tif \(globalThis\.QL_TEST_BUILD\) \{\n\t\t\t\tconst \{ qlServicesHold \} = await import\('\.\/qlHost\/servicesHold\.js'\);\n\t\t\t\tawait qlServicesHold\(process\.env, message => this\.logService\.info\(message\)\);\n\t\t\t\}\n/g);
+	const oneBlock = count(app, /globalThis\.QL_TEST_BUILD/g) === 2 + permissionGuards + servicesHold && permissionGuards === 2 && servicesHold === 1;
 	const dynamicInside = count(block, /const \{ qlProcessRoleLines \} = await import\('\.\/qlHost\/processRoles\.js'\);/g) === 1;
 	const routeInside = count(block, /event\.message === 'ql-test:process-roles'/g) === 1 && block.includes('utilities: UtilityProcess.getAll(),') && block.includes('metrics: app.getAppMetrics()') && block.includes('view.webContents.getOSProcessId()') && block.includes('this.logService.info(`QuantLab host: test build: ${line}`);');
 	const nothingOutside = !/processRoles|process-roles|qlProcessRoleLines/.test(outside);
